@@ -56,14 +56,22 @@ doesn't guess: it asks the engine.
 
 Channel chain modes (kept deliberately light on the ARM)
 ────────────────────────────────────────────────────────
-Every mode reduces to "produce one device-rate complex64 buffer, then replay it";
-the expansion happens once, at load, in NumPy — never per sample in the hot loop:
+Every mode reduces to a "playlist" — a few device-rate period-blocks plus a
+selector sequence (one index per period) that's looped. The expansion happens
+once, at load, in NumPy; the hot loop only DMAs finished blocks, never per-sample
+DSP. Streaming blocks[selectors[k]] in order is byte-identical to one fully-baked
+buffer, so nothing about fidelity is traded for the RAM saving.
 
-  • "expanded"  device-rate IQ file → replay as-is                 (lightest; pure DMA)
-  • "tiered"    primary-period IQ × a ±1 secondary overlay, one    (L1C / B1C)
-                sign per primary period → built into one buffer
+  • "expanded"  device-rate IQ file → one block, one selector      (lightest; pure DMA)
   • "pcode"     chip-rate IQ file, each chip repeated `interp`×     (long m-seqs, e.g. GLONASS P)
-                (np.repeat) → device-rate buffer
+                (np.repeat) → one device-rate block
+  • "tiered"    primary-period IQ × a ±1 overlay → two blocks       (single-component + overlay)
+                (+primary, −primary), selectors from the overlay
+  • "composite" the channel-task supplies the distinct period-blocks and the       (L1C / L5 /
+                selector sequence directly — for multi-component signals            E1 / B1C)
+                (pilot+data sums, per-component overlays) that aren't one
+                block × one ±1 overlay. Reproduces the full-length signal
+                (e.g. L1C's 18 s overlay) from a handful of blocks.
 
 The on-air handshake (fits the agent's pre-roll)
 ────────────────────────────────────────────────
@@ -114,7 +122,7 @@ from paramkit import Script
 
 
 NUM_CHANNELS = 4
-MODES = ("expanded", "tiered", "pcode")
+MODES = ("expanded", "tiered", "pcode", "composite")
 
 # Stock X410 master clock rates (Hz). The engine only ever sets one of these; the
 # achievable per-channel rates are the integer divisors of the chosen clock.
@@ -141,10 +149,14 @@ def achievable_rate(master_clock_hz: float, target_rate_hz: float) -> float:
 
 @dataclass
 class ChannelSpec:
-    """A signal to play on one channel. `mode` selects how the device-rate buffer
+    """A signal to play on one channel. `mode` selects how the device-rate playback
     is built (see module docstring). Any IQ files must already exist on disk, built
-    at the channel's negotiated rate (see the `configure` command)."""
-    mode: str                       # "expanded" | "tiered" | "pcode"
+    at the channel's negotiated rate (see the `configure` command).
+
+    Internally every mode becomes a "playlist" = (a few period-blocks, a per-period
+    selector sequence that's looped). expanded/pcode are one block; tiered and
+    composite pick among blocks per period."""
+    mode: str                       # "expanded" | "tiered" | "pcode" | "composite"
     freq_hz: float                  # channel carrier
     gain_db: float = 50.0
     amplitude: float = 0.0          # digital scale 0..1; start muted, raise at on-air
@@ -156,6 +168,14 @@ class ChannelSpec:
     primary_file: str = ""          # device-rate primary-period IQ
     secondary: List[int] = field(default_factory=list)   # ±1 overlay, one per primary period
     period_samples: int = 0         # samples per primary period (overlay repeat factor)
+    # composite — multi-component signals (pilot+data sums, per-component overlays).
+    # The channel-task precomputes the few DISTINCT period-blocks (each one whole
+    # primary period, equal length) and a selector sequence that names, per period,
+    # which block to play. Streaming blocks[selectors[k]] in order and looping the
+    # sequence is byte-identical to a single fully-baked buffer — without holding
+    # the whole (e.g. 18 s) thing in RAM.
+    block_files: List[str] = field(default_factory=list)   # device-rate period blocks
+    selectors: List[int] = field(default_factory=list)     # index into block_files, per period
 
     def validate(self) -> None:
         if self.mode not in MODES:
@@ -181,16 +201,28 @@ class ChannelSpec:
                 raise ValueError("tiered mode needs period_samples >= 1")
             if any(s not in (-1, 1) for s in self.secondary):
                 raise ValueError("secondary overlay values must be ±1")
+        elif self.mode == "composite":
+            if not self.block_files:
+                raise ValueError("composite mode needs at least one block_file")
+            if not self.selectors:
+                raise ValueError("composite mode needs a non-empty selector sequence")
+            if any(not (0 <= s < len(self.block_files)) for s in self.selectors):
+                raise ValueError("every selector must index into block_files")
 
     def files(self) -> List[str]:
-        return [f for f in (self.iq_file, self.primary_file) if f]
+        return [f for f in (self.iq_file, self.primary_file) if f] + list(self.block_files)
 
 
-def build_base_buffer(spec: ChannelSpec):
-    """Turn a validated ChannelSpec into ONE device-rate complex64 buffer, ready to
-    replay. All the per-mode expansion happens here, once, in NumPy — the replay
-    hot loop only ever streams the finished buffer. Shared by the real backend and
-    tests so the two never diverge."""
+def build_playlist(spec: ChannelSpec):
+    """Turn a validated ChannelSpec into a device-rate PLAYLIST: a list of distinct
+    complex64 period-blocks plus a selector sequence (one index per period, looped).
+    Streaming blocks[selectors[k]] in order, wrapping the sequence, reproduces the
+    signal exactly — including full-length overlays — without materialising the
+    whole thing. All per-mode expansion happens here, once, in NumPy; the replay
+    hot loop only ever DMAs finished blocks. Shared by the real backend and tests.
+
+    Returns (blocks: List[np.ndarray complex64 of equal length], selectors: List[int]).
+    """
     import numpy as np
 
     def _read(path: str):
@@ -200,22 +232,35 @@ def build_base_buffer(spec: ChannelSpec):
         return buf
 
     if spec.mode == "expanded":
-        return _read(spec.iq_file)
+        return [_read(spec.iq_file)], [0]
 
     if spec.mode == "pcode":
         chips = _read(spec.iq_file)
-        return np.repeat(chips, int(spec.interp)) if spec.interp > 1 else chips
+        block = np.repeat(chips, int(spec.interp)) if spec.interp > 1 else chips
+        return [np.ascontiguousarray(block)], [0]
 
-    # tiered: one primary period, sign-flipped per secondary chip, concatenated.
-    primary = _read(spec.primary_file)
-    if primary.size != spec.period_samples:
-        raise ValueError(
-            f"tiered primary has {primary.size} samples but period_samples="
-            f"{spec.period_samples}")
-    signs = np.asarray(spec.secondary, dtype=np.float32)
-    # (period, 1) × (n_periods,) → (n_periods, period) → flat: primary tiled and
-    # sign-applied per period, without a Python loop.
-    return (primary[None, :] * signs[:, None]).astype(np.complex64).reshape(-1)
+    if spec.mode == "tiered":
+        # Two blocks (+primary, −primary); the ±1 overlay picks one per period.
+        primary = _read(spec.primary_file)
+        if primary.size != spec.period_samples:
+            raise ValueError(
+                f"tiered primary has {primary.size} samples but period_samples="
+                f"{spec.period_samples}")
+        blocks = [np.ascontiguousarray(primary),
+                  np.ascontiguousarray(-primary)]
+        selectors = [0 if s == 1 else 1 for s in spec.secondary]
+        return blocks, selectors
+
+    # composite: the channel-task already built the distinct period-blocks and the
+    # selector sequence; just read them and check they're equal-length.
+    blocks = [np.ascontiguousarray(_read(f)) for f in spec.block_files]
+    n = blocks[0].size
+    for i, b in enumerate(blocks):
+        if b.size != n:
+            raise ValueError(
+                f"composite block {i} has {b.size} samples, expected {n} "
+                f"(all period-blocks must be the same length)")
+    return blocks, list(spec.selectors)
 
 
 # ── Radio backends ─────────────────────────────────────────────────────────────
@@ -313,10 +358,10 @@ class UhdRadio(RadioBackend):
         return self._chan[ch].configure(target_rate_hz)
 
     def load(self, ch, spec):
-        base = build_base_buffer(spec)          # NumPy expansion, once
+        blocks, selectors = build_playlist(spec)   # NumPy expansion, once
         self.usrp.set_tx_freq(self.uhd.types.TuneRequest(spec.freq_hz), ch)
         self.usrp.set_tx_gain(spec.gain_db, ch)
-        self._chan[ch].load(base, spec.amplitude)
+        self._chan[ch].load(blocks, selectors, spec.amplitude)
 
     def clear(self, ch):
         self._chan[ch].mute_idle()
@@ -342,7 +387,7 @@ class UhdRadio(RadioBackend):
             buf = (0.2 * np.exp(2j * np.pi * 1e3 * t)).astype(np.complex64)
             self.usrp.set_tx_freq(self.uhd.types.TuneRequest(1.5e9), ch)
             self._chan[ch].configure(rate)
-            self._chan[ch].load(buf, 0.2)
+            self._chan[ch].load([buf], [0], 0.2)
 
         os.environ["UHD_LOG_FASTPATH_DISABLE"] = "0"
         tmp = tempfile.TemporaryFile(mode="w+")
@@ -363,17 +408,21 @@ class UhdRadio(RadioBackend):
 
 
 class _ReplayChannel:
-    """One TX channel: a UHD streamer plus a thread that loops the current buffer
-    into it. Buffer swaps and amplitude changes are done by replacing references
-    under a lock, so the hot send loop never allocates and never blocks on DSP."""
+    """One TX channel: a UHD streamer plus a thread that loops the current PLAYLIST
+    into it. A playlist is a list of period-blocks + a selector sequence naming which
+    block plays each period; streaming blocks[selectors[k]] in order (looping the
+    sequence) reproduces the full signal. Playlist swaps and amplitude changes are
+    done by replacing references under a lock, so the hot send loop never allocates
+    and never blocks on DSP."""
 
     def __init__(self, radio: "UhdRadio", ch: int):
         self.radio = radio
         self.ch = ch
         self.rate_hz = 0.0
         self._lock = threading.Lock()
-        self._scaled = None            # complex64 buffer actually streamed (base×amp)
-        self._base = None              # unit-amplitude buffer (kept for rescale)
+        self._blocks = None            # list[complex64] unit-amplitude period-blocks
+        self._scaled = None            # list[complex64] blocks×amp — what's streamed
+        self._selectors = None         # list[int] index into blocks, per period
         self._amp = 0.0
         self._streamer = None
         self._spp = 0
@@ -393,33 +442,38 @@ class _ReplayChannel:
         self._spp = int(self._streamer.get_max_num_samps())
         return self.rate_hz
 
-    # ── buffer / amplitude ────────────────────────────────────────────────────
-    def load(self, base, amplitude: float) -> None:
+    # ── playlist / amplitude ──────────────────────────────────────────────────
+    def _scale(self, blocks, amp):
         np = self.radio.np
-        base = np.ascontiguousarray(base, dtype=np.complex64)
+        if amp:
+            return [(b * amp).astype(np.complex64) for b in blocks]
+        return [np.zeros_like(b) for b in blocks]
+
+    def load(self, blocks, selectors, amplitude: float) -> None:
+        np = self.radio.np
+        blocks = [np.ascontiguousarray(b, dtype=np.complex64) for b in blocks]
         with self._lock:
-            self._base = base
+            self._blocks = blocks
+            self._selectors = list(selectors)
             self._amp = float(amplitude)
-            self._scaled = (base * self._amp).astype(np.complex64) if self._amp else \
-                np.zeros_like(base)
+            self._scaled = self._scale(blocks, self._amp)
         self.start()   # ensure the thread is running (streams zeros while amp==0)
 
     def set_amplitude(self, a: float) -> None:
-        np = self.radio.np
         with self._lock:
             self._amp = float(a)
-            if self._base is None:
+            if self._blocks is None:
                 return
-            self._scaled = (self._base * self._amp).astype(np.complex64) if self._amp \
-                else np.zeros_like(self._base)
+            self._scaled = self._scale(self._blocks, self._amp)
 
     def mute_idle(self) -> None:
-        """Release a channel: mute and drop its buffer. The thread keeps running and
-        feeds zeros so the DUC stays fed (no device error), ready for the next load."""
+        """Release a channel: mute and drop its playlist. The thread keeps running
+        and feeds zeros so the DUC stays fed (no device error), ready for reuse."""
         with self._lock:
             self._amp = 0.0
-            self._base = None
+            self._blocks = None
             self._scaled = None
+            self._selectors = None
 
     # ── streaming thread ──────────────────────────────────────────────────────
     def start(self) -> None:
@@ -446,24 +500,33 @@ class _ReplayChannel:
         md.has_time_spec = False
         spp = self._spp
         zeros = np.zeros((1, spp), dtype=np.complex64)
-        idx = 0
+        sel_i = 0        # position in the selector sequence
+        samp_i = 0       # position within the current block
         while self._running.is_set():
             with self._lock:
-                buf = self._scaled
-            if buf is None or buf.size == 0:
+                blocks = self._scaled
+                selectors = self._selectors
+            if not blocks or not selectors:
                 self._streamer.send(zeros, md)
                 md.start_of_burst = False
-                idx = 0
+                sel_i = samp_i = 0
                 continue
+            if sel_i >= len(selectors):
+                sel_i = 0
+            buf = blocks[selectors[sel_i]]
             n = buf.size
-            if idx >= n:
-                idx = 0
-            end = min(idx + spp, n)             # variable chunk at the wrap boundary,
-            chunk = buf[idx:end]                # so looping never allocates/concats
+            if samp_i >= n:
+                samp_i = 0
+            end = min(samp_i + spp, n)          # variable chunk at each block edge,
+            chunk = buf[samp_i:end]             # so looping never allocates/concats
             self._streamer.send(
                 np.ascontiguousarray(chunk.reshape(1, chunk.size)), md)
             md.start_of_burst = False
-            idx = 0 if end >= n else end
+            if end >= n:                        # block done → advance the selector
+                samp_i = 0
+                sel_i = (sel_i + 1) % len(selectors)
+            else:
+                samp_i = end
 
     def _send_eob(self) -> None:
         np = self.radio.np
@@ -679,21 +742,45 @@ def _self_test() -> int:
     except ValueError:
         check(True, "non-±1 secondary rejected")
 
-    # build_base_buffer (needs NumPy; skip gracefully if absent)
+    # build_playlist (needs NumPy; skip gracefully if absent)
     try:
         import numpy as np
         tmpd = tempfile.mkdtemp()
         chipf = os.path.join(tmpd, "chips.fc32")
         np.array([1 + 0j, -1 + 0j, 1 + 0j], dtype=np.complex64).tofile(chipf)
-        buf = build_base_buffer(ChannelSpec(mode="pcode", freq_hz=1e9, iq_file=chipf, interp=4))
-        check(buf.size == 12 and buf[0] == 1 and buf[4] == -1, "pcode np.repeat expands chips")
+        blk, sel = build_playlist(ChannelSpec(mode="pcode", freq_hz=1e9, iq_file=chipf, interp=4))
+        check(len(blk) == 1 and sel == [0] and blk[0].size == 12
+              and blk[0][0] == 1 and blk[0][4] == -1, "pcode np.repeat expands chips")
         primf = os.path.join(tmpd, "prim.fc32")
         np.array([1 + 0j, 1j], dtype=np.complex64).tofile(primf)
-        tb = build_base_buffer(ChannelSpec(mode="tiered", freq_hz=1e9, primary_file=primf,
-                                           secondary=[1, -1], period_samples=2))
-        check(tb.size == 4 and tb[2] == -1 and tb[3] == -1j, "tiered applies ±1 per period")
+        blk, sel = build_playlist(ChannelSpec(mode="tiered", freq_hz=1e9, primary_file=primf,
+                                              secondary=[1, -1, 1], period_samples=2))
+        check(len(blk) == 2 and sel == [0, 1, 0] and blk[1][0] == -1 and blk[1][1] == -1j,
+              "tiered → [+primary,−primary] + selectors from overlay")
+
+        # composite: two blocks + a selector sequence, and the EXACTNESS guarantee —
+        # the streamed playlist equals a single fully-baked buffer, byte for byte.
+        b0 = os.path.join(tmpd, "b0.fc32"); b1 = os.path.join(tmpd, "b1.fc32")
+        B0 = np.array([1 + 0j, 2 + 0j, 3 + 0j], dtype=np.complex64)
+        B1 = np.array([-1 + 0j, -2 + 0j, -3 + 0j], dtype=np.complex64)
+        B0.tofile(b0); B1.tofile(b1)
+        selectors = [0, 1, 1, 0]
+        blocks, sel = build_playlist(ChannelSpec(
+            mode="composite", freq_hz=1e9, block_files=[b0, b1], selectors=selectors))
+        streamed = np.concatenate([blocks[s] for s in sel])           # what the thread emits
+        baked = np.concatenate([[B0, B1][s] for s in selectors])      # a single big buffer
+        check(np.array_equal(streamed, baked), "composite playlist == fully-baked buffer (exact)")
+        # unequal-length blocks are rejected
+        bshort = os.path.join(tmpd, "bs.fc32")
+        np.array([1 + 0j], dtype=np.complex64).tofile(bshort)
+        try:
+            build_playlist(ChannelSpec(mode="composite", freq_hz=1e9,
+                                       block_files=[b0, bshort], selectors=[0, 1]))
+            check(False, "unequal-length composite blocks rejected")
+        except ValueError:
+            check(True, "unequal-length composite blocks rejected")
     except ImportError:
-        check(True, "build_base_buffer skipped (no NumPy here)")
+        check(True, "build_playlist skipped (no NumPy here)")
 
     # End-to-end over a real Unix socket with the mock backend.
     tmp = tempfile.mkdtemp()
@@ -743,6 +830,14 @@ def _self_test() -> int:
               "spec": {"mode": "pcode", "freq_hz": 1.602e9, "iq_file": iqf,
                        "interp": 4, "label": "glonass_p"}})
     check(r["ok"], "load pcode on ch1")
+    # composite load over the socket (two blocks + selectors)
+    check(call({"cmd": "configure", "channel": 3, "owner": "D",
+                "target_rate_hz": 20.48e6})["ok"], "configure ch3 for composite")
+    r = call({"cmd": "load", "channel": 3, "owner": "D",
+              "spec": {"mode": "composite", "freq_hz": 1.57542e9,
+                       "block_files": [iqf, iqf], "selectors": [0, 1, 1, 0],
+                       "label": "l1c prn5"}})
+    check(r["ok"], "load composite on ch3")
     st = call({"cmd": "status"})
     owners = {c["channel"]: c["owner"] for c in st["channels"]}
     rates = {c["channel"]: c["rate_hz"] for c in st["channels"]}
