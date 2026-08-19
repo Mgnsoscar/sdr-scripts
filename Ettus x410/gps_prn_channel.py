@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-gps_l1ca_channel — GPS L1 C/A PRN channel-task for the X410 engine.
+gps_prn_channel — GPS C/A Gold-code PRN channel-task for the X410 engine.
+
+Plays a GPS C/A Gold code on one engine channel, at a selectable chip rate and
+carrier — which covers three signals from one script (create a task per config):
+
+  • GPS L1 C/A   : 1.023 Mcps @ 1575.42 MHz  (~2 MHz null-to-null)
+  • GPS L1 P(Y)  : 10.23 Mcps @ 1575.42 MHz  (~20 MHz — the C/A code clocked 10×,
+  • GPS L2 P(Y)  : 10.23 Mcps @ 1227.60 MHz   an unclassified P(Y) surrogate: the
+                                               real precision code is encrypted,
+                                               so this matches the RF/spectral
+                                               shape with a C/A Gold code, like
+                                               the M-code surrogate script)
 
 This is a *channel-task*: it does NOT own the radio. The persistent x410_engine
 owns UHD (all four channels); this task builds one signal's IQ, hands it to the
@@ -21,6 +32,9 @@ What it does
 The engine copies the IQ into RAM at load, so the /dev/shm file is deleted right
 after — no lingering buffer.
 
+At 10.23 Mcps the ~20 MHz main lobe needs a wide sample rate — use 40.96 MHz or
+higher (61.44 MHz is cleanest); the 20 MHz option only just spans the main lobe.
+
 On-air handshake (pre-roll)
 ───────────────────────────
 Start this task ~10 s before on-air with `--amplitude 0`; it streams silence
@@ -28,15 +42,18 @@ Start this task ~10 s before on-air with `--amplitude 0`; it streams silence
 instant a timeline tune-step raises `amplitude` (and/or `gain`) live. Set a
 non-zero `--amplitude` instead to transmit immediately on load.
 
-⚠  RF SAFETY / LEGAL: L1 (1575.42 MHz) is a live GNSS band. Transmit ONLY into a
-   shielded/conducted setup (cable + attenuators) you are LICENSED / AUTHORISED
-   to use. Radiating a PRN over the air can jam or spoof real receivers.
+⚠  RF SAFETY / LEGAL: L1 (1575.42 MHz) and L2 (1227.60 MHz) are live GNSS bands.
+   Transmit ONLY into a shielded/conducted setup (cable + attenuators) you are
+   LICENSED / AUTHORISED to use. Radiating a PRN over the air can jam or spoof
+   real receivers.
 
 CLI
 ───
-    gps_l1ca_channel.py --channel 0 --prn 5 --samp_rate 20.46 --gain 45 --amplitude 0
-    gps_l1ca_channel.py --self-test        # verify the Gold-code generator, no engine
-    gps_l1ca_channel.py --describe-params  # paramkit JSON schema for the GUI
+    gps_prn_channel.py --channel 0 --prn 5 --code_rate 1.023 --freq 1.57542e9  # L1 C/A
+    gps_prn_channel.py --channel 1 --prn 5 --code_rate 10.23 --freq 1.57542e9 --samp_rate 61.38  # L1 P(Y)
+    gps_prn_channel.py --channel 2 --prn 5 --code_rate 10.23 --freq 1.2276e9 --samp_rate 61.38   # L2 P(Y)
+    gps_prn_channel.py --self-test        # Gold code + negotiation fidelity, no engine
+    gps_prn_channel.py --describe-params  # paramkit JSON schema for the GUI
 """
 from __future__ import annotations
 
@@ -59,10 +76,11 @@ L2_HZ = 1227.60e6
 CODE_LEN = 1023                 # chips in a GPS C/A Gold code period
 
 # Selectable spreading-code rates. 1.023 Mcps is the true C/A rate (~2 MHz
-# null-to-null); 10.23 Mcps is the same Gold code clocked 10× (~20 MHz).
+# null-to-null); 10.23 Mcps is the same Gold code clocked 10× (~20 MHz) — the
+# unclassified P(Y) surrogate.
 CODE_RATES_MCPS = {
-    "1 MHz code — 1.023 Mcps (~2 MHz BW)":   1.023,
-    "10 MHz code — 10.23 Mcps (~20 MHz BW)": 10.23,
+    "C/A — 1.023 Mcps (~2 MHz BW)":          1.023,
+    "P(Y) surrogate — 10.23 Mcps (~20 MHz)": 10.23,
 }
 
 FREQUENCIES = {
@@ -189,6 +207,13 @@ def _self_test() -> int:
         good_iso = iso < -18.0
         ok = ok and good_iso
         print(f"cross-PRN isolation (5 vs 7): {iso:.2f} dB [{'OK' if good_iso else 'FAIL'}]")
+
+        # P(Y) surrogate: same Gold code at 10.23 Mcps (~20 MHz), wide sample rate.
+        # Engine negotiates 61.38→61.44 MHz; prove it still acquires cleanly.
+        ok = check_negotiation_fidelity(
+            lambda r: build_iq_buffer(5, 10.23e6, r)[0],
+            chip_rate_hz=10.23e6, ideal_rate_hz=61.38e6, negotiated_rate_hz=61.44e6,
+            label="P(Y) surrogate", min_db=20.0) and ok
     except ImportError:
         print("buffer/fidelity: skipped (no NumPy here)")
     print("ALL CHECKS PASSED" if ok else "SELF-TEST FAILED")
@@ -199,9 +224,9 @@ def _self_test() -> int:
 
 def build_script() -> Script:
     return (
-        Script("GPS L1 C/A PRN channel-task — plays one C/A Gold code on one X410 "
-               "engine channel. The engine owns the radio; this builds the IQ and "
-               "drives the channel.")
+        Script("GPS C/A Gold-code PRN channel-task — plays a C/A Gold code on one "
+               "X410 engine channel at a selectable chip rate/carrier: L1 C/A "
+               "(1.023 Mcps), or the P(Y) surrogate (10.23 Mcps) on L1 or L2.")
         .integer("-Channel", "--channel", min=0, max=3, default=0, required=True,
                  help="X410 engine channel (0=RF0 … 3=RF3). Fixed per run.")
         .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
@@ -272,9 +297,12 @@ def main() -> int:
         iq, n_samples, n_periods = build_iq_buffer(args.prn, chip_rate_hz, actual_rate)
         iq_path = _write_shm(iq)
 
-        print("── GPS L1 C/A channel-task ─────────────────────────────────")
+        # Name the signal by chip rate: C/A (1.023) vs the P(Y) surrogate (10.23).
+        kind = "c/a" if abs(args.code_rate - 1.023) < 0.05 else "p(y)"
+
+        print("── GPS PRN channel-task ────────────────────────────────────")
         print(f"  engine channel : {ch}   owner {owner}")
-        print(f"  PRN            : {args.prn}")
+        print(f"  PRN            : {args.prn}   signal {kind.upper()}")
         print(f"  carrier        : {args.freq/1e6:.3f} MHz")
         print(f"  code rate      : {args.code_rate:g} Mcps")
         print(f"  sample rate    : requested {args.samp_rate:g} MHz, "
@@ -289,7 +317,7 @@ def main() -> int:
             eng.load(ch, owner, {
                 "mode": "expanded", "freq_hz": args.freq, "gain_db": args.gain,
                 "amplitude": args.amplitude, "iq_file": iq_path,
-                "label": f"gps_l1ca prn{args.prn}"})
+                "label": f"gps_{kind} prn{args.prn}"})
         finally:
             # The engine copied the IQ into RAM at load — the file is done with.
             try:
