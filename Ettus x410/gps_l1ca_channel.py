@@ -176,8 +176,21 @@ def _self_test() -> int:
         ok = ok and good
         print(f"buffer: n={n} periods={periods} unit-mag={bool(np.all(np.abs(iq)==1.0))} "
               f"[{'OK' if good else 'FAIL'}]")
+
+        # Modulation fidelity: the engine negotiates 20.46→20.48 MHz (non-integer
+        # samples/chip); prove that still acquires as well as the integer-rate ideal.
+        from gnss_acq import check_negotiation_fidelity, cross_isolation_db
+        ok = check_negotiation_fidelity(
+            lambda r: build_iq_buffer(5, 1.023e6, r)[0],
+            chip_rate_hz=1.023e6, ideal_rate_hz=20.46e6, negotiated_rate_hz=20.48e6,
+            label="L1 C/A") and ok
+        iso = cross_isolation_db(build_iq_buffer(5, 1.023e6, 20.48e6)[0],
+                                 build_iq_buffer(7, 1.023e6, 20.48e6)[0])
+        good_iso = iso < -18.0
+        ok = ok and good_iso
+        print(f"cross-PRN isolation (5 vs 7): {iso:.2f} dB [{'OK' if good_iso else 'FAIL'}]")
     except ImportError:
-        print("buffer: skipped (no NumPy here)")
+        print("buffer/fidelity: skipped (no NumPy here)")
     print("ALL CHECKS PASSED" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
