@@ -112,20 +112,15 @@ Every signal lowers to one of these engine modes:
      python3 x410_engine.py --backend replay --master_clock 245.76
      ```
 
-     **Requires a Replay-capable FPGA image.** Not every X410 image includes a
-     Replay/DRAM block (some show only Radio + DUC blocks). If `--list_rfnoc` shows
-     no Replay block, load one that has it — download the stock images and flash the
-     default, then re-check:
-
-     ```sh
-     uhd_images_downloader                       # fetch stock X410 images
-     uhd_image_loader --args "type=x4xx"         # flash (X4_200 includes Replay)
-     uhd_usrp_probe | grep -i replay             # confirm a Replay block is present
-     ```
-
-     If your image genuinely can't provide a Replay block and reflashing isn't an
-     option, the wide-rate signal has to stay on `--backend stream` (and we revisit
-     an int16-host memcpy path to push the stream ceiling instead).
+     **Requires a Replay-capable FPGA image — which means UHD ≥ 4.5 on the X410.**
+     The stock `X4_200` image only gained a Replay/DRAM block in **UHD 4.5**; older
+     devices (e.g. UHD 4.1) show only Radio + DDC + DUC blocks and `--list_rfnoc`
+     reports no Replay. An FPGA image is locked to its MPM/UHD version, so you can't
+     drop a 4.5 `.bit` onto a 4.1 device — getting Replay means upgrading the whole
+     X410 to UHD ≥ 4.5 (device filesystem/MPM/FPGA + a compatible host UHD). That's
+     a full firmware upgrade of the unit; on a deployed system, weigh it against
+     staying on `--backend stream` with the int16-host memcpy path (below), which
+     needs no firmware change.
 
      Notes: `--otw`/`--cpu`/`--send_ms` don't apply (there's no host sample loop).
      Digital `amplitude` acts as play/mute (0 = not playing); set the level with
@@ -148,16 +143,37 @@ Every signal lowers to one of these engine modes:
      errors (`Cannot find a conversion routine … fc32 → sc8_chdr`). `--cpu auto`
      handles this: it selects an `sc8` host for an `sc8` wire automatically.
    - `--cpu` — the host sample format. `auto` (default) keeps the proven `fc32`
-     path for `sc16` and matches the wire for `sc8`. Setting `--cpu sc16`/`sc8`
-     builds the samples **already in the wire layout**, so `send()` is a pure
-     memcpy — no per-sample conversion on the ARM. IQ is packed into the wire
-     format once, at load, not on every send.
+     path for `sc16` and matches the wire for `sc8`. Setting **`--cpu sc16`** (with
+     the default `sc16` wire) builds the samples **already in the wire layout**, so
+     `send()` is a pure memcpy — no `fc32→sc16` conversion on the ARM, which is the
+     real cost at 61.44 MS/s. IQ is packed once, at load, not on every send. The
+     packing interleaves I/Q ints and presents them as one wide scalar per sample
+     (int32 for `sc16`, int16 for `sc8`) — a byte-exact wire layout UHD accepts
+     (a numpy *record* dtype does **not** work — it garbles TX). **Verify once on
+     an analyzer** (see below) before trusting a wide run, since the integer send
+     path is only exercisable on hardware.
    - `--send_ms` — how many ms of samples go out per `send()` call (default 10).
      Bigger = far fewer Python/UHD calls per second (the real ARM cost) at the
      price of live-tune latency.
 
-   A good high-rate recipe: `--otw sc8 --cpu auto --send_ms 20`. Underflows are
-   reported per channel in the log and in `status` (see *Underflow monitoring*).
+   Recipes: for full-fidelity high rate without a firmware change, **`--cpu sc16
+   --send_ms 20`** (memcpy, 16-bit); if you also need to halve the wire rate,
+   `--otw sc8 --cpu auto --send_ms 20`. Underflows are reported per channel in the
+   log and in `status` (see *Underflow monitoring*).
+
+   **Verifying the integer host path.** The packing math is unit-tested, but that
+   UHD interprets the buffer correctly can only be confirmed on the radio. Send one
+   signal both ways into your analyzer and confirm they're identical:
+
+   ```sh
+   # A: baseline (proven)     python3 x410_engine.py --cpu fc32 ...
+   # B: memcpy path           python3 x410_engine.py --cpu sc16 ...
+   # then run e.g. fm_chirp or gps_prn at ~20 MS/s and compare the spectra —
+   # same centre, same shape, no mirror image (an I/Q swap reverses a chirp).
+   ```
+
+   Once B matches A at 20 MS/s, push the rate to 61.44 and watch the log for
+   `[engine] chN TX underflow` — zero underflows means you've cleared the wall.
 
 3. **Run channel-tasks** against the engine socket, one per signal. Each is an
    ordinary agent task. Example (GPS L1 C/A on RF0):

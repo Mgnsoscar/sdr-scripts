@@ -518,34 +518,45 @@ class _ReplayChannel:
         return self.rate_hz
 
     # ── host sample format (fc32 complex64, or interleaved int16/int8) ──────────
+    #
+    # For an integer CPU format each sample is a pair of interleaved ints (I,Q). We
+    # build the interleaved ints, then present the buffer as a PLAIN scalar dtype
+    # whose itemsize equals one sample (int32 for sc16 = 4 B, int16 for sc8 = 2 B)
+    # via .view(). The bytes are exactly the wire layout UHD expects, and UHD reads
+    # nsamps = shape[-1] correctly. This avoids a numpy *record* dtype, which UHD's
+    # Python binding mishandles (it produced garbled TX). Little-endian aarch64, so
+    # the int16→int32 view keeps I in the low half, Q in the high half — byte-exact.
+    _VIEW = {"sc16": ("int16", "int32"), "sc8": ("int8", "int16")}
+
     def _host_dtype(self):
-        """numpy dtype for one sample in the streamer's CPU format. Integer formats
-        use a 2-field struct so each element is one interleaved-I/Q sample and UHD
-        reads the right sample count."""
+        """The scalar numpy dtype the send buffer is presented as (one element = one
+        sample): complex64 for fc32, else the wide view type (int32 / int16)."""
         np = self.radio.np
         cpu = self.radio.cpu
         if cpu == "fc32":
-            return np.complex64
-        idt = np.int16 if cpu == "sc16" else np.int8
-        return np.dtype([("re", idt), ("im", idt)])
+            return np.dtype(np.complex64)
+        return np.dtype(self._VIEW[cpu][1])
 
     def _to_host(self, cfloat):
         """A unit-scale complex64 buffer → a contiguous (1, N) array in the streamer's
         CPU format, ready to send with no conversion (integer) or the proven fc32
-        path. Integer output is rounded and clipped to full-scale."""
+        path. Integer output is rounded and clipped to full-scale, interleaved I/Q,
+        then viewed as one wide element per sample."""
         np = self.radio.np
         cpu = self.radio.cpu
         n = int(cfloat.size)
         if cpu == "fc32":
             return np.ascontiguousarray(cfloat, dtype=np.complex64).reshape(1, n)
         full = _INT_FULL_SCALE[cpu]
-        idt = np.int16 if cpu == "sc16" else np.int8
-        out = np.empty((1, n), dtype=np.dtype([("re", idt), ("im", idt)]))
-        out["re"][0] = np.clip(np.rint(cfloat.real * full), -full, full).astype(idt)
-        out["im"][0] = np.clip(np.rint(cfloat.imag * full), -full, full).astype(idt)
-        return out
+        idt, view = self._VIEW[cpu]
+        inter = np.empty(2 * n, dtype=np.dtype(idt))     # [I0,Q0,I1,Q1,…]
+        inter[0::2] = np.clip(np.rint(cfloat.real * full), -full, full).astype(idt)
+        inter[1::2] = np.clip(np.rint(cfloat.imag * full), -full, full).astype(idt)
+        return inter.view(np.dtype(view)).reshape(1, n)  # one sample per element
 
     def _host_zeros(self, n):
+        # Zeros in the wire format are silence in either representation (all-zero
+        # bytes = (0,0) samples), so a plain zero array of the view dtype works.
         return self.radio.np.zeros((1, int(n)), dtype=self._host_dtype())
 
     # ── playlist / amplitude ──────────────────────────────────────────────────
@@ -1402,9 +1413,10 @@ def _self_test() -> int:
         check(True, "streamer-reuse check skipped (no NumPy here)")
 
     # Host-format packing: fc32 stays complex64; sc16/sc8 pack to interleaved-int
-    # samples (one struct element per sample) with correct scale, clipping and a
-    # zero-conversion (1, N) shape — this is what makes send() a memcpy and what an
-    # 8-bit wire needs (no fc32→sc8 converter in this UHD build).
+    # samples presented as one WIDE scalar element per sample (int32 / int16 view —
+    # NOT a record dtype, which UHD's Python binding mishandles). The bytes must be
+    # I,Q interleaved with correct scale/clip and a (1, N) shape so send() is a
+    # memcpy and UHD reads nsamps = N.
     try:
         import types as _types
         import numpy as _np
@@ -1421,19 +1433,20 @@ def _self_test() -> int:
               and _np.allclose(h32[0], c), "fc32 host stays complex64 (1,N)")
 
         h16 = _chan("sc16")._to_host(c)
-        check(h16.shape == (1, 3) and h16.dtype.names == ("re", "im")
-              and h16["re"][0, 0] == round(0.5 * 32767)
-              and h16["im"][0, 0] == round(-0.25 * 32767)
-              and h16["re"][0, 2] == 32767,             # +2.0 clips to full-scale
-              "sc16 host packs interleaved int16 with scale + clip")
+        i16 = h16.view(_np.int16).reshape(-1)          # decode the interleaved bytes
+        check(h16.dtype == _np.int32 and h16.shape == (1, 3) and h16.flags["C_CONTIGUOUS"]
+              and i16[0] == round(0.5 * 32767) and i16[1] == round(-0.25 * 32767)
+              and i16[4] == 32767,                     # +2.0 (I of sample 2) clips
+              "sc16 host = interleaved int16 viewed as int32 (scale + clip, 1×N)")
 
         h8 = _chan("sc8")._to_host(c)
-        check(h8.dtype.names == ("re", "im") and h8["re"].dtype == _np.int8
-              and h8["re"][0, 1] == -127 and h8["im"][0, 1] == 127,
-              "sc8 host packs interleaved int8 with clip to ±127")
+        i8 = h8.view(_np.int8).reshape(-1)
+        check(h8.dtype == _np.int16 and h8.shape == (1, 3)
+              and i8[2] == -127 and i8[3] == 127,      # sample 1 = (-1.0, +1.0)
+              "sc8 host = interleaved int8 viewed as int16 (clip to ±127, 1×N)")
 
         z = _chan("sc8")._host_zeros(4)
-        check(z.shape == (1, 4) and int(z["re"][0, 0]) == 0 and int(z["im"][0, 3]) == 0,
+        check(z.shape == (1, 4) and int(z.view(_np.int8).sum()) == 0,
               "host zeros are silent in the wire format")
     except ImportError:
         check(True, "host-format check skipped (no NumPy here)")
