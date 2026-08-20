@@ -71,7 +71,7 @@ Every signal lowers to one of these engine modes:
 |---|---|---|
 | **expanded** | one device-rate buffer, replayed | C/A, P(Y), L2C, L5, M-code, B1I/B2b/B3I/B2a, E5, PRS, AltBOC, chirp, GLONASS |
 | **composite** | a few distinct period-blocks + a per-period selector sequence; streams the full (e.g. 18 s overlay) signal from a handful of blocks, byte-identical to a fully-baked buffer | L1C, B1C, E1, E6 |
-| **tone** | a **generated** continuous-phase CW at a baseband offset — no buffer; the frequency can be drifted live | CW / drift-CW |
+| **tone** | a **generated** continuous-phase CW at a baseband offset — no buffer; the frequency can be drifted live, and a wide sweep hops the LO under a small baseband | CW / drift-CW |
 
 ---
 
@@ -155,7 +155,7 @@ negotiates to the nearest supported rate.
 | `glonass_sf_channel` | GLONASS **L1SF/L2SF** (FDMA P-code) | expanded | `--band L1\|L2`, `--mode channel\|band`, `--k -7..6` |
 | `iridium_stl_channel` | **Iridium / STL** DQPSK bursts *(surrogate)* | expanded | `--freq` (STL band), `--payload_symbols`, `--burst_period`, `--frames` |
 | `fm_chirp_channel` | FM chirp (swept tone) | expanded | `--freq`, `--bw`, `--rate`, `--waveform` |
-| `cw_channel` | **CW** tone + optional slow drift | tone | `--freq`, `--freq_end`, `--duration ≤1200`, `--drift once\|loop\|pingpong`, `--restart` |
+| `cw_channel` | **CW** tone + optional slow drift (wide spans hop the LO) | tone | `--freq`, `--freq_end`, `--duration ≤1200`, `--drift once\|loop\|pingpong`, `--restart` |
 
 **Surrogates:** M-code, PRS and Iridium/STL reproduce the correct RF/spectral (and,
 for Iridium, burst-timing) shape over an unclassified stand-in — the real sequences
@@ -174,14 +174,31 @@ continuous-phase and costs no buffer however slow it is.
 # pure CW at L1 (leave --freq_end unset)
 cw_channel.py --channel 0 --freq 1575.42e6 --gain 45 --amplitude 0
 
-# drift 1575.42 → 1575.43 MHz over 20 minutes, restartable from a tune-step
+# narrow drift 1575.42 → 1575.43 MHz over 20 min, restartable from a tune-step
 cw_channel.py --channel 1 --freq 1575.42e6 --freq_end 1575.43e6 \
     --duration 1200 --drift once --samp_rate 2.048
+
+# WIDE sweep 1600 → 1545 MHz over 15 min — the LO hops, baseband stays small
+cw_channel.py --channel 0 --freq 1600e6 --freq_end 1545e6 \
+    --duration 900 --drift once --samp_rate 5.0
 ```
 
 The drift begins at on-air (first `amplitude > 0`); the live `restart` flag re-runs
-it from the start. The drift range `|end−start|` must fit the baseband, so keep
-`--samp_rate` above it. (For a slowly-drifting narrow tone this stays small.)
+it from the start.
+
+**Narrow vs. wide sweeps** — a baseband tone can only occupy ±`samp_rate`/2, so the
+task picks the regime automatically:
+
+- **Narrow** (span ≤ one baseband window): the LO stays fixed at the drift centre
+  and the whole sweep is carried in baseband — perfectly continuous, no retunes.
+- **Wide** (span bigger than a window, e.g. the 55 MHz `1600→1545`): the hardware
+  **LO hops** in whole-window steps and the baseband tone fills in between. A hop
+  moves the LO and the baseband by equal-and-opposite amounts, so the *emitted*
+  frequency stays continuous across it — only the LO's own retune settle is a brief
+  transient. So a 55 MHz sweep needs only a few-MHz `--samp_rate` (one hop window),
+  not 55 MS/s. Hop count is `span ÷ window`, so a higher `--samp_rate` = fewer hops
+  (e.g. 55 MHz at 5 MS/s ≈ 16 hops, ~1/min). Keep the rate in the ARM's clean range
+  (~5 MS/s is solid; 10 MS/s jitters occasionally).
 
 ---
 
