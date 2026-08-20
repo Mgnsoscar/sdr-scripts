@@ -922,7 +922,7 @@ def _self_test() -> int:
 # ── Parameter schema / entry point ─────────────────────────────────────────────
 
 def build_script() -> Script:
-    clocks = {f"{c/1e6:g} MHz": c for c in STOCK_MASTER_CLOCKS_HZ}
+    clocks = {f"{c/1e6:g} MHz": c / 1e6 for c in STOCK_MASTER_CLOCKS_HZ}  # values in MHz
     return (
         Script("Persistent multi-channel IQ-replay engine for the USRP X410. Owns "
                "the device; channel-tasks drive channels (each at its own sample "
