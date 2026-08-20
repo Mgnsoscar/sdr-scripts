@@ -72,6 +72,9 @@ buffer, so nothing about fidelity is traded for the RAM saving.
                 (pilot+data sums, per-component overlays) that aren't one
                 block × one ±1 overlay. Reproduces the full-length signal
                 (e.g. L1C's 18 s overlay) from a handful of blocks.
+  • "tone"      a GENERATED continuous-phase CW at a baseband offset — no buffer    (drifting CW)
+                at all. `set` drifts tone_hz over time (phase-continuous via an
+                accumulator), so a 20-minute frequency ramp costs nothing.
 
 The on-air handshake (fits the agent's pre-roll)
 ────────────────────────────────────────────────
@@ -122,7 +125,7 @@ from paramkit import Script
 
 
 NUM_CHANNELS = 4
-MODES = ("expanded", "tiered", "pcode", "composite")
+MODES = ("expanded", "tiered", "pcode", "composite", "tone")
 
 # Stock X410 master clock rates (Hz). The engine only ever sets one of these; the
 # achievable per-channel rates are the integer divisors of the chosen clock.
@@ -176,6 +179,10 @@ class ChannelSpec:
     # the whole (e.g. 18 s) thing in RAM.
     block_files: List[str] = field(default_factory=list)   # device-rate period blocks
     selectors: List[int] = field(default_factory=list)     # index into block_files, per period
+    # tone — a GENERATED continuous-phase CW at a baseband offset (no buffer). The
+    # channel-task drifts tone_hz over time (e.g. a slow x→y frequency ramp); the
+    # engine's LO stays at freq_hz, so the emitted frequency is freq_hz + tone_hz.
+    tone_hz: float = 0.0
 
     def validate(self) -> None:
         if self.mode not in MODES:
@@ -184,6 +191,8 @@ class ChannelSpec:
             raise ValueError(f"amplitude must be 0..1, got {self.amplitude}")
         if self.freq_hz <= 0:
             raise ValueError("freq_hz must be positive")
+        if self.mode == "tone":
+            return                          # a generated tone needs no files
         if self.mode == "expanded":
             if not self.iq_file:
                 raise ValueError("expanded mode needs iq_file")
@@ -278,6 +287,7 @@ class RadioBackend:
     def set_amplitude(self, ch: int, a: float) -> None: ...
     def set_freq(self, ch: int, hz: float) -> None: ...
     def set_gain(self, ch: int, db: float) -> None: ...
+    def set_tone_hz(self, ch: int, hz: float) -> None: ...
     def actual_freq(self, ch: int) -> float: ...
     def actual_rate(self, ch: int) -> float: ...
     def benchmark(self, seconds: float, rates_hz: List[float]) -> Dict[str, Any]: ...
@@ -315,6 +325,7 @@ class MockRadio(RadioBackend):
     def set_amplitude(self, ch, a): self.calls.append(f"amp ch{ch} {a}")
     def set_freq(self, ch, hz): self._freq[ch] = hz; self.calls.append(f"freq ch{ch} {hz}")
     def set_gain(self, ch, db): self.calls.append(f"gain ch{ch} {db}")
+    def set_tone_hz(self, ch, hz): self.calls.append(f"tone ch{ch} {hz}")
     def actual_freq(self, ch): return self._freq[ch]
     def actual_rate(self, ch): return self._rate[ch]
 
@@ -358,10 +369,13 @@ class UhdRadio(RadioBackend):
         return self._chan[ch].configure(target_rate_hz)
 
     def load(self, ch, spec):
-        blocks, selectors = build_playlist(spec)   # NumPy expansion, once
         self.usrp.set_tx_freq(self.uhd.types.TuneRequest(spec.freq_hz), ch)
         self.usrp.set_tx_gain(spec.gain_db, ch)
-        self._chan[ch].load(blocks, selectors, spec.amplitude)
+        if spec.mode == "tone":
+            self._chan[ch].load_tone(spec.tone_hz, spec.amplitude)
+        else:
+            blocks, selectors = build_playlist(spec)   # NumPy expansion, once
+            self._chan[ch].load(blocks, selectors, spec.amplitude)
 
     def clear(self, ch):
         self._chan[ch].mute_idle()
@@ -370,6 +384,7 @@ class UhdRadio(RadioBackend):
     def set_freq(self, ch, hz):
         self.usrp.set_tx_freq(self.uhd.types.TuneRequest(float(hz)), ch)
     def set_gain(self, ch, db): self.usrp.set_tx_gain(float(db), ch)
+    def set_tone_hz(self, ch, hz): self._chan[ch].set_tone_hz(float(hz))
     def actual_freq(self, ch): return self.usrp.get_tx_freq(ch)
     def actual_rate(self, ch): return self._chan[ch].rate_hz
 
@@ -424,6 +439,9 @@ class _ReplayChannel:
         self._scaled = None            # list[complex64] blocks×amp — what's streamed
         self._selectors = None         # list[int] index into blocks, per period
         self._amp = 0.0
+        self._tone = False             # generated-CW mode (no buffer)
+        self._tone_hz = 0.0            # baseband tone frequency (live, drifts)
+        self._tone_phase = 0.0         # phase accumulator → continuous phase across changes
         self._streamer = None
         self._spp = 0
         self._running = threading.Event()
@@ -453,24 +471,40 @@ class _ReplayChannel:
         np = self.radio.np
         blocks = [np.ascontiguousarray(b, dtype=np.complex64) for b in blocks]
         with self._lock:
+            self._tone = False
             self._blocks = blocks
             self._selectors = list(selectors)
             self._amp = float(amplitude)
             self._scaled = self._scale(blocks, self._amp)
         self.start()   # ensure the thread is running (streams zeros while amp==0)
 
+    def load_tone(self, tone_hz: float, amplitude: float) -> None:
+        """Switch to generated-CW mode: a continuous-phase tone at `tone_hz` off the
+        LO. tone_hz is live (see set_tone_hz) so a task can drift it over time."""
+        with self._lock:
+            self._tone = True
+            self._tone_hz = float(tone_hz)
+            self._amp = float(amplitude)
+            self._blocks = self._scaled = self._selectors = None
+        self.start()
+
+    def set_tone_hz(self, hz: float) -> None:
+        with self._lock:
+            self._tone_hz = float(hz)      # phase stays continuous via the accumulator
+
     def set_amplitude(self, a: float) -> None:
         with self._lock:
             self._amp = float(a)
-            if self._blocks is None:
+            if self._tone or self._blocks is None:
                 return
             self._scaled = self._scale(self._blocks, self._amp)
 
     def mute_idle(self) -> None:
-        """Release a channel: mute and drop its playlist. The thread keeps running
-        and feeds zeros so the DUC stays fed (no device error), ready for reuse."""
+        """Release a channel: mute and drop its playlist/tone. The thread keeps
+        running and feeds zeros so the DUC stays fed, ready for reuse."""
         with self._lock:
             self._amp = 0.0
+            self._tone = False
             self._blocks = None
             self._scaled = None
             self._selectors = None
@@ -500,12 +534,27 @@ class _ReplayChannel:
         md.has_time_spec = False
         spp = self._spp
         zeros = np.zeros((1, spp), dtype=np.complex64)
+        rate = self.rate_hz or 1.0
+        ramp = np.arange(spp, dtype=np.float64)
         sel_i = 0        # position in the selector sequence
         samp_i = 0       # position within the current block
         while self._running.is_set():
             with self._lock:
+                tone = self._tone
                 blocks = self._scaled
                 selectors = self._selectors
+                tone_hz = self._tone_hz
+                amp = self._amp
+            if tone:
+                # Generated CW: continuous phase across frequency changes via the
+                # accumulator, so a drifting tone_hz produces no phase glitches.
+                w = 2.0 * np.pi * tone_hz / rate
+                ph = self._tone_phase + w * ramp
+                chunk = (amp * np.exp(1j * ph)).astype(np.complex64)
+                self._streamer.send(np.ascontiguousarray(chunk.reshape(1, spp)), md)
+                md.start_of_burst = False
+                self._tone_phase = (self._tone_phase + w * spp) % (2.0 * np.pi)
+                continue
             if not blocks or not selectors:
                 self._streamer.send(zeros, md)
                 md.start_of_burst = False
@@ -583,10 +632,10 @@ class Engine:
     def configure(self, ch: int, owner: str, target_rate_hz: float) -> float:
         with self._lock:
             self._check(ch, owner)
-            if self._owner[ch] is None:
-                self._owner[ch] = owner            # implicit acquire on configure
-            actual = self.backend.configure(ch, target_rate_hz)
+            actual = self.backend.configure(ch, target_rate_hz)   # may raise first
             self._rate[ch] = actual
+            if self._owner[ch] is None:
+                self._owner[ch] = owner            # implicit acquire once it succeeds
             return actual
 
     def load(self, ch: int, owner: str, spec: ChannelSpec) -> None:
@@ -604,7 +653,7 @@ class Engine:
             self._freq[ch] = spec.freq_hz
 
     def set(self, ch: int, owner: str, *, amplitude=None, freq_hz=None,
-            gain_db=None) -> None:
+            gain_db=None, tone_hz=None) -> None:
         with self._lock:
             self._check(ch, owner)
             if amplitude is not None:
@@ -613,6 +662,8 @@ class Engine:
                 self.backend.set_freq(ch, freq_hz); self._freq[ch] = freq_hz
             if gain_db is not None:
                 self.backend.set_gain(ch, gain_db)
+            if tone_hz is not None:
+                self.backend.set_tone_hz(ch, tone_hz)
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -661,7 +712,8 @@ class ControlServer:
                 e.load(ch, owner, ChannelSpec(**msg["spec"])); return {"ok": True}
             if cmd == "set":
                 e.set(ch, owner, amplitude=msg.get("amplitude"),
-                      freq_hz=msg.get("freq_hz"), gain_db=msg.get("gain_db"))
+                      freq_hz=msg.get("freq_hz"), gain_db=msg.get("gain_db"),
+                      tone_hz=msg.get("tone_hz"))
                 return {"ok": True}
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
         except (KeyError,) as ex:
@@ -852,6 +904,15 @@ def _self_test() -> int:
                     "spec": {"mode": "expanded", "freq_hz": 1e9,
                              "iq_file": "/no/such/file"}})["ok"],
           "load on unconfigured/ missing-file channel rejected")
+    # tone mode: generated CW needs no files, and tone_hz drifts via set
+    check(call({"cmd": "configure", "channel": 2, "owner": "T",
+                "target_rate_hz": 4e6})["ok"], "configure ch2 for tone")
+    r = call({"cmd": "load", "channel": 2, "owner": "T",
+              "spec": {"mode": "tone", "freq_hz": 1.57542e9, "tone_hz": 0.0,
+                       "amplitude": 0.0, "label": "cw"}})
+    check(r["ok"], "load tone on ch2 (no files)")
+    check(call({"cmd": "set", "channel": 2, "owner": "T", "tone_hz": 1234.0})["ok"],
+          "drift tone_hz via set")
     srv.stop()
 
     print("ALL ENGINE CHECKS PASSED" if ok else "SELF-TEST FAILED")
