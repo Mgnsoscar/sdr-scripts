@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+# transient IQ scratch (built into /dev/shm at runtime)
+*.fc32
