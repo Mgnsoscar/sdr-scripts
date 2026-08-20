@@ -290,6 +290,7 @@ class RadioBackend:
     def set_tone_hz(self, ch: int, hz: float) -> None: ...
     def actual_freq(self, ch: int) -> float: ...
     def actual_rate(self, ch: int) -> float: ...
+    def underflows(self, ch: int) -> int: ...
     def benchmark(self, seconds: float, rates_hz: List[float]) -> Dict[str, Any]: ...
 
 
@@ -328,6 +329,7 @@ class MockRadio(RadioBackend):
     def set_tone_hz(self, ch, hz): self.calls.append(f"tone ch{ch} {hz}")
     def actual_freq(self, ch): return self._freq[ch]
     def actual_rate(self, ch): return self._rate[ch]
+    def underflows(self, ch): return 0
 
     def benchmark(self, seconds, rates_hz):
         return {"seconds": seconds, "rates_hz": rates_hz, "underflows": 0,
@@ -387,6 +389,7 @@ class UhdRadio(RadioBackend):
     def set_tone_hz(self, ch, hz): self._chan[ch].set_tone_hz(float(hz))
     def actual_freq(self, ch): return self.usrp.get_tx_freq(ch)
     def actual_rate(self, ch): return self._chan[ch].rate_hz
+    def underflows(self, ch): return self._chan[ch]._underflows
 
     def benchmark(self, seconds: float, rates_hz: List[float]) -> Dict[str, Any]:
         """Stream a synthetic buffer per channel at the given per-channel rates for
@@ -442,10 +445,15 @@ class _ReplayChannel:
         self._tone = False             # generated-CW mode (no buffer)
         self._tone_hz = 0.0            # baseband tone frequency (live, drifts)
         self._tone_phase = 0.0         # phase accumulator → continuous phase across changes
+        self._tone_w = None            # cached angular step; step-vector rebuilt when it changes
+        self._tone_step = None         # cached exp(1j·w·n) per-sample phasor ramp (complex64)
         self._streamer = None
         self._spp = 0
         self._running = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._async_thread: Optional[threading.Thread] = None
+        self._underflows = 0           # TX underflows seen on this channel (async metadata)
+        self._underflow_warned = 0.0   # monotonic time of last throttled underflow warning
 
     # ── configuration ─────────────────────────────────────────────────────────
     def configure(self, target_rate_hz: float) -> float:
@@ -489,6 +497,8 @@ class _ReplayChannel:
             self._tone = True
             self._tone_hz = float(tone_hz)
             self._amp = float(amplitude)
+            self._tone_w = None          # force the step-vector to rebuild for this load
+            self._tone_step = None
             self._blocks = self._scaled = self._selectors = None
         self.start()
 
@@ -513,6 +523,13 @@ class _ReplayChannel:
             self._scaled = None
             self._selectors = None
 
+    @staticmethod
+    def _make_tone_step(np, w: float, ramp) -> "Any":
+        """The per-sample phasor ramp exp(1j·w·n), n in [0,spp), as complex64. Cached
+        by the caller and rebuilt only when the angular step w changes, so the tone
+        hot path avoids a full np.exp on every chunk."""
+        return np.exp(1j * w * ramp).astype(np.complex64)
+
     # ── streaming thread ──────────────────────────────────────────────────────
     def start(self) -> None:
         if self._streamer is None or self._running.is_set():
@@ -521,14 +538,49 @@ class _ReplayChannel:
         self._thread = threading.Thread(
             target=self._run, name=f"x410-ch{self.ch}", daemon=True)
         self._thread.start()
+        # Best-effort async monitor so TX underflows are counted and surfaced
+        # instead of vanishing (the engine disables UHD's fastpath 'U' markers).
+        self._async_thread = threading.Thread(
+            target=self._monitor_async, name=f"x410-ch{self.ch}-async", daemon=True)
+        self._async_thread.start()
 
     def stop(self) -> None:
         self._running.clear()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        if self._async_thread is not None:
+            self._async_thread.join(timeout=1.0)
+            self._async_thread = None
         if self._streamer is not None:
             self._send_eob()
+
+    def _monitor_async(self) -> None:
+        """Drain the streamer's async message queue, counting TX underflows and
+        printing a throttled warning. Best-effort: if the UHD async API isn't shaped
+        as expected (e.g. a mock backend), it exits quietly and streaming continues."""
+        uhd = self.radio.uhd
+        try:
+            md = uhd.types.TXAsyncMetadata()
+            codes = uhd.types.TXMetadataEventCode
+            underflow_codes = {codes.underflow, getattr(codes, "underflow_in_packet",
+                                                        codes.underflow)}
+        except Exception:
+            return
+        while self._running.is_set():
+            try:
+                if not self._streamer.recv_async_msg(md, 0.1):
+                    continue
+            except Exception:
+                return
+            if md.event_code in underflow_codes:
+                self._underflows += 1
+                now = time.monotonic()
+                if now - self._underflow_warned > 1.0:
+                    self._underflow_warned = now
+                    print(f"[engine] ch{self.ch} TX underflow (total {self._underflows}) "
+                          f"— host can't sustain {self.rate_hz/1e6:.3f} MS/s on this "
+                          f"channel", file=sys.stderr, flush=True)
 
     def _run(self) -> None:
         np = self.radio.np
@@ -538,7 +590,6 @@ class _ReplayChannel:
         md.has_time_spec = False
         spp = self._spp
         zeros = np.zeros((1, spp), dtype=np.complex64)
-        rate = self.rate_hz or 1.0
         ramp = np.arange(spp, dtype=np.float64)
         sel_i = 0        # position in the selector sequence
         samp_i = 0       # position within the current block
@@ -549,12 +600,22 @@ class _ReplayChannel:
                 selectors = self._selectors
                 tone_hz = self._tone_hz
                 amp = self._amp
+                rate = self.rate_hz or 1.0   # read fresh: a re-configure (reused
+                                             # channel) changes the negotiated rate,
+                                             # and the tone frequency must track it.
             if tone:
-                # Generated CW: continuous phase across frequency changes via the
-                # accumulator, so a drifting tone_hz produces no phase glitches.
+                # Generated CW: continuous phase across frequency (and rate) changes
+                # via the phase accumulator, so a drifting tone_hz produces no phase
+                # glitches. The per-sample phasor ramp exp(1j·w·n) is cached and only
+                # rebuilt when w changes (tone_hz or rate) — the hot path is then one
+                # scalar exp + one complex64 array multiply, cheap enough to feed the
+                # widest rates. A full np.exp per chunk here underflowed above ~2 MS/s.
                 w = 2.0 * np.pi * tone_hz / rate
-                ph = self._tone_phase + w * ramp
-                chunk = (amp * np.exp(1j * ph)).astype(np.complex64)
+                if w != self._tone_w or self._tone_step is None:
+                    self._tone_w = w
+                    self._tone_step = self._make_tone_step(np, w, ramp)
+                scal = np.complex64(amp * np.exp(1j * self._tone_phase))
+                chunk = scal * self._tone_step               # complex64 × complex64
                 self._streamer.send(np.ascontiguousarray(chunk.reshape(1, spp)), md)
                 md.start_of_burst = False
                 self._tone_phase = (self._tone_phase + w * spp) % (2.0 * np.pi)
@@ -674,7 +735,7 @@ class Engine:
             return {"master_clock_hz": self.master_clock_hz, "channels": [
                 {"channel": ch, "owner": self._owner[ch], "signal": self._signal[ch],
                  "amplitude": self._amp[ch], "freq_hz": self._freq[ch],
-                 "rate_hz": self._rate[ch]}
+                 "rate_hz": self._rate[ch], "underflows": self.backend.underflows(ch)}
                 for ch in range(self.channels)]}
 
     def benchmark(self, seconds: float, rates_hz: List[float]) -> Dict[str, Any]:
@@ -885,6 +946,48 @@ def _self_test() -> int:
               "_ReplayChannel reuses TX streamer across re-configures")
     except ImportError:
         check(True, "streamer-reuse check skipped (no NumPy here)")
+
+    # Generated-tone math (mirrors the _run hot path): the emitted baseband
+    # frequency equals tone_hz regardless of the negotiated sample rate, and the
+    # phase accumulator keeps the signal continuous when tone_hz changes mid-drift.
+    try:
+        import numpy as _np
+
+        def _emit(rate_hz, tone_hz, spp=257, nchunks=12, phase0=0.0):
+            ramp = _np.arange(spp, dtype=_np.float64)
+            w = 2.0 * _np.pi * tone_hz / rate_hz
+            step = _ReplayChannel._make_tone_step(_np, w, ramp)   # production builder
+            phase = phase0
+            out = []
+            for _ in range(nchunks):
+                scal = _np.complex64(_np.exp(1j * phase))
+                out.append(scal * step)
+                phase = (phase + w * spp) % (2.0 * _np.pi)
+            return _np.concatenate(out), phase
+
+        def _measure_hz(x, rate_hz):
+            d = _np.angle(x[1:] * _np.conj(x[:-1]))               # per-sample phase step
+            return float(_np.mean(d) / (2.0 * _np.pi) * rate_hz)
+
+        f_hi, _ = _emit(40.96e6, 12345.0)
+        f_lo, _ = _emit(2.048e6, 12345.0)
+        check(abs(_measure_hz(f_hi, 40.96e6) - 12345.0) < 1.0 and
+              abs(_measure_hz(f_lo, 2.048e6) - 12345.0) < 1.0,
+              "generated-tone frequency == tone_hz, independent of sample rate")
+
+        # continuity across a tone_hz change: end one chunk-run, carry the phase into
+        # a new frequency, and confirm the seam has no phase discontinuity. The
+        # accumulator carries the phase forward, so the seam sample still advances by
+        # the OLD per-sample step (the new frequency applies from the next sample) —
+        # a smooth continuation with no jump, which is the whole point of the phasor.
+        a, ph = _emit(2.048e6, 3000.0, nchunks=4)
+        b, _ = _emit(2.048e6, -4000.0, nchunks=4, phase0=ph)
+        w_old = 2.0 * _np.pi * 3000.0 / 2.048e6
+        seam = _np.angle(b[0] * _np.conj(a[-1])) - w_old
+        check(abs((seam + _np.pi) % (2.0 * _np.pi) - _np.pi) < 1e-6,
+              "tone phase stays continuous across a frequency change")
+    except ImportError:
+        check(True, "tone-frequency check skipped (no NumPy here)")
 
     # End-to-end over a real Unix socket with the mock backend.
     tmp = tempfile.mkdtemp()

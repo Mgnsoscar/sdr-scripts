@@ -115,6 +115,18 @@ follows this pattern, which fits the client's timeline:
 `freq`, `gain`, `amplitude` are live on every signal. The CW task adds a live
 `restart` trigger (re-run the drift from the start).
 
+### Underflow monitoring
+
+The engine normally suppresses UHD's fastpath `U` markers, so a struggling
+channel used to fail silently. Each channel now runs a lightweight async monitor:
+TX underflows are **counted per channel and exposed in `status`** (the
+`underflows` field), and a throttled `[engine] chN TX underflow …` line is logged
+to stderr. If a channel underflows, it's asking for more samples/s than the ARM
+can generate — lower that channel's `--samp_rate`, or move a wide signal off a
+crowded scene. The generated `tone` mode caches its per-sample phasor ramp (only
+rebuilt when the frequency changes), so a pure or drifting CW now streams cleanly
+at the wide rates too.
+
 ---
 
 ## Signal catalog
