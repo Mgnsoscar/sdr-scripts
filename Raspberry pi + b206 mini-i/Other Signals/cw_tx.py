@@ -164,6 +164,9 @@ def build_script() -> Script:
                 required=True, live=True,
                 help="Baseband digital amplitude (0..1). The drift begins when "
                      "amplitude first goes >0 (on-air). Live.")
+        .flag("-Restart", "--restart", live=True,
+              help="Live trigger (tune-step): restart the drift from the start "
+                   "frequency. Fire it to re-run the ramp from the beginning.")
     )
 
 
@@ -219,6 +222,10 @@ def main() -> int:
                 elif change.name == "gain":
                     tb.set_gain(change.value)
                     ctrl.report("gain", tb.actual_gain())
+                elif change.name == "restart" and change.value:
+                    t0 = time.monotonic()              # re-run the drift from start
+                    tb.set_tone(start - center)
+                    ctrl.report("restart", True)
             if t0 is not None and drifting:
                 f = drift_freq(time.monotonic() - t0, start, end, args.duration, args.drift)
                 tb.set_tone(f - center)

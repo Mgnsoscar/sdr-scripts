@@ -118,6 +118,9 @@ def build_script() -> Script:
                 required=True, live=True,
                 help="Digital amplitude 0..1. Start at 0 for a pre-roll — the drift "
                      "begins when amplitude first goes >0 (on-air). Live.")
+        .flag("-Restart", "--restart", live=True,
+              help="Live trigger (tune-step): restart the drift from the start "
+                   "frequency. Fire it to re-run the ramp from the beginning.")
         .text("-Engine-socket", "--engine_socket", default="/tmp/x410_engine.sock",
               help="Unix socket of the running x410_engine.")
         .text("-Owner", "--owner", default="",
@@ -185,6 +188,11 @@ def main() -> int:
                     elif change.name == "gain":
                         eng.set(ch, owner, gain_db=change.value)
                         ctrl.report("gain", change.value)
+                    elif change.name == "restart" and change.value:
+                        t0 = time.monotonic()              # re-run the drift from start
+                        eng.set(ch, owner, tone_hz=start - center)
+                        last_tone = start - center
+                        ctrl.report("restart", True)
                 except EngineError as exc:
                     print(f"[warn] live {change.name} rejected: {exc}", flush=True)
 
