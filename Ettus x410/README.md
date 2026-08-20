@@ -141,13 +141,16 @@ negotiates to the nearest supported rate.
 | `gal_e5_altboc_channel` | Galileo **E5 AltBOC(15,10)** (both sidebands) | expanded | `--svid 1..50` |
 | `glonass_of_channel` | GLONASS **L1OF/L2OF** (FDMA C/A) | expanded | `--band L1\|L2`, `--mode channel\|band`, `--k -7..6` |
 | `glonass_sf_channel` | GLONASS **L1SF/L2SF** (FDMA P-code) | expanded | `--band L1\|L2`, `--mode channel\|band`, `--k -7..6` |
+| `iridium_stl_channel` | **Iridium / STL** DQPSK bursts *(surrogate)* | expanded | `--freq` (STL band), `--payload_symbols`, `--burst_period`, `--frames` |
 | `fm_chirp_channel` | FM chirp (swept tone) | expanded | `--freq`, `--bw`, `--rate`, `--waveform` |
 | `cw_channel` | **CW** tone + optional slow drift | tone | `--freq`, `--freq_end`, `--duration ≤1200`, `--drift once\|loop\|pingpong`, `--restart` |
 
-**Surrogates:** M-code and PRS reproduce the correct RF/spectral shape over an
-unclassified stand-in code — the real sequences are classified. GPS "P(Y)" here is
-the C/A Gold code clocked at 10.23 Mcps (a wideband surrogate), *not* the encrypted
-P/Y. GLONASS SF is the **real** public P-code (reverse-engineered, unencrypted).
+**Surrogates:** M-code, PRS and Iridium/STL reproduce the correct RF/spectral (and,
+for Iridium, burst-timing) shape over an unclassified stand-in — the real sequences
+/ payloads are classified or proprietary. Iridium/STL is a burst DQPSK waveform, not
+a PRN. GPS "P(Y)" here is the C/A Gold code clocked at 10.23 Mcps (a wideband
+surrogate), *not* the encrypted P/Y. GLONASS SF is the **real** public P-code
+(reverse-engineered, unencrypted).
 
 ### CW / drift-CW
 
