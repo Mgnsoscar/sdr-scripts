@@ -731,6 +731,373 @@ class _ReplayChannel:
             pass
 
 
+# ── Replay-block backend (FPGA-DRAM playback, host-rate-independent) ───────────
+#
+# The streaming backend feeds every sample from the ARM in real time, so it
+# underflows once the per-channel rate outruns the ARM (≈10 MS/s and up). The
+# Replay backend removes the ARM from the sample path entirely: each signal's loop
+# is uploaded to FPGA DRAM ONCE (a non-real-time write — fc32→sc16 conversion
+# happens here, off the RF deadline, at full fidelity), then the RFNoC Replay block
+# streams it to the radio, looping, straight from DRAM. Nothing per-sample touches
+# the host, so 61.44 MS/s is as cheap as 1 MS/s and underflows are structural-
+# impossible. This is the correct high-rate path; the streaming backend stays the
+# default for lower rates and live drifting CW (which a static DRAM loop can't do).
+
+def bake_signal_loop(spec: "ChannelSpec"):
+    """Materialise a buffered spec into ONE contiguous complex64 loop — the full
+    selector sequence concatenated once. Looping it in the Replay block reproduces
+    the signal exactly (the same guarantee the streaming playlist gives, baked once
+    into DRAM instead of held in RAM). Not for tone mode."""
+    import numpy as np
+    blocks, selectors = build_playlist(spec)
+    loop = np.concatenate([blocks[s] for s in selectors]) if len(selectors) > 1 \
+        else blocks[selectors[0]]
+    return np.ascontiguousarray(loop, dtype=np.complex64)
+
+
+def bake_tone_loop(rate_hz: float, tone_hz: float, min_samps: int = 4096,
+                   max_samps: int = 1 << 20):
+    """A short complex64 CW loop at baseband tone_hz, sized to hold a whole number of
+    cycles so it loops seamlessly (DC → a constant buffer). For a STATIC tone on the
+    Replay backend; a drifting sweep re-bakes per step (better on the stream backend)."""
+    import numpy as np
+    if abs(tone_hz) < 1e-3 or rate_hz <= 0:
+        return np.ones(min_samps, dtype=np.complex64)
+    samples_per_cycle = rate_hz / abs(tone_hz)
+    cycles = max(1, int(round(min_samps / samples_per_cycle)))   # ≥ min_samps long
+    n = int(round(cycles * samples_per_cycle))
+    n = max(min_samps, min(n, max_samps))
+    t = np.arange(n, dtype=np.float64)
+    return np.exp(2j * np.pi * tone_hz * t / rate_hz).astype(np.complex64)
+
+
+def align_loop(loop_c64, samples_per_word: int, np):
+    """Tile the loop to a whole number of DRAM words (still seamless) so its sc16 byte
+    count is word-aligned for the Replay block. Returns the (possibly tiled) loop."""
+    import math
+    if samples_per_word <= 1 or loop_c64.size % samples_per_word == 0:
+        return loop_c64
+    reps = samples_per_word // math.gcd(loop_c64.size, samples_per_word)
+    return np.tile(loop_c64, reps)
+
+
+class RfnocRadio(RadioBackend):
+    """Replay-block backend: one RfnocGraph, per channel a Radio(+DUC) fed by a
+    Replay block that loops a DRAM buffer. Implements the same RadioBackend contract
+    as UhdRadio, so the Engine drives it unchanged. Amplitude is applied when baking
+    (0 = not playing = silent); gain and freq are live on the radio. tone mode bakes
+    a static CW loop (re-baked on tone change).
+
+    This path is exercised only on hardware; the RFNoC topology (block names, port
+    counts, DUC presence) varies by FPGA image, so discovery is dynamic and every
+    device call is logged with the step name to make bench iteration pinpointable."""
+
+    def __init__(self, device_args: str, master_clock_hz: float, channels: int,
+                 dram_mb: float = 0.0, **_ignored):
+        import numpy as np
+        import uhd
+        self.np = np
+        self.uhd = uhd
+        self.channels = channels
+        self._dram_mb = dram_mb
+
+        self._log("opening RFNoC graph…")
+        self.graph = uhd.rfnoc.RfnocGraph(device_args or "type=x4xx")
+        self._radios, self._ducs, self._replay, self._map = self._discover(channels)
+        self.master_clock_hz = float(master_clock_hz)
+        self._apply_master_clock()
+
+        # Per-channel state.
+        self._rate = [0.0] * channels
+        self._freq = [0.0] * channels
+        self._amp = [0.0] * channels
+        self._tone_hz = [0.0] * channels
+        self._mode = [None] * channels
+        self._loop = [None] * channels          # complex64 unit loop (re-bake on amp)
+        self._playing = [False] * channels
+        self._errors = [0] * channels
+        self._up_streamer = [None] * channels
+
+        self._word = self._replay_word_size()
+        self._mem = self._replay_mem_size()
+        self._region = self._mem // max(1, channels)   # DRAM slice per channel
+        self._wire_graph()
+        self.graph.commit()
+        self._log(f"graph committed: {channels} ch, DRAM {self._mem/1e6:.0f} MB "
+                  f"({self._region/1e6:.0f} MB/ch), word {self._word} B")
+
+    # ── logging ────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _log(msg: str) -> None:
+        print(f"[engine/replay] {msg}", file=sys.stderr, flush=True)
+
+    def _step(self, name: str, fn):
+        """Run a device call, logging the step so a hardware failure names exactly
+        which RFNoC call to look at."""
+        try:
+            return fn()
+        except Exception as ex:
+            self._log(f"FAILED at '{name}': {type(ex).__name__}: {ex}")
+            raise
+
+    # ── discovery / wiring (topology-dependent — logged for bench iteration) ────
+    def _discover(self, channels: int):
+        g = self.graph
+        radio_ids = list(g.find_blocks("Radio"))
+        duc_ids = list(g.find_blocks("DUC"))
+        replay_ids = list(g.find_blocks("Replay"))
+        self._log(f"blocks: radios={radio_ids} ducs={duc_ids} replay={replay_ids}")
+        if not radio_ids:
+            raise RuntimeError("no Radio blocks in the FPGA image")
+        if not replay_ids:
+            raise RuntimeError("no Replay block in the FPGA image — the Replay "
+                               "backend needs a DRAM/Replay-capable image (e.g. X4_200)")
+        radios = [self.uhd.rfnoc.RadioControl(g.get_block(i)) for i in radio_ids]
+        ducs = [self.uhd.rfnoc.DucBlockControl(g.get_block(i)) for i in duc_ids] \
+            if duc_ids else []
+        replay = self.uhd.rfnoc.ReplayBlockControl(g.get_block(replay_ids[0]))
+
+        # Flatten radio TX channels (each Radio block has get_num_input_ports TX
+        # ports) into a global channel list, pairing each with a DUC (if present).
+        chan_map = []
+        for r_idx, (rid, rc) in enumerate(zip(radio_ids, radios)):
+            n_tx = int(rc.get_num_input_ports())
+            for p in range(n_tx):
+                duc_idx = len(chan_map) if ducs else None
+                chan_map.append({"radio": r_idx, "radio_id": rid, "radio_port": p,
+                                 "duc": (duc_idx if ducs and duc_idx < len(ducs) else None),
+                                 "replay_port": len(chan_map)})
+        if len(chan_map) < channels:
+            raise RuntimeError(f"image exposes {len(chan_map)} TX channels, need {channels}")
+        chan_map = chan_map[:channels]
+        for ch, m in enumerate(chan_map):
+            self._log(f"ch{ch} → radio {m['radio_id']} port {m['radio_port']}, "
+                      f"duc {m['duc']}, replay port {m['replay_port']}")
+        self._replay_id = replay_ids[0]
+        self._duc_ids = duc_ids
+        return radios, ducs, replay, chan_map
+
+    def _wire_graph(self):
+        """Connect, per channel: upload-streamer → Replay in, and Replay out → (DUC) →
+        Radio. Recording and playback share the Replay block; the streamer only writes
+        DRAM (once, non-real-time)."""
+        g = self.graph
+        uhd = self.uhd
+        for ch, m in enumerate(self._map):
+            rport = m["replay_port"]
+            sa = uhd.usrp.StreamArgs("fc32", "sc16")   # host complex → sc16 into DRAM
+            sa.channels = [0]
+            st = self._step(f"ch{ch} create_tx_streamer",
+                            lambda: g.create_tx_streamer(1, sa))
+            self._up_streamer[ch] = st
+            self._step(f"ch{ch} connect streamer→replay[{rport}]",
+                       lambda: g.connect(st, 0, self._replay_id, rport))
+            if m["duc"] is not None:
+                did = self._duc_ids[m["duc"]]
+                self._step(f"ch{ch} connect replay[{rport}]→duc",
+                           lambda: g.connect(self._replay_id, rport, did, 0))
+                self._step(f"ch{ch} connect duc→radio",
+                           lambda: g.connect(did, 0, m["radio_id"], m["radio_port"]))
+            else:
+                self._step(f"ch{ch} connect replay[{rport}]→radio",
+                           lambda: g.connect(self._replay_id, rport,
+                                             m["radio_id"], m["radio_port"]))
+
+    def _apply_master_clock(self):
+        # Prefer the motherboard controller (sets the device master clock the radios
+        # run from); fall back to the radio's own rate. Best-effort — some images
+        # fix the clock at load, in which case we just read what's there.
+        try:
+            mbc = self.graph.get_mb_controller(0)
+            if hasattr(mbc, "set_master_clock_rate"):
+                mbc.set_master_clock_rate(self.master_clock_hz)
+        except Exception:
+            pass
+        for rc in self._radios:
+            try:
+                self.master_clock_hz = float(rc.get_rate())
+                break
+            except Exception:
+                pass
+
+    def _replay_word_size(self):
+        for name in ("get_word_size", "get_mem_word_size"):
+            fn = getattr(self._replay, name, None)
+            if fn:
+                try:
+                    return int(fn())
+                except Exception:
+                    pass
+        return 8       # X4xx DRAM word is 8 bytes (2× sc16 samples)
+
+    def _replay_mem_size(self):
+        fn = getattr(self._replay, "get_mem_size", None)
+        try:
+            return int(fn()) if fn else (1 << 31)
+        except Exception:
+            return 1 << 31
+
+    # ── RadioBackend contract ──────────────────────────────────────────────────
+    def start(self):
+        pass   # nothing streams until a channel plays
+
+    def stop(self):
+        for ch in range(self.channels):
+            self._stop_play(ch)
+
+    def configure(self, ch, target_rate_hz):
+        m = self._map[ch]
+        rate = float(target_rate_hz)
+        if m["duc"] is not None:
+            duc = self._ducs[m["duc"]]
+            self._step(f"ch{ch} duc.set_input_rate",
+                       lambda: duc.set_input_rate(rate, 0))
+            self._rate[ch] = float(self._step(f"ch{ch} duc.get_input_rate",
+                                              lambda: duc.get_input_rate(0)))
+        else:
+            # No DUC: the channel streams at the radio rate (its divisors).
+            self._rate[ch] = achievable_rate(self.master_clock_hz, rate)
+        return self._rate[ch]
+
+    def load(self, ch, spec):
+        self.set_freq(ch, spec.freq_hz)
+        self.set_gain(ch, spec.gain_db)
+        self._mode[ch] = spec.mode
+        if spec.mode == "tone":
+            self._tone_hz[ch] = spec.tone_hz
+            self._loop[ch] = bake_tone_loop(self._rate[ch], spec.tone_hz)
+        else:
+            self._loop[ch] = bake_signal_loop(spec)      # complex64 unit loop
+        self._amp[ch] = float(spec.amplitude)
+        self._apply(ch)                                   # upload + play (or stay silent)
+
+    def clear(self, ch):
+        self._stop_play(ch)
+        self._loop[ch] = None
+        self._mode[ch] = None
+        self._amp[ch] = 0.0
+
+    def set_amplitude(self, ch, a):
+        self._amp[ch] = float(a)
+        self._apply(ch)             # re-bake at the new amplitude (0 ⇒ silence)
+
+    def set_freq(self, ch, hz, rf_freq_hz=None):
+        m = self._map[ch]
+        rc = self._radios[m["radio"]]
+        tr = self.uhd.types.TuneRequest(float(hz))
+        if rf_freq_hz and rf_freq_hz > 0:
+            tr.rf_freq_policy = self.uhd.types.TuneRequestPolicy.manual
+            tr.rf_freq = float(rf_freq_hz)
+            tr.dsp_freq_policy = self.uhd.types.TuneRequestPolicy.auto
+        self._step(f"ch{ch} radio.set_tx_frequency",
+                   lambda: rc.set_tx_frequency(float(hz), m["radio_port"]))
+        self._freq[ch] = float(hz)
+
+    def set_gain(self, ch, db):
+        m = self._map[ch]
+        rc = self._radios[m["radio"]]
+        self._step(f"ch{ch} radio.set_tx_gain",
+                   lambda: rc.set_tx_gain(float(db), m["radio_port"]))
+
+    def set_tone_hz(self, ch, hz):
+        if self._mode[ch] != "tone":
+            return
+        self._tone_hz[ch] = float(hz)
+        self._loop[ch] = bake_tone_loop(self._rate[ch], float(hz))
+        self._apply(ch)             # re-bake + re-upload (brief gap; drift → use stream)
+
+    def actual_freq(self, ch):
+        return self._freq[ch]
+
+    def actual_rate(self, ch):
+        return self._rate[ch]
+
+    def underflows(self, ch):
+        return self._errors[ch]     # DRAM playback can't underflow; counts play errors
+
+    def benchmark(self, seconds, rates_hz):
+        return {"seconds": seconds, "rates_hz": rates_hz,
+                "master_clock_hz": self.master_clock_hz, "underflows": 0,
+                "note": "replay backend — FPGA-DRAM playback, host-rate-independent"}
+
+    # ── DRAM upload / play ─────────────────────────────────────────────────────
+    def _apply(self, ch):
+        """(Re)bake the loop at the current amplitude and start looping it from DRAM.
+        amplitude 0 ⇒ stop playing (silent). Called on load and on amplitude change."""
+        if self._loop[ch] is None:
+            return
+        if self._amp[ch] <= 0.0:
+            self._stop_play(ch)
+            return
+        np = self.np
+        loop = (self._loop[ch] * self._amp[ch]).astype(np.complex64)
+        loop = align_loop(loop, max(1, self._word // 4), np)   # sc16 = 4 B/sample
+        nbytes = loop.size * 4                                  # sc16 bytes in DRAM
+        if nbytes > self._region:
+            raise ValueError(
+                f"channel {ch} loop is {nbytes/1e6:.1f} MB but the per-channel DRAM "
+                f"budget is {self._region/1e6:.1f} MB — lower the rate or shorten the "
+                f"loop (or use --backend stream for this signal)")
+        self._stop_play(ch)
+        self._upload(ch, loop)
+        self._start_play(ch, nbytes)
+
+    def _upload(self, ch, loop_c64):
+        rport = self._map[ch]["replay_port"]
+        offset = ch * self._region
+        nbytes = loop_c64.size * 4                              # sc16 in DRAM
+        rep, st, uhd = self._replay, self._up_streamer[ch], self.uhd
+        self._step(f"ch{ch} replay.record",
+                   lambda: rep.record(offset, nbytes, rport))
+        # Upload as one burst; the fc32→sc16 conversion happens here, off the RF
+        # deadline, so it costs nothing in real time and keeps full sc16 fidelity.
+        md = uhd.types.TXMetadata()
+        md.start_of_burst = True
+        md.end_of_burst = True
+        md.has_time_spec = False
+        self._step(f"ch{ch} upload send()",
+                   lambda: st.send(loop_c64.reshape(1, loop_c64.size), md))
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                if int(rep.get_record_fullness(rport)) >= nbytes:
+                    break
+            except Exception:
+                break
+            time.sleep(0.01)
+        self._log(f"ch{ch} uploaded {nbytes/1e3:.1f} kB to DRAM offset {offset}")
+
+    def _start_play(self, ch, nbytes):
+        rport = self._map[ch]["replay_port"]
+        offset = ch * self._region
+        rep, uhd = self._replay, self.uhd
+        self._step(f"ch{ch} replay.set_play_type(sc16)",
+                   lambda: rep.set_play_type("sc16", rport))
+        self._step(f"ch{ch} replay.config_play",
+                   lambda: rep.config_play(offset, nbytes, rport))
+        try:
+            self._step(f"ch{ch} replay.play(repeat)",
+                       lambda: rep.play(offset, nbytes, rport,
+                                        uhd.types.TimeSpec(0.0), True))
+        except TypeError:
+            # Older signature without repeat/time_spec — set repeat separately.
+            if hasattr(rep, "set_play_repeat"):
+                rep.set_play_repeat(True, rport)
+            self._step(f"ch{ch} replay.play",
+                       lambda: rep.play(offset, nbytes, rport))
+        self._playing[ch] = True
+
+    def _stop_play(self, ch):
+        if not self._playing[ch]:
+            return
+        try:
+            self._replay.stop(self._map[ch]["replay_port"])
+        except Exception as ex:
+            self._errors[ch] += 1
+            self._log(f"ch{ch} replay.stop failed: {ex}")
+        self._playing[ch] = False
+
+
 # ── Engine: per-channel ownership + state, delegating to a backend ─────────────
 
 class Engine:
@@ -1063,6 +1430,45 @@ def _self_test() -> int:
     except ImportError:
         check(True, "host-format check skipped (no NumPy here)")
 
+    # Replay-backend baking (no hardware): the DRAM loop is the exact concatenation
+    # of the streaming playlist, the tone loop holds whole cycles (seamless), and
+    # word-alignment tiles without altering the waveform.
+    try:
+        import numpy as _np
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        f0 = os.path.join(d, "e.fc32")
+        sig = _np.array([1 + 0j, 1j, -1 + 0j, -1j, 2 + 0j, 3 + 0j], dtype=_np.complex64)
+        sig.tofile(f0)
+        loop = bake_signal_loop(ChannelSpec(mode="expanded", freq_hz=1e9, iq_file=f0))
+        check(_np.array_equal(loop, sig) and loop.dtype == _np.complex64,
+              "bake_signal_loop expands a spec to its exact loop")
+
+        fa = os.path.join(d, "a.fc32"); fb = os.path.join(d, "b.fc32")
+        A = _np.array([1 + 0j, 2 + 0j], dtype=_np.complex64)
+        Bb = _np.array([-1 + 0j, -2 + 0j], dtype=_np.complex64)
+        A.tofile(fa); Bb.tofile(fb)
+        cloop = bake_signal_loop(ChannelSpec(mode="composite", freq_hz=1e9,
+                                             block_files=[fa, fb], selectors=[0, 1, 1, 0]))
+        check(_np.array_equal(cloop, _np.concatenate([A, Bb, Bb, A])),
+              "bake_signal_loop composite == concatenated selector sequence")
+
+        dc = bake_tone_loop(4e6, 0.0)
+        check(_np.allclose(dc, 1.0), "bake_tone_loop DC → constant carrier")
+        tl = bake_tone_loop(4e6, 1e6)          # 4 samples/cycle, whole cycles
+        w = 2.0 * _np.pi * 1e6 / 4e6
+        fmeas = _np.mean(_np.angle(tl[1:] * _np.conj(tl[:-1]))) / (2 * _np.pi) * 4e6
+        seam = _np.angle(tl[0] * _np.conj(tl[-1]))    # wrap step ≈ one sample step
+        check(abs(fmeas - 1e6) < 1.0 and abs(abs(seam) - w) < 1e-3,
+              "bake_tone_loop holds the tone and loops seamlessly")
+
+        aligned = align_loop(_np.ones(3, dtype=_np.complex64), 2, _np)
+        check(aligned.size % 2 == 0
+              and align_loop(_np.ones(4, dtype=_np.complex64), 2, _np).size == 4,
+              "align_loop tiles to a whole DRAM word, leaves aligned loops alone")
+    except ImportError:
+        check(True, "replay-bake check skipped (no NumPy here)")
+
     # Generated-tone math (mirrors the _run hot path): the emitted baseband
     # frequency equals tone_hz regardless of the negotiated sample rate, and the
     # phase accumulator keeps the signal continuous when tone_hz changes mid-drift.
@@ -1215,10 +1621,19 @@ def build_script() -> Script:
               help="Unix socket path the control clients connect to.")
         .text("-Device-args", "--device_args", default="type=x4xx",
               help="UHD device args, e.g. 'type=x4xx,addr=192.168.10.2'.")
+        .choice("-Backend", "--backend",
+                options={"stream": "host streams every sample (default; simple, "
+                                   "supports live drifting CW; underflows ≳10 MS/s)",
+                         "replay": "FPGA-DRAM Replay block loops each signal — "
+                                   "host-rate-independent, no underflows at any rate"},
+                default="stream",
+                help="Playback engine. 'replay' uploads each signal to FPGA DRAM once "
+                     "and loops it from there, so wide rates (61.44 MS/s) never "
+                     "underflow. Needs a Replay-capable FPGA image.")
         .choice("-OTW-format", "--otw",
                 options={"sc16": "16-bit (default, full range)",
                          "sc8": "8-bit (halves the wire rate — helps at ≥10 MS/s)"},
-                default="sc16", help="Over-the-wire sample format.")
+                default="sc16", help="Over-the-wire sample format (stream backend).")
         .choice("-CPU-format", "--cpu",
                 options={"auto": "match the wire (fc32 for sc16, sc8 for sc8)",
                          "fc32": "complex float host (only valid with sc16 wire)",
@@ -1245,6 +1660,15 @@ def _parse_rates_mhz(s: str) -> List[float]:
     return [float(x) * 1e6 for x in str(s).split(",") if x.strip()]
 
 
+def build_backend(args, master_clock_hz):
+    """Construct the selected backend. 'replay' uses the FPGA Replay block; 'stream'
+    (default) uses the host-streaming path."""
+    if args.backend == "replay":
+        return RfnocRadio(args.device_args, master_clock_hz, args.channels)
+    return UhdRadio(args.device_args, master_clock_hz, args.channels, args.otw,
+                    args.cpu, args.send_ms)
+
+
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
@@ -1254,8 +1678,7 @@ def main() -> int:
 
     if args.benchmark and args.benchmark > 0:
         rates = _parse_rates_mhz(args.bench_rates)
-        radio = UhdRadio(args.device_args, master_clock_hz, args.channels, args.otw,
-                         args.cpu, args.send_ms)
+        radio = build_backend(args, master_clock_hz)
         print(f"[benchmark] {args.channels} ch, master {radio.master_clock_hz/1e6:g} MHz, "
               f"rates {[f'{r/1e6:g}' for r in rates]} MHz, {args.benchmark:g}s…", flush=True)
         result = radio.benchmark(args.benchmark, rates)
@@ -1264,8 +1687,7 @@ def main() -> int:
         print("RESULT:", "clean (no underflows)" if u == 0 else f"{u} underflow marker(s)")
         return 0
 
-    radio = UhdRadio(args.device_args, master_clock_hz, args.channels, args.otw,
-                     args.cpu, args.send_ms)
+    radio = build_backend(args, master_clock_hz)
     engine = Engine(radio, channels=args.channels)
     server = ControlServer(engine, args.socket)
 
@@ -1273,9 +1695,12 @@ def main() -> int:
     print("── X410 engine ─────────────────────────────────────────────")
     print(f"  device         : {args.device_args}")
     print(f"  master clock   : {radio.master_clock_hz/1e6:g} MHz  ({args.channels} channels)")
-    print(f"  sample format  : host {radio.cpu} → wire {args.otw}"
-          f"{'  (memcpy send)' if radio.cpu == args.otw else ''}, "
-          f"{args.send_ms:g} ms/send")
+    if args.backend == "replay":
+        print("  backend        : replay (FPGA-DRAM loop — no host-rate limit)")
+    else:
+        print(f"  backend        : stream — host {radio.cpu} → wire {args.otw}"
+              f"{'  (memcpy send)' if radio.cpu == args.otw else ''}, "
+              f"{args.send_ms:g} ms/send")
     print(f"  control socket : {args.socket}")
     print("  all channels idle (muted); waiting for channel-tasks…")
     print("────────────────────────────────────────────────────────────")

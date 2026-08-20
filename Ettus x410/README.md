@@ -90,9 +90,37 @@ Every signal lowers to one of these engine modes:
 
    It opens the device, sets the master clock, and waits — all channels idle/muted.
 
-   **Wire / host sample format & throughput** (`--otw`, `--cpu`, `--send_ms`).
-   At high per-channel rates (≳10 MS/s) the ARM can underflow. Three levers, all
-   about moving fewer bytes and doing less per-sample work:
+   **Two playback backends (`--backend stream | replay`).** This is the main
+   throughput decision:
+
+   - **`stream`** (default) — the ARM streams every sample in real time. Simple,
+     supports live drifting CW, and the only path that needs the format/throughput
+     knobs below. It underflows once a per-channel rate outruns the ARM (≈10 MS/s+).
+   - **`replay`** — each signal's loop is uploaded to **FPGA DRAM once** and the
+     RFNoC **Replay block** streams it to the radio, looping, straight from DRAM.
+     Nothing per-sample touches the host, so **61.44 MS/s is as cheap as 1 MS/s and
+     underflows are structurally impossible**. The one-time upload does the
+     `fc32→sc16` conversion off the RF deadline, so you keep full 16-bit fidelity
+     with no host real-time cost. This is the right path for wide signals (E5
+     AltBOC, etc.). Needs a Replay-capable FPGA image (e.g. the stock `X4_200`).
+
+     ```sh
+     python3 x410_engine.py --backend replay --master_clock 245.76
+     ```
+
+     Notes: `--otw`/`--cpu`/`--send_ms` don't apply (there's no host sample loop).
+     Digital `amplitude` acts as play/mute (0 = not playing); set the level with
+     `gain`. A **static** CW works (a baked loop); a **drifting** CW re-bakes per
+     step, so run sweeps on `--backend stream`. Each channel gets an equal slice of
+     DRAM; a loop bigger than its slice is rejected (lower the rate or shorten it).
+     The engine logs the discovered RFNoC topology and every device call under
+     `[engine/replay]`, so a first-run mismatch on your image points to the exact
+     block/port to adjust.
+
+   **Wire / host sample format & throughput** (`--otw`, `--cpu`, `--send_ms`;
+   `stream` backend only). At high per-channel rates (≳10 MS/s) the ARM can
+   underflow. Three levers, all about moving fewer bytes and doing less per-sample
+   work — or just switch to `--backend replay` above:
 
    - `--otw sc8` — 8-bit over the wire, half the data rate of the default `sc16`.
      The single biggest win at wide rates (and what fixed the same problem on the
@@ -255,11 +283,15 @@ device. In order:
    python3 x410_engine.py --benchmark 10 --bench_rates 61.44,8.192,8.192,8.192
    ```
 
-   A clean (0-underflow) result confirms the per-channel-replay approach at that
-   scene; underflows tell you the real rate ceiling. The benchmark uses the same
-   `--otw`/`--cpu`/`--send_ms` streaming path as live tasks, so re-run it with the
-   format you plan to use — e.g. add `--otw sc8 --send_ms 20` to see how much
-   headroom 8-bit + larger sends buys at ≥10 MS/s.
+   A clean (0-underflow) result confirms the per-channel streaming approach at that
+   scene; underflows tell you the real rate ceiling of the `stream` backend. The
+   benchmark uses the same `--otw`/`--cpu`/`--send_ms` path as live tasks, so re-run
+   it with the format you plan to use — e.g. add `--otw sc8 --send_ms 20` to see how
+   much headroom 8-bit + larger sends buys at ≥10 MS/s.
+
+   If a scene needs rates the ARM can't stream (e.g. a 61.44 MS/s channel), use
+   **`--backend replay`** — FPGA-DRAM playback is host-rate-independent, so it has no
+   underflow ceiling at all.
 
 2. **One signal into a cable + attenuator.** Start the engine, run one channel-task,
    and confirm a receiver/analyzer acquires it.
