@@ -90,6 +90,28 @@ Every signal lowers to one of these engine modes:
 
    It opens the device, sets the master clock, and waits — all channels idle/muted.
 
+   **Wire / host sample format & throughput** (`--otw`, `--cpu`, `--send_ms`).
+   At high per-channel rates (≳10 MS/s) the ARM can underflow. Three levers, all
+   about moving fewer bytes and doing less per-sample work:
+
+   - `--otw sc8` — 8-bit over the wire, half the data rate of the default `sc16`.
+     The single biggest win at wide rates (and what fixed the same problem on the
+     Pi). **An 8-bit wire needs an 8-bit (or 16-bit) host format** — this UHD build
+     has no `fc32→sc8` converter, so `--otw sc8` with the default `fc32` host
+     errors (`Cannot find a conversion routine … fc32 → sc8_chdr`). `--cpu auto`
+     handles this: it selects an `sc8` host for an `sc8` wire automatically.
+   - `--cpu` — the host sample format. `auto` (default) keeps the proven `fc32`
+     path for `sc16` and matches the wire for `sc8`. Setting `--cpu sc16`/`sc8`
+     builds the samples **already in the wire layout**, so `send()` is a pure
+     memcpy — no per-sample conversion on the ARM. IQ is packed into the wire
+     format once, at load, not on every send.
+   - `--send_ms` — how many ms of samples go out per `send()` call (default 10).
+     Bigger = far fewer Python/UHD calls per second (the real ARM cost) at the
+     price of live-tune latency.
+
+   A good high-rate recipe: `--otw sc8 --cpu auto --send_ms 20`. Underflows are
+   reported per channel in the log and in `status` (see *Underflow monitoring*).
+
 3. **Run channel-tasks** against the engine socket, one per signal. Each is an
    ordinary agent task. Example (GPS L1 C/A on RF0):
 
@@ -234,7 +256,10 @@ device. In order:
    ```
 
    A clean (0-underflow) result confirms the per-channel-replay approach at that
-   scene; underflows tell you the real rate ceiling.
+   scene; underflows tell you the real rate ceiling. The benchmark uses the same
+   `--otw`/`--cpu`/`--send_ms` streaming path as live tasks, so re-run it with the
+   format you plan to use — e.g. add `--otw sc8 --send_ms 20` to see how much
+   headroom 8-bit + larger sends buys at ≥10 MS/s.
 
 2. **One signal into a cable + attenuator.** Start the engine, run one channel-task,
    and confirm a receiver/analyzer acquires it.
