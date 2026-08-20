@@ -183,6 +183,11 @@ class ChannelSpec:
     # channel-task drifts tone_hz over time (e.g. a slow x→y frequency ramp); the
     # engine's LO stays at freq_hz, so the emitted frequency is freq_hz + tone_hz.
     tone_hz: float = 0.0
+    # Optional MANUAL analog-LO anchor (Hz). When >0 the tune to freq_hz pins the RF
+    # LO here and reaches freq_hz with the digital DUC/NCO instead — so a wide CW
+    # sweep can move the tone across the NCO window with the analog LO held fixed
+    # (no synth relock, no settle glitch). 0 = ordinary automatic tuning.
+    rf_freq_hz: float = 0.0
 
     def validate(self) -> None:
         if self.mode not in MODES:
@@ -285,7 +290,7 @@ class RadioBackend:
     def load(self, ch: int, spec: ChannelSpec) -> None: ...
     def clear(self, ch: int) -> None: ...
     def set_amplitude(self, ch: int, a: float) -> None: ...
-    def set_freq(self, ch: int, hz: float) -> None: ...
+    def set_freq(self, ch: int, hz: float, rf_freq_hz: float = None) -> None: ...
     def set_gain(self, ch: int, db: float) -> None: ...
     def set_tone_hz(self, ch: int, hz: float) -> None: ...
     def actual_freq(self, ch: int) -> float: ...
@@ -324,7 +329,10 @@ class MockRadio(RadioBackend):
 
     def clear(self, ch): self.calls.append(f"clear ch{ch}")
     def set_amplitude(self, ch, a): self.calls.append(f"amp ch{ch} {a}")
-    def set_freq(self, ch, hz): self._freq[ch] = hz; self.calls.append(f"freq ch{ch} {hz}")
+    def set_freq(self, ch, hz, rf_freq_hz=None):
+        self._freq[ch] = hz
+        tag = f"freq ch{ch} {hz}" + (f" rf={rf_freq_hz}" if rf_freq_hz else "")
+        self.calls.append(tag)
     def set_gain(self, ch, db): self.calls.append(f"gain ch{ch} {db}")
     def set_tone_hz(self, ch, hz): self.calls.append(f"tone ch{ch} {hz}")
     def actual_freq(self, ch): return self._freq[ch]
@@ -370,8 +378,22 @@ class UhdRadio(RadioBackend):
     def configure(self, ch, target_rate_hz):
         return self._chan[ch].configure(target_rate_hz)
 
+    def _tune_request(self, target_hz, rf_freq_hz=None):
+        """A TuneRequest for target_hz. With a positive rf_freq_hz the analog RF LO
+        is pinned there (MANUAL policy) and the residual is reached by the digital
+        DUC/NCO — so sweeping target_hz while rf_freq_hz stays fixed moves only the
+        NCO, with no analog synth relock. Otherwise UHD tunes automatically."""
+        types = self.uhd.types
+        if rf_freq_hz and rf_freq_hz > 0:
+            tr = types.TuneRequest(float(target_hz))
+            tr.rf_freq_policy = types.TuneRequestPolicy.manual
+            tr.rf_freq = float(rf_freq_hz)
+            tr.dsp_freq_policy = types.TuneRequestPolicy.auto
+            return tr
+        return types.TuneRequest(float(target_hz))
+
     def load(self, ch, spec):
-        self.usrp.set_tx_freq(self.uhd.types.TuneRequest(spec.freq_hz), ch)
+        self.usrp.set_tx_freq(self._tune_request(spec.freq_hz, spec.rf_freq_hz), ch)
         self.usrp.set_tx_gain(spec.gain_db, ch)
         if spec.mode == "tone":
             self._chan[ch].load_tone(spec.tone_hz, spec.amplitude)
@@ -383,8 +405,8 @@ class UhdRadio(RadioBackend):
         self._chan[ch].mute_idle()
 
     def set_amplitude(self, ch, a): self._chan[ch].set_amplitude(float(a))
-    def set_freq(self, ch, hz):
-        self.usrp.set_tx_freq(self.uhd.types.TuneRequest(float(hz)), ch)
+    def set_freq(self, ch, hz, rf_freq_hz=None):
+        self.usrp.set_tx_freq(self._tune_request(hz, rf_freq_hz), ch)
     def set_gain(self, ch, db): self.usrp.set_tx_gain(float(db), ch)
     def set_tone_hz(self, ch, hz): self._chan[ch].set_tone_hz(float(hz))
     def actual_freq(self, ch): return self.usrp.get_tx_freq(ch)
@@ -718,13 +740,13 @@ class Engine:
             self._freq[ch] = spec.freq_hz
 
     def set(self, ch: int, owner: str, *, amplitude=None, freq_hz=None,
-            gain_db=None, tone_hz=None) -> None:
+            gain_db=None, tone_hz=None, rf_freq_hz=None) -> None:
         with self._lock:
             self._check(ch, owner)
             if amplitude is not None:
                 self.backend.set_amplitude(ch, amplitude); self._amp[ch] = amplitude
             if freq_hz is not None:
-                self.backend.set_freq(ch, freq_hz); self._freq[ch] = freq_hz
+                self.backend.set_freq(ch, freq_hz, rf_freq_hz); self._freq[ch] = freq_hz
             if gain_db is not None:
                 self.backend.set_gain(ch, gain_db)
             if tone_hz is not None:
@@ -778,7 +800,7 @@ class ControlServer:
             if cmd == "set":
                 e.set(ch, owner, amplitude=msg.get("amplitude"),
                       freq_hz=msg.get("freq_hz"), gain_db=msg.get("gain_db"),
-                      tone_hz=msg.get("tone_hz"))
+                      tone_hz=msg.get("tone_hz"), rf_freq_hz=msg.get("rf_freq_hz"))
                 return {"ok": True}
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
         except KeyError as ex:
@@ -1068,6 +1090,13 @@ def _self_test() -> int:
     check(r["ok"], "load tone on ch2 (no files)")
     check(call({"cmd": "set", "channel": 2, "owner": "T", "tone_hz": 1234.0})["ok"],
           "drift tone_hz via set")
+    # manual-LO (rf_freq_hz) tune passes through — the analog LO is pinned while the
+    # emitted frequency is reached by the DUC/NCO (wide CW sweep with no synth relock).
+    eng.backend.calls.clear()
+    check(call({"cmd": "set", "channel": 2, "owner": "T", "freq_hz": 1.6e9,
+                "rf_freq_hz": 1.58e9})["ok"], "set with manual rf_freq_hz accepted")
+    check(any("rf=1.58" in c or "rf=1580000000" in c for c in eng.backend.calls),
+          "manual rf_freq_hz reaches the backend tune")
     srv.stop()
 
     print("ALL ENGINE CHECKS PASSED" if ok else "SELF-TEST FAILED")

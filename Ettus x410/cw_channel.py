@@ -23,19 +23,24 @@ the ramp. A non-zero --amplitude starts the drift immediately on load.
 
 Narrow vs. wide sweeps
 ──────────────────────
-A CW baseband tone can only occupy ±(sample_rate/2). Two regimes, chosen
+A software CW baseband tone can only occupy ±(sample_rate/2). Two regimes, chosen
 automatically from the span |end−start| and the negotiated rate:
 
   • Narrow (span fits one baseband window): the LO sits fixed at the drift centre
-    and the whole sweep is carried in baseband — perfectly continuous, no retunes.
+    and the whole sweep is carried in the software baseband tone — perfectly
+    continuous, no retunes.
 
-  • Wide (span bigger than a window, e.g. 1600→1545 MHz = 55 MHz): the hardware LO
-    does the coarse sweep in discrete hops of one window, and the baseband tone
-    fills in between. Because a hop moves the LO and the baseband by equal and
-    opposite amounts, the EMITTED frequency stays continuous across a hop — only
-    the LO's own retune settle is a brief transient. This means a 55 MHz sweep
-    needs only enough sample rate for ONE hop window (a few MHz), not 55 MS/s.
-    The number of hops is span ÷ hop-window, so a higher --samp_rate = fewer hops.
+  • Wide (span bigger than a window, e.g. 1600→1545 MHz = 55 MHz): the sweep is
+    carried by the hardware DUC/NCO instead. The analog LO is PINNED (a MANUAL-LO
+    tune) and the digital NCO moves the carrier across a window of ±lo_span/2 — a
+    purely digital frequency change with no analog synth relock, so no settle
+    glitch and a flat amplitude across the window. Crucially this avoids the old
+    software-baseband-vs-analog-LO race (where the baseband jumped before the LO
+    settled, kicking the tone briefly off-frequency). The analog LO only re-anchors
+    when the tone would leave the window; if --lo_span ≥ the span it never moves at
+    all, so the sweep is fully glitchless. Those rare re-anchors are blanked
+    (--hop_blank) to hide their retune settle. A wide sweep is a near-DC signal, so
+    a LOW --samp_rate (1–2 MHz) is ideal — it keeps ARM load minimal.
 
 ⚠  RF SAFETY / LEGAL: many presets are live GNSS bands. Transmit ONLY into a
    shielded / conducted setup you are LICENSED / AUTHORISED to use.
@@ -45,7 +50,7 @@ CLI
     cw_channel.py --channel 0 --freq 1575.42e6 --gain 45 --amplitude 0   # pure CW at L1
     cw_channel.py --channel 1 --freq 1575.42e6 --freq_end 1575.43e6 --duration 1200
     cw_channel.py --channel 0 --freq 1600e6 --freq_end 1545e6 --duration 900 \
-        --samp_rate 5.0                      # wide 55 MHz sweep over 15 min (LO hops)
+        --samp_rate 2.048 --lo_span 60       # wide 55 MHz sweep, 15 min, NCO (no hops)
     cw_channel.py --self-test        # drift + LO-hop planner math, no engine/hardware
     cw_channel.py --describe-params  # paramkit JSON schema for the GUI
 """
@@ -103,10 +108,11 @@ def drift_freq(elapsed: float, start: float, end: float, duration: float,
 
 
 def plan_lo(f_hz: float, lo_hz: float, half_window_hz: float) -> float:
-    """The LO to emit f_hz while keeping the baseband tone (f − LO) within
-    ±half_window. Steps the LO by whole windows (2·half_window) as the sweep
-    crosses a window edge; because the LO and the baseband then move by equal and
-    opposite amounts, the emitted frequency is continuous across a hop."""
+    """The LO/anchor to emit f_hz while keeping the offset (f − LO) within
+    ±half_window. Steps the LO by whole windows (2·half_window) as the sweep crosses
+    a window edge. Used for the NCO anchor in a wide sweep: within a window the LO is
+    fixed and the offset is realised by the digital NCO, so only a whole-window
+    re-anchor ever moves the analog LO."""
     step = 2.0 * half_window_hz
     while f_hz - lo_hz > half_window_hz:
         lo_hz += step
@@ -143,9 +149,20 @@ def build_script() -> Script:
                      "pingpong = start→end→start… Fixed per run.")
         .number("-Sample-rate", "--samp_rate", unit="MHz", min=0.5, max=125.0,
                 presets=SAMPLE_RATES_MHZ, default=2.048, required=True,
-                help="Target channel sample rate (negotiated). For a narrow sweep it "
-                     "must exceed |end−start|; for a wide sweep it sets the LO hop "
-                     "size (bigger rate = fewer hops). Fixed per run.")
+                help="Target channel sample rate (negotiated). A narrow sweep is "
+                     "carried in baseband so this must exceed |end−start|; a wide "
+                     "sweep is carried by the hardware NCO, so a low rate is fine and "
+                     "keeps ARM load down. Fixed per run.")
+        .number("-LO-span", "--lo_span", unit="MHz", min=1.0, max=200.0, default=40.0,
+                help="Wide sweep only: how far the tone may move on the digital NCO "
+                     "before the analog LO re-anchors. The sweep is glitchless within "
+                     "one span; a span wider than |end−start| means the analog LO "
+                     "never moves (fully glitchless). Keep ≤ the channel's NCO/analog "
+                     "range. Fixed per run.")
+        .number("-Hop-blank", "--hop_blank", unit="ms", min=0.0, max=100.0, default=5.0,
+                help="Wide sweep only: mute for this long around each (rare) analog-LO "
+                     "re-anchor to hide its retune settle. 0 disables blanking. Live-"
+                     "safe. Fixed per run.")
         .number("-Gain", "--gain", unit="dB", min=0, max=65, default=45,
                 required=True, live=True, help="Channel TX gain. Live.")
         .number("-Amplitude", "--amplitude", min=0.0, max=1.0, default=0.0,
@@ -183,33 +200,35 @@ def _self_test() -> int:
           "pingpong returns toward start")
     check(abs(drift_freq(5, S, S, D, "once") - S) < 1e-3, "no --freq_end ⇒ pure CW")
 
-    # LO-hop planner over the full 55 MHz sweep at 5 MS/s: the baseband stays inside
-    # the window, the LO only ever moves by whole windows, and the sweep needs many
-    # hops (i.e. it genuinely runs on a few-MHz baseband, not 55 MS/s).
-    B = SWEEP_MARGIN * 5e6 / 2.0
-    lo = S
-    hops = 0
-    bb_ok = step_ok = True
+    # NCO-anchor planner over the full 55 MHz sweep: the tone offset stays inside the
+    # ±half_window NCO window, the analog LO only ever re-anchors by whole windows,
+    # and each re-anchor is exactly one window (so the emitted freq never steps).
+    hw = 20e6 / 2.0                      # a 20 MHz lo_span
+    anc = plan_lo(S, 0.5 * (S + E), hw)  # window containing start
+    steps = 0
+    win_ok = step_ok = True
     for k in range(int(D) + 1):
         f = drift_freq(k, S, E, D, "once")
-        new_lo = plan_lo(f, lo, B)
-        if new_lo != lo:
-            hops += 1
-            if abs(abs(new_lo - lo) - 2.0 * B) > 1e-3:
+        new_anc = plan_lo(f, anc, hw)
+        if new_anc != anc:
+            steps += 1
+            if abs(abs(new_anc - anc) - 2.0 * hw) > 1e-3:
                 step_ok = False
-            lo = new_lo
-        if abs(f - lo) > B + 1e-6:
-            bb_ok = False
-    check(bb_ok, "plan_lo keeps |baseband| ≤ window across the whole 55 MHz sweep")
-    check(step_ok, "each LO hop is exactly one window (2·half_window)")
-    check(hops >= 10, f"55 MHz sweep at 5 MS/s takes multiple LO hops ({hops})")
+            anc = new_anc
+        if abs(f - anc) > hw + 1e-6:
+            win_ok = False
+    check(win_ok, "NCO offset stays within ±half_window across the whole 55 MHz sweep")
+    check(step_ok, "each analog re-anchor is exactly one window (2·half_window)")
+    check(steps >= 1, f"a 55 MHz sweep in 20 MHz windows re-anchors the LO ({steps}×)")
 
-    # a sub-window span never hops — it stays a clean baseband drift.
-    loc = 0.5 * (1575.42e6 + 1575.43e6)
-    narrow_hops = sum(
-        1 for k in range(101)
-        if plan_lo(drift_freq(k, 1575.42e6, 1575.43e6, 100, "once"), loc, B) != loc)
-    check(narrow_hops == 0, "a sub-window span carries entirely in baseband (no hops)")
+    # a span that fits one window never re-anchors — fully glitchless.
+    center = 0.5 * (1600e6 + 1580e6)     # a 20 MHz span in a 40 MHz window
+    hw40 = 40e6 / 2.0
+    anc2 = plan_lo(1600e6, center, hw40)
+    reanchors = sum(
+        1 for k in range(901)
+        if plan_lo(drift_freq(k, 1600e6, 1580e6, 900, "once"), anc2, hw40) != anc2)
+    check(reanchors == 0, "a span ≤ lo_span never re-anchors the analog LO (glitchless)")
 
     print("ALL CW CHECKS PASSED" if ok else "CW SELF-TEST FAILED")
     return 0 if ok else 1
@@ -236,68 +255,129 @@ def main() -> int:
         eng.acquire(ch, owner)
         actual_rate = eng.configure(ch, owner, args.samp_rate * 1e6)
 
-        # Usable baseband half-window; a span wider than a full window is LO-hopped.
-        half_window = SWEEP_MARGIN * actual_rate / 2.0
-        hopped = drifting and span > 2.0 * half_window
-        lo0 = start if hopped else 0.5 * (start + end)   # tone starts at 0 when hopped
-        tone0 = start - lo0
-        n_hops = int(span // (2.0 * half_window)) if hopped else 0
+        # Pick the sweep mechanism:
+        #   pure      — no drift.
+        #   baseband  — span fits one baseband window: LO fixed at the drift centre,
+        #               the software tone carries the whole sweep (perfectly clean).
+        #   dsp       — wider span: the analog LO is pinned and the sweep is carried
+        #               by the hardware DUC/NCO, so there is no software-baseband vs.
+        #               analog-LO race. The analog LO only re-anchors when the tone
+        #               leaves ±lo_span/2; those rare steps are blanked.
+        bb_half = SWEEP_MARGIN * actual_rate / 2.0
+        lo_span = args.lo_span * 1e6
+        dsp_half = lo_span / 2.0
+        blank_s = args.hop_blank / 1e3
+        if not drifting:
+            mode = "pure"
+        elif span <= 2.0 * bb_half:
+            mode = "baseband"
+        else:
+            mode = "dsp"
+
+        center = 0.5 * (start + end)
+        if mode == "dsp":
+            anchor0 = plan_lo(start, center, dsp_half)   # window containing `start`
+            lo0, tone0 = start, 0.0                       # HW tune places the carrier
+            n_steps = int(span // lo_span)
+        else:
+            anchor0 = 0.0
+            lo0 = center if mode == "baseband" else start
+            tone0 = start - lo0
+            n_steps = 0
 
         print("── CW tone channel-task ────────────────────────────────────")
         print(f"  engine channel : {ch}   owner {owner}")
-        if drifting and hopped:
+        if mode == "dsp":
             print(f"  drift          : {start/1e6:.6f} → {end/1e6:.6f} MHz over "
                   f"{args.duration:g} s ({args.drift})")
-            print(f"  sweep mode     : LO-hopped — {span/1e6:.3f} MHz span in ~{n_hops} "
-                  f"hops of {2*half_window/1e6:.3f} MHz (baseband ±{half_window/1e6:.3f} MHz)")
-        elif drifting:
+            print(f"  sweep mode     : NCO — analog LO pinned, {span/1e6:.3f} MHz swept "
+                  f"on the digital NCO (±{dsp_half/1e6:g} MHz windows, ~{n_steps} analog "
+                  f"re-anchor{'s' if n_steps != 1 else ''}"
+                  f"{f', {args.hop_blank:g} ms blank each' if n_steps and blank_s else ''})")
+        elif mode == "baseband":
             print(f"  drift          : {start/1e6:.6f} → {end/1e6:.6f} MHz over "
                   f"{args.duration:g} s ({args.drift})")
             print(f"  sweep mode     : baseband — LO fixed at {lo0/1e6:.6f} MHz "
-                  f"(baseband ±{span/2e6:g} MHz)")
+                  f"(baseband ±{span/2e6:g} MHz, fully continuous)")
         else:
             print(f"  tone           : {start/1e6:.6f} MHz (pure CW, no drift)")
         print(f"  sample rate    : requested {args.samp_rate:g} MHz, "
               f"engine gave {actual_rate/1e6:.6f} MHz")
         print(f"  gain / amp     : {args.gain:g} dB / {args.amplitude:g} "
               f"({'MUTED — raise on-air' if args.amplitude == 0 else 'live on load'})")
-        if hopped:
-            print("  note           : each LO hop has a brief retune transient; the "
-                  "emitted frequency itself stays continuous across it.")
+        if mode == "dsp" and n_steps == 0:
+            print("  note           : the whole sweep fits one NCO window — the analog "
+                  "LO never moves, so the sweep is fully glitchless.")
         print("  drift begins at on-air (first amplitude > 0).")
         print("────────────────────────────────────────────────────────────")
         sys.stdout.flush()
 
-        # Load the generated tone: LO at lo0, baseband offset placing it at `start`.
-        eng.load(ch, owner, {
-            "mode": "tone", "freq_hz": lo0, "gain_db": args.gain,
-            "amplitude": args.amplitude, "tone_hz": tone0, "label": "cw"})
+        # Load the tone. In dsp mode the carrier is placed by a MANUAL-LO tune
+        # (rf_freq_hz pins the analog LO; the NCO reaches freq_hz); the software tone
+        # stays at DC. In baseband/pure mode the LO is fixed and the software tone
+        # carries any offset.
+        spec = {"mode": "tone", "freq_hz": lo0, "gain_db": args.gain,
+                "amplitude": args.amplitude, "tone_hz": tone0, "label": "cw"}
+        if mode == "dsp":
+            spec["rf_freq_hz"] = anchor0
+        eng.load(ch, owner, spec)
 
         ctrl = script.live_control(args)
         t0 = time.monotonic() if args.amplitude > 0 else None   # on-air reference
-        cur_lo = lo0
+        cur_anchor = anchor0
+        cur_amp = args.amplitude
         last_tone = None
+        last_f = start
 
         def emit(f: float) -> None:
-            """Point the emitted frequency at f, hopping the LO when the sweep leaves
-            the baseband window. The LO and baseband go in ONE atomic set(), so the
-            emitted frequency is continuous across a hop; between hops only the
-            baseband moves (throttled to ≥0.5 Hz steps)."""
-            nonlocal cur_lo, last_tone
-            new_lo = plan_lo(f, cur_lo, half_window) if hopped else cur_lo
-            tone_hz = f - new_lo
-            if new_lo != cur_lo:
-                eng.set(ch, owner, freq_hz=new_lo, tone_hz=tone_hz)
-                cur_lo, last_tone = new_lo, tone_hz
-            elif last_tone is None or abs(tone_hz - last_tone) >= 0.5:
-                eng.set(ch, owner, tone_hz=tone_hz)
-                last_tone = tone_hz
+            """Point the emitted frequency at f. In dsp mode the hardware NCO moves
+            (analog LO pinned) and only re-anchors — blanked — when f leaves the
+            window; in baseband mode only the software tone moves."""
+            nonlocal cur_anchor, last_tone, last_f
+            if mode == "dsp":
+                new_anchor = plan_lo(f, cur_anchor, dsp_half)
+                if new_anchor != cur_anchor:
+                    do_blank = cur_amp > 0 and blank_s > 0
+                    if do_blank:
+                        eng.set(ch, owner, amplitude=0.0)
+                    eng.set(ch, owner, freq_hz=f, rf_freq_hz=new_anchor)
+                    cur_anchor = new_anchor
+                    if do_blank:
+                        time.sleep(blank_s)
+                        eng.set(ch, owner, amplitude=cur_amp)
+                    last_f = f
+                elif abs(f - last_f) >= 1.0:
+                    eng.set(ch, owner, freq_hz=f, rf_freq_hz=cur_anchor)
+                    last_f = f
+            else:  # baseband
+                tone_hz = f - lo0
+                if last_tone is None or abs(tone_hz - last_tone) >= 0.5:
+                    eng.set(ch, owner, tone_hz=tone_hz)
+                    last_tone = tone_hz
+
+        def reset_to_start() -> None:
+            """Re-run the drift from `start` (the live restart trigger)."""
+            nonlocal cur_anchor, last_tone, last_f
+            if mode == "dsp":
+                do_blank = cur_amp > 0 and blank_s > 0
+                if do_blank:
+                    eng.set(ch, owner, amplitude=0.0)
+                cur_anchor = anchor0
+                eng.set(ch, owner, freq_hz=start, rf_freq_hz=anchor0)
+                if do_blank:
+                    time.sleep(blank_s)
+                    eng.set(ch, owner, amplitude=cur_amp)
+                last_f = start
+            else:
+                eng.set(ch, owner, tone_hz=tone0)
+                last_tone = tone0
 
         stop = _stop_event()
         while not stop.is_set():
             for change in ctrl.drain():
                 try:
                     if change.name == "amplitude":
+                        cur_amp = change.value
                         eng.set(ch, owner, amplitude=change.value)
                         ctrl.report("amplitude", change.value)
                         if change.value > 0 and t0 is None:
@@ -307,9 +387,7 @@ def main() -> int:
                         ctrl.report("gain", change.value)
                     elif change.name == "restart" and change.value:
                         t0 = time.monotonic()              # re-run the drift from start
-                        cur_lo = lo0                       # retune the LO back to start
-                        eng.set(ch, owner, freq_hz=lo0, tone_hz=tone0)
-                        last_tone = tone0
+                        reset_to_start()
                         ctrl.report("restart", True)
                 except EngineError as exc:
                     print(f"[warn] live {change.name} rejected: {exc}", flush=True)
