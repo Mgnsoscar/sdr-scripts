@@ -136,29 +136,27 @@ Every signal lowers to one of these engine modes:
    underflow. Three levers, all about moving fewer bytes and doing less per-sample
    work — or just switch to `--backend replay` above:
 
-   - `--otw sc8` — 8-bit over the wire, half the data rate of the default `sc16`.
-     The single biggest win at wide rates (and what fixed the same problem on the
-     Pi). **An 8-bit wire needs an 8-bit (or 16-bit) host format** — this UHD build
-     has no `fc32→sc8` converter, so `--otw sc8` with the default `fc32` host
-     errors (`Cannot find a conversion routine … fc32 → sc8_chdr`). `--cpu auto`
-     handles this: it selects an `sc8` host for an `sc8` wire automatically.
-   - `--cpu` — the host sample format. `auto` (default) keeps the proven `fc32`
-     path for `sc16` and matches the wire for `sc8`. Setting **`--cpu sc16`** (with
-     the default `sc16` wire) builds the samples **already in the wire layout**, so
-     `send()` is a pure memcpy — no `fc32→sc16` conversion on the ARM, which is the
-     real cost at 61.44 MS/s. IQ is packed once, at load, not on every send. The
-     packing interleaves I/Q ints and presents them as one wide scalar per sample
-     (int32 for `sc16`, int16 for `sc8`) — a byte-exact wire layout UHD accepts
-     (a numpy *record* dtype does **not** work — it garbles TX). **Verify once on
-     an analyzer** (see below) before trusting a wide run, since the integer send
-     path is only exercisable on hardware.
+   - **`--cpu sc16`** (with the default `sc16` wire) — **the one that works and the
+     one to use.** It builds the samples **already in the wire layout**, so `send()`
+     is a pure memcpy — no `fc32→sc16` conversion on the ARM, which is the real cost
+     at 61.44 MS/s. IQ is packed once, at load, not on every send. The packing
+     interleaves I/Q ints and presents them as one wide scalar per sample (int32 for
+     `sc16`) — a byte-exact wire layout UHD accepts (a numpy *record* dtype does
+     **not** work — it garbles TX). Confirmed on hardware: `--cpu sc16` and `--cpu
+     fc32` produce identical spectra, so `sc16` gives full 16-bit fidelity at memcpy
+     cost.
    - `--send_ms` — how many ms of samples go out per `send()` call (default 10).
      Bigger = far fewer Python/UHD calls per second (the real ARM cost) at the
      price of live-tune latency.
+   - `--otw sc8` / `--cpu sc8` — **avoid.** UHD's 8-bit host/wire format reorders
+     bytes within each 32-bit word in a version-specific way that a raw memcpy does
+     not match, so the spectrum comes out wrong (verified on hardware), and this UHD
+     build also lacks the `fc32→sc8` converter. `sc16` memcpy already removes the
+     conversion cost at full fidelity, so 8-bit isn't needed; the engine prints a
+     warning if you select `sc8`.
 
-   Recipes: for full-fidelity high rate without a firmware change, **`--cpu sc16
-   --send_ms 20`** (memcpy, 16-bit); if you also need to halve the wire rate,
-   `--otw sc8 --cpu auto --send_ms 20`. Underflows are reported per channel in the
+   Recipe for full-fidelity high rate without a firmware change: **`--cpu sc16
+   --send_ms 20`** (memcpy, 16-bit). Underflows are reported per channel in the
    log and in `status` (see *Underflow monitoring*).
 
    **Verifying the integer host path.** The packing math is unit-tested, but that
@@ -320,13 +318,13 @@ device. In order:
 
    A clean (0-underflow) result confirms the per-channel streaming approach at that
    scene; underflows tell you the real rate ceiling of the `stream` backend. The
-   benchmark uses the same `--otw`/`--cpu`/`--send_ms` path as live tasks, so re-run
-   it with the format you plan to use — e.g. add `--otw sc8 --send_ms 20` to see how
-   much headroom 8-bit + larger sends buys at ≥10 MS/s.
+   benchmark uses the same `--cpu`/`--send_ms` path as live tasks, so re-run it with
+   the format you plan to use — e.g. **`--cpu sc16 --send_ms 20`** to see how much
+   headroom the memcpy path (no `fc32→sc16` conversion) buys at ≥10 MS/s.
 
-   If a scene needs rates the ARM can't stream (e.g. a 61.44 MS/s channel), use
-   **`--backend replay`** — FPGA-DRAM playback is host-rate-independent, so it has no
-   underflow ceiling at all.
+   If `--cpu sc16` still can't sustain the widest channel, the only host-independent
+   fix is **`--backend replay`** (FPGA-DRAM playback, no underflow ceiling) — which
+   on this X410 needs a UHD ≥ 4.5 image, see the backend note above.
 
 2. **One signal into a cable + attenuator.** Start the engine, run one channel-task,
    and confirm a receiver/analyzer acquires it.

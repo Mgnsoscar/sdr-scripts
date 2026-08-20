@@ -380,6 +380,12 @@ class UhdRadio(RadioBackend):
         self.otw = otw
         self.cpu = resolve_cpu_format(cpu, otw)   # host format (fc32 / sc16 / sc8)
         self.send_s = max(0.001, send_ms / 1e3)   # target seconds of samples per send
+        if self.cpu == "sc8":
+            print("[engine] WARNING: cpu=sc8 — UHD's 8-bit host/wire packing reorders "
+                  "bytes in a version-specific way that a raw memcpy does not match, so "
+                  "the spectrum comes out wrong. Use --cpu sc16 (memcpy, full 16-bit "
+                  "fidelity) instead; it clears the fc32→sc16 conversion cost that "
+                  "underflows at high rates.", file=sys.stderr, flush=True)
 
         self.usrp = uhd.usrp.MultiUSRP(device_args or "type=x4xx")
         self.usrp.set_master_clock_rate(master_clock_hz)
@@ -1656,14 +1662,15 @@ def build_script() -> Script:
                          "sc8": "8-bit (halves the wire rate — helps at ≥10 MS/s)"},
                 default="sc16", help="Over-the-wire sample format (stream backend).")
         .choice("-CPU-format", "--cpu",
-                options={"auto": "match the wire (fc32 for sc16, sc8 for sc8)",
-                         "fc32": "complex float host (only valid with sc16 wire)",
-                         "sc16": "int16 host — memcpy send, no conversion",
-                         "sc8": "int8 host — memcpy send (required for an sc8 wire)"},
+                options={"auto": "fc32 for an sc16 wire (proven), matches the wire otherwise",
+                         "fc32": "complex float host (converts to sc16 — the ARM cost)",
+                         "sc16": "int16 host — memcpy send, full fidelity (RECOMMENDED)",
+                         "sc8": "int8 host — AVOID (UHD 8-bit packing garbles TX)"},
                 default="auto",
-                help="Host sample format. Matching it to the wire makes send() a "
-                     "memcpy (no per-sample conversion). An sc8 wire REQUIRES sc8/sc16 "
-                     "host — this UHD build has no fc32→sc8 converter.")
+                help="Host sample format. --cpu sc16 makes send() a memcpy (no "
+                     "fc32→sc16 conversion) at full 16-bit fidelity — the fix for "
+                     "underflows at high rates. Avoid sc8: UHD's 8-bit packing "
+                     "reorders bytes and a raw memcpy comes out wrong.")
         .number("-Send-ms", "--send_ms", unit="ms", min=1.0, max=100.0,
                 default=DEFAULT_SEND_MS,
                 help="Milliseconds of samples per send() call. Larger = fewer calls = "
