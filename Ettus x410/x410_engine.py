@@ -843,15 +843,23 @@ class RfnocRadio(RadioBackend):
     # ── discovery / wiring (topology-dependent — logged for bench iteration) ────
     def _discover(self, channels: int):
         g = self.graph
+        all_ids = list(g.find_blocks(""))          # every block, real string names
+        self._log("all RFNoC blocks: " + ", ".join(str(b) for b in all_ids))
         radio_ids = list(g.find_blocks("Radio"))
         duc_ids = list(g.find_blocks("DUC"))
         replay_ids = list(g.find_blocks("Replay"))
-        self._log(f"blocks: radios={radio_ids} ducs={duc_ids} replay={replay_ids}")
+        self._log(f"radios={[str(b) for b in radio_ids]} "
+                  f"ducs={[str(b) for b in duc_ids]} "
+                  f"replay={[str(b) for b in replay_ids]}")
         if not radio_ids:
             raise RuntimeError("no Radio blocks in the FPGA image")
         if not replay_ids:
-            raise RuntimeError("no Replay block in the FPGA image — the Replay "
-                               "backend needs a DRAM/Replay-capable image (e.g. X4_200)")
+            raise RuntimeError(
+                "no Replay block in this FPGA image, so DRAM playback isn't available. "
+                "Blocks present: " + ", ".join(str(b) for b in all_ids) + ". "
+                "Load a Replay-capable X410 image (run `uhd_images_downloader`, then "
+                "`uhd_image_loader --args type=x4xx`, and confirm `uhd_usrp_probe` "
+                "lists a Replay block), or run with --backend stream.")
         radios = [self.uhd.rfnoc.RadioControl(g.get_block(i)) for i in radio_ids]
         ducs = [self.uhd.rfnoc.DucBlockControl(g.get_block(i)) for i in duc_ids] \
             if duc_ids else []
@@ -871,7 +879,7 @@ class RfnocRadio(RadioBackend):
             raise RuntimeError(f"image exposes {len(chan_map)} TX channels, need {channels}")
         chan_map = chan_map[:channels]
         for ch, m in enumerate(chan_map):
-            self._log(f"ch{ch} → radio {m['radio_id']} port {m['radio_port']}, "
+            self._log(f"ch{ch} → radio {str(m['radio_id'])} port {m['radio_port']}, "
                       f"duc {m['duc']}, replay port {m['replay_port']}")
         self._replay_id = replay_ids[0]
         self._duc_ids = duc_ids
@@ -1648,6 +1656,9 @@ def build_script() -> Script:
                 help="Milliseconds of samples per send() call. Larger = fewer calls = "
                      "less ARM overhead (fewer underflows), at the cost of live-tune "
                      "latency. 10 ms is a good default.")
+        .flag("-List-RFNoC", "--list_rfnoc",
+              help="Print every RFNoC block in the loaded FPGA image (to check whether "
+                   "a Replay/DRAM block is present for --backend replay) and exit.")
         .number("-Benchmark", "--benchmark", unit="s", min=0.0, max=120.0, default=0.0,
                 help="If >0, run an underflow probe for this many seconds (per-channel "
                      "streamers at --bench_rates) and exit.")
@@ -1669,12 +1680,31 @@ def build_backend(args, master_clock_hz):
                     args.cpu, args.send_ms)
 
 
+def list_rfnoc_blocks(device_args: str) -> int:
+    """Open the RFNoC graph and print every block the loaded FPGA image exposes, so
+    you can confirm whether a Replay (DRAM) block is present before choosing a
+    backend. Exits without touching the radios."""
+    import uhd
+    g = uhd.rfnoc.RfnocGraph(device_args or "type=x4xx")
+    blocks = [str(b) for b in g.find_blocks("")]
+    print("── RFNoC blocks in the loaded FPGA image ───────────────────")
+    for b in blocks:
+        print(f"  {b}")
+    has_replay = any("Replay" in b for b in blocks)
+    print("────────────────────────────────────────────────────────────")
+    print(f"  Replay (DRAM) block: {'PRESENT — --backend replay is available' if has_replay else 'MISSING — load a Replay-capable image, or use --backend stream'}")
+    return 0
+
+
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
     args = build_script().parse()
     master_clock_hz = args.master_clock * 1e6
+
+    if getattr(args, "list_rfnoc", False):
+        return list_rfnoc_blocks(args.device_args)
 
     if args.benchmark and args.benchmark > 0:
         rates = _parse_rates_mhz(args.bench_rates)

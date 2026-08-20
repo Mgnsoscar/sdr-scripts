@@ -105,8 +105,27 @@ Every signal lowers to one of these engine modes:
      AltBOC, etc.). Needs a Replay-capable FPGA image (e.g. the stock `X4_200`).
 
      ```sh
+     # first confirm the loaded FPGA image actually has a Replay/DRAM block:
+     python3 x410_engine.py --list_rfnoc
+     #   → lists every RFNoC block; needs a line containing "Replay"
+
      python3 x410_engine.py --backend replay --master_clock 245.76
      ```
+
+     **Requires a Replay-capable FPGA image.** Not every X410 image includes a
+     Replay/DRAM block (some show only Radio + DUC blocks). If `--list_rfnoc` shows
+     no Replay block, load one that has it — download the stock images and flash the
+     default, then re-check:
+
+     ```sh
+     uhd_images_downloader                       # fetch stock X410 images
+     uhd_image_loader --args "type=x4xx"         # flash (X4_200 includes Replay)
+     uhd_usrp_probe | grep -i replay             # confirm a Replay block is present
+     ```
+
+     If your image genuinely can't provide a Replay block and reflashing isn't an
+     option, the wide-rate signal has to stay on `--backend stream` (and we revisit
+     an int16-host memcpy path to push the stream ceiling instead).
 
      Notes: `--otw`/`--cpu`/`--send_ms` don't apply (there's no host sample loop).
      Digital `amplitude` acts as play/mute (0 = not playing); set the level with
