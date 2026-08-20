@@ -449,15 +449,19 @@ class _ReplayChannel:
 
     # ── configuration ─────────────────────────────────────────────────────────
     def configure(self, target_rate_hz: float) -> float:
-        """Set this channel's TX rate and (re)build its streamer for that rate.
-        Returns the actual rate UHD locked to — what the buffer must be built for."""
+        """Set this channel's TX rate and return the actual rate UHD locked to (what
+        the buffer must be built for). The TX streamer is created ONCE per channel
+        and reused across re-configures: on the X410's RFNoC graph a second
+        get_tx_stream() on the same channel would fail with 'Attempting to reconnect
+        input port!', and changing the rate needs only set_tx_rate() anyway."""
         u = self.radio
         u.usrp.set_tx_rate(float(target_rate_hz), self.ch)
         self.rate_hz = float(u.usrp.get_tx_rate(self.ch))
-        st_args = u.uhd.usrp.StreamArgs("fc32", u.otw)
-        st_args.channels = [self.ch]
-        self._streamer = u.usrp.get_tx_stream(st_args)
-        self._spp = int(self._streamer.get_max_num_samps())
+        if self._streamer is None:
+            st_args = u.uhd.usrp.StreamArgs("fc32", u.otw)
+            st_args.channels = [self.ch]
+            self._streamer = u.usrp.get_tx_stream(st_args)
+            self._spp = int(self._streamer.get_max_num_samps())
         return self.rate_hz
 
     # ── playlist / amplitude ──────────────────────────────────────────────────
@@ -716,10 +720,24 @@ class ControlServer:
                       tone_hz=msg.get("tone_hz"))
                 return {"ok": True}
             return {"ok": False, "error": f"unknown cmd {cmd!r}"}
-        except (KeyError,) as ex:
+        except KeyError as ex:
             return {"ok": False, "error": f"missing field: {ex}"}
-        except (ValueError, PermissionError, FileNotFoundError, TypeError) as ex:
-            return {"ok": False, "error": str(ex)}
+        except (ValueError, PermissionError, FileNotFoundError) as ex:
+            # Expected client-facing rejections (bad rate, wrong owner, load before
+            # configure, missing IQ file, …). These are normal feedback to the
+            # caller, so reply with the message and no stack trace — no traceback
+            # noise for a routine no.
+            return {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
+        except Exception as ex:
+            # Any *unexpected* backend/UHD error (RuntimeError from UHD, …) becomes
+            # an error reply — never let it kill the serve thread and drop the
+            # connection, or one bad command would take the whole engine down for
+            # every channel. Log it with a traceback since it's genuinely unexpected.
+            import traceback
+            print(f"[engine] command {cmd!r} failed: {type(ex).__name__}: {ex}",
+                  file=sys.stderr)
+            traceback.print_exc()
+            return {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
 
     def _serve_conn(self, conn: socket.socket) -> None:
         with conn, conn.makefile("rwb") as f:
@@ -833,6 +851,40 @@ def _self_test() -> int:
             check(True, "unequal-length composite blocks rejected")
     except ImportError:
         check(True, "build_playlist skipped (no NumPy here)")
+
+    # _ReplayChannel reuses its TX streamer across re-configures (a second
+    # get_tx_stream on the same channel fails with 'reconnect input port' on the
+    # X410 RFNoC graph — re-running a task must not recreate the streamer).
+    try:
+        import types as _types
+        import numpy as _np
+        _n = {"streams": 0}
+
+        class _FakeStreamer:
+            def get_max_num_samps(self): return 2000
+            def send(self, b, m): pass
+
+        class _FakeUsrp:
+            def __init__(self): self.rate = 0.0
+            def set_tx_rate(self, r, c): self.rate = float(r)
+            def get_tx_rate(self, c): return self.rate
+            def get_tx_stream(self, a): _n["streams"] += 1; return _FakeStreamer()
+
+        class _FakeRadio:
+            np = _np
+            otw = "sc16"
+            def __init__(self): self.usrp = _FakeUsrp()
+            uhd = _types.SimpleNamespace(usrp=_types.SimpleNamespace(
+                StreamArgs=lambda a, b: _types.SimpleNamespace(channels=[])))
+
+        rc = _ReplayChannel(_FakeRadio(), 0)
+        rc.configure(40.96e6)
+        mid = rc.configure(20.48e6)                 # rate change → same streamer
+        rc.configure(40.96e6)
+        check(_n["streams"] == 1 and mid == 20.48e6 and rc.rate_hz == 40.96e6,
+              "_ReplayChannel reuses TX streamer across re-configures")
+    except ImportError:
+        check(True, "streamer-reuse check skipped (no NumPy here)")
 
     # End-to-end over a real Unix socket with the mock backend.
     tmp = tempfile.mkdtemp()
