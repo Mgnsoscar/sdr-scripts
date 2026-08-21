@@ -30,6 +30,7 @@ from .params import (
     slug,
 )
 from .live import CTRL_SOCK_ENV, Change, LiveControl
+from .calkit import CALIBRATION_FILE_ENV, PowerMap
 
 __all__ = [
     "Script",
@@ -44,6 +45,8 @@ __all__ = [
     "LiveControl",
     "Change",
     "CTRL_SOCK_ENV",
+    "PowerMap",
+    "CALIBRATION_FILE_ENV",
 ]
 
 __version__ = "0.1.0"

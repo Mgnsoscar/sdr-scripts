@@ -60,8 +60,7 @@ os.environ.setdefault("UHD_LOG_FASTPATH_DISABLE", "1")
 os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paramkit import Script
-from calkit import PowerMap
+from paramkit import Script, PowerMap
 
 # Stable calibration signal id. When a task sets SDR_CAL_SIGNAL_ID to this value the
 # agent injects this unit's resolved calibration (SDR_CALIBRATION_FILE); calkit reads
@@ -73,7 +72,6 @@ CAL_SIGNAL_ID = "gps_l1_mcode"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # USER CALIBRATION — FALLBACK CONSTANTS (used only when the unit has no calibration)
-# ═══════════════════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════════════════
 # You set the transmit level in dBm. That only works if the script knows how the
 # SDR's gain maps to real output power, which you establish once with a spectrum

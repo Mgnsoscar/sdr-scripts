@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from calkit import PowerMap, CALIBRATION_FILE_ENV
+from paramkit import PowerMap, CALIBRATION_FILE_ENV
 
 
 # ── Baked fallback reproduces the old single-anchor slope-1 model ────────────────
