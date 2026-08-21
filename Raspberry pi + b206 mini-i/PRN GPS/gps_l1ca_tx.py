@@ -114,6 +114,12 @@ AMPLITUDE = 0.8
 MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
 MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 
+# Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
+# from GAIN_AT_MAX_DB (your chosen operating ceiling). The calibration gain knob
+# sweeps the full 0..HW_MAX_GAIN_DB range so you can find and measure the gain that
+# produces your clean maximum power.
+HW_MAX_GAIN_DB = 89.75
+
 
 def gain_for_power(delivered_dbm: float) -> float:
     """TX gain (dB) that puts `delivered_dbm` at the far end of the RF chain. Undo
@@ -282,6 +288,9 @@ def _build_top_block(code_file: str, center_freq_hz: float, samp_rate_hz: float,
         def set_gain(self, g: float) -> None:
             self.usrp.set_gain(g, 0)
 
+        def set_amplitude(self, a: float) -> None:
+            self.amp.set_k(a)          # baseband digital scale (used by RF on/off)
+
         def actual_gain(self) -> float:
             return self.usrp.get_gain(0)
 
@@ -294,7 +303,7 @@ def _build_top_block(code_file: str, center_freq_hz: float, samp_rate_hz: float,
 # ── Parameter schema ────────────────────────────────────────────────────────────
 
 def build_script() -> Script:
-    return (
+    s = (
         Script(
             f"{SIGNAL_NAME} (C/A Gold code) transmitter. Level is set in dBm; edit "
             "the USER CALIBRATION block at the top of the script to match your rig."
@@ -331,18 +340,59 @@ def build_script() -> Script:
             help="Over-the-wire sample format. sc8 halves USB load (needed for "
                  "high MS/s on a Pi); sc16 for more dynamic range."
         )
+        .choice(
+            "-RF", "--rf",
+            options=["on", "off"], default="on", required=False, live=True,
+            help="RF output on/off. OFF mutes the signal (gain AND baseband "
+                 "amplitude to 0); ON restores them. Change the power (or the "
+                 "calibration gain) while OFF and it takes effect when you turn ON."
+        )
     )
+    # ── CALIBRATION KNOB (normally commented OUT) ───────────────────────────────
+    # Uncomment to expose a raw TX-gain slider (dB) so you can measure output power
+    # vs gain on a spectrum analyser and fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB
+    # above. While present it OVERRIDES --power (whichever you touch last wins).
+    # s = s.number(
+    #     "-Cal-gain", "--gain", unit="dB",
+    #     min=0, max=HW_MAX_GAIN_DB, default=HW_MAX_GAIN_DB,
+    #     required=False, live=True,
+    #     help="CALIBRATION ONLY — set SDR TX gain directly, bypassing the dBm "
+    #          "mapping. Comment out again for normal dBm operation.")
+    return s
 
 
 # ── Live-change dispatch ────────────────────────────────────────────────────────
 
-def _apply_live_change(tb, ctrl, name: str, value) -> None:
+def _apply_live_change(tb, ctrl, state, name: str, value) -> None:
+    """Live-tune dispatch. `state` carries the RF on/off flag and the gain that RF-on
+    should apply, so power/gain edits made while RF is OFF are staged and reach the
+    hardware only when RF is switched ON."""
     if name == "power":
-        gain = gain_for_power(float(value))
-        tb.set_gain(gain)
-        # Report the delivered power the radio actually settled on (gain quantises),
-        # so the GUI shows the true level rather than the request.
-        ctrl.report("power", round(power_for_gain(tb.actual_gain()), 2))
+        # dBm → gain via the calibration; stage it, apply to the radio only if RF is on.
+        state["gain"] = gain_for_power(float(value))
+        if state["rf_on"]:
+            tb.set_gain(state["gain"])
+            ctrl.report("power", round(power_for_gain(tb.actual_gain()), 2))
+        else:
+            ctrl.report("power", round(power_for_gain(state["gain"]), 2))
+    elif name == "gain":
+        # Calibration knob: raw TX gain (dB), bypassing the dBm mapping.
+        state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
+        if state["rf_on"]:
+            tb.set_gain(state["gain"])
+            ctrl.report("gain", round(tb.actual_gain(), 2))
+        else:
+            ctrl.report("gain", round(state["gain"], 2))
+    elif name == "rf":
+        on = str(value).strip().lower() in ("on", "1", "true", "yes")
+        state["rf_on"] = on
+        if on:
+            tb.set_amplitude(AMPLITUDE)   # restore staged level, then unmute gain
+            tb.set_gain(state["gain"])
+        else:
+            tb.set_gain(0.0)
+            tb.set_amplitude(0.0)
+        ctrl.report("rf", "on" if on else "off")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
@@ -359,7 +409,10 @@ def main() -> int:
     args = script.parse()
 
     samp_rate_hz = args.samp_rate * 1e6
-    gain_db = gain_for_power(args.power)
+    # A raw calibration gain (the normally-commented --gain knob) overrides the dBm
+    # mapping when present, so you can measure output power at a chosen gain.
+    gain_cal = getattr(args, "gain", None)
+    gain_db = float(gain_cal) if gain_cal is not None else gain_for_power(args.power)
 
     # Temp dir for the period file: prefer /dev/shm (RAM-backed → fast, no SD wear);
     # fall back to the default temp location if it's absent.
@@ -377,6 +430,14 @@ def main() -> int:
         code_file=code_file, center_freq_hz=CARRIER_HZ, samp_rate_hz=samp_rate_hz,
         gain_db=gain_db, otw_format=args.otw, extra_args="")
 
+    # RF on/off state + the gain that RF-on applies. Starting with --rf off builds
+    # the flow muted; power/gain edits made while OFF are staged into state["gain"]
+    # and reach the radio only when RF is switched ON.
+    state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
+    if not state["rf_on"]:
+        tb.set_gain(0.0)
+        tb.set_amplitude(0.0)
+
     # Startup banner (the ONLY output during a run — we go silent after start()).
     print(f"── {SIGNAL_NAME} TX ─────────────────────────────────────────")
     print(f"  PRN            : {args.prn}")
@@ -389,6 +450,9 @@ def main() -> int:
           f"(cable −{CABLE_LOSS_DB:g} dB, amp +{AMPLIFIER_GAIN_DB:g} dB)")
     print(f"  → gain         : {gain_db:.2f} dB (max {GAIN_AT_MAX_DB:g}), "
           f"amplitude {AMPLITUDE:g}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
+    if gain_cal is not None:
+        print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
     print(f"  otw            : {args.otw}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
@@ -403,7 +467,7 @@ def main() -> int:
     try:
         while not stop.is_set():
             for change in ctrl.drain():
-                _apply_live_change(tb, ctrl, change.name, change.value)
+                _apply_live_change(tb, ctrl, state, change.name, change.value)
             time.sleep(0.1)
     finally:
         ctrl.close()
