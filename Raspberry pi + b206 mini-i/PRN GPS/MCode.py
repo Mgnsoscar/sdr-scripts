@@ -116,6 +116,21 @@ def power_for_gain(gain_db: float) -> float:
     return port_dbm - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
 
 
+_PMAP = None
+
+
+def power_map() -> PowerMap:
+    """The active power map: the unit's injected calibration curve if present
+    (SDR_CALIBRATION_FILE), else the baked constants above. Cached, so build_script
+    and main share one — and so --power's schema bounds match the real operating
+    range (calibrated → e.g. EIRP; else the baked SDR-port range)."""
+    global _PMAP
+    if _PMAP is None:
+        _PMAP = PowerMap.load(PowerMap.from_linear(
+            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+    return _PMAP
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 L1_HZ = 1575.42e6
@@ -282,8 +297,9 @@ def build_script() -> Script:
                 presets=FREQUENCIES, default=L1_HZ, required=True,
                 help="RF carrier (M-code is on L1 and L2). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
-                min=round(MIN_DELIVERED_DBM, 2), max=round(MAX_DELIVERED_DBM, 2),
-                default=round(MAX_DELIVERED_DBM, 2), required=True, live=True,
+                min=round(power_map().min_power_dbm, 2),
+                max=round(power_map().max_power_dbm, 2),
+                default=round(power_map().max_power_dbm, 2), required=True, live=True,
                 help="Target output power at the delivered plane (after cable loss + "
                      "amplifier gain). Max = what the SDR produces at its calibrated "
                      "max gain; raise it by editing the calibration constants.")
@@ -329,10 +345,7 @@ def main() -> int:
 
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
     # else the baked constants above (identical to the old single-anchor behaviour).
-    pmap = PowerMap.load(PowerMap.from_linear(
-        min_gain_db=0.0, max_gain_db=GAIN_AT_MAX_DB,
-        min_power_dbm=MIN_DELIVERED_DBM, max_power_dbm=MAX_DELIVERED_DBM,
-        amplitude=AMPLITUDE))
+    pmap = power_map()
     amplitude = pmap.amplitude
 
     # A raw calibration gain (the normally-commented --gain knob) overrides the dBm

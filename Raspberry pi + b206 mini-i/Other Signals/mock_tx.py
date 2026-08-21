@@ -61,6 +61,19 @@ HW_MAX_GAIN_DB = 89.75
 MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
 MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 
+_PMAP = None
+
+
+def power_map() -> PowerMap:
+    """The active power map: the unit's injected calibration curve if present
+    (SDR_CALIBRATION_FILE), else the baked constants. Cached, so --power's schema
+    bounds match the real operating range (calibrated → e.g. EIRP; else baked)."""
+    global _PMAP
+    if _PMAP is None:
+        _PMAP = PowerMap.load(PowerMap.from_linear(
+            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+    return _PMAP
+
 
 # ── The fake radio: logs instead of touching hardware ──────────────────────────
 
@@ -95,14 +108,14 @@ def build_script() -> Script:
                 default=1575.42e6,
                 help="Informational carrier for the log lines. Fixed per run.")
         .number("-Power", "--power", unit="dBm",
-                min=-140.0, max=60.0,
-                default=round(MAX_DELIVERED_DBM, 2), required=True, live=True,
+                min=round(power_map().min_power_dbm, 2),
+                max=round(power_map().max_power_dbm, 2),
+                default=round(power_map().max_power_dbm, 2), required=True, live=True,
                 help="Target output power at the delivered plane. With a calibration "
                      "file this reads through the unit's measured curve at its real "
-                     "plane (e.g. EIRP, so higher values are valid); without it, the "
-                     "baked SDR-port scale. The runtime clamps to the true limits and "
-                     "reports what it settled on. Deliberately wide so it demos both "
-                     "scales. Live — retune while running.")
+                     "plane (e.g. EIRP); without it, the baked SDR-port scale. The "
+                     "schema bounds track whichever is active. Live — retune while "
+                     "running.")
         .choice("-RF", "--rf", options=["on", "off"], default="on",
                 required=False, live=True,
                 help="RF output on/off (mock: on-air vs muted). Live. Power changes "
@@ -122,9 +135,7 @@ def build_script() -> Script:
 
 def _self_test() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
-    baked = PowerMap.from_linear(0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM,
-                                 MAX_DELIVERED_DBM, AMPLITUDE)
-    pmap = PowerMap.load(baked)
+    pmap = power_map()
     log.info("power map source : %s", pmap.source)
     log.info("operating label  : %s", pmap.label)
     log.info("gain limits      : %.2f … %.2f dB", pmap.min_gain_db, pmap.max_gain_db)
@@ -151,8 +162,7 @@ def main() -> int:
     args = script.parse()
 
     # Power map: the unit's injected calibration curve if present, else baked.
-    pmap = PowerMap.load(PowerMap.from_linear(
-        0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+    pmap = power_map()
     amplitude = pmap.amplitude
 
     gain_cal = getattr(args, "gain", None)
