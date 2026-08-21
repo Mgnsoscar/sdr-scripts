@@ -14,8 +14,9 @@ How the drift works
 ───────────────────
 The LO sits at the drift centre f_c = (start+end)/2, and the baseband tone offset
 moves over time so the emitted frequency f(t) ramps from start to end. The drift
-begins at ON-AIR — the moment RF is switched on. It starts OFF (muted), so a
-pre-roll works: set the power, then switch --rf on to go on-air and start the ramp.
+runs on its own timeline from the moment the script starts — it is independent of
+RF. --rf on/off is a pure mute/unmute and does NOT start, stop, or restart the
+sweep; use --restart to re-run the ramp from the start frequency.
 
     --drift once      : ramp start→end over --duration, then hold at end (default)
     --drift loop      : ramp start→end, jump back to start, repeat
@@ -255,9 +256,9 @@ def main() -> int:
     tb = _build_top_block(center, samp_rate, start - center, gain_db,
                           AMPLITUDE, extra_args="")
 
-    # RF on/off state + the gain RF-on applies. CW defaults to --rf off (muted
-    # pre-roll): the flow starts silent, and going ON is the on-air moment that
-    # starts the drift. Power/gain edits made while OFF are staged for the next ON.
+    # RF on/off state + the gain RF-on applies. CW defaults to --rf off so it starts
+    # muted; RF is a pure mute/unmute and does NOT touch the sweep. Power/gain edits
+    # made while OFF are staged for the next ON.
     state = {"rf_on": getattr(args, "rf", "off") == "on", "gain": gain_db}
     if not state["rf_on"]:
         tb.set_gain(0.0)
@@ -275,15 +276,19 @@ def main() -> int:
           f"(cable −{CABLE_LOSS_DB:g} dB, amp +{AMPLIFIER_GAIN_DB:g} dB)")
     print(f"  → gain         : {gain_db:.2f} dB (max {GAIN_AT_MAX_DB:g}), "
           f"amplitude {AMPLITUDE:g}")
-    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted — switch on to go on-air)'}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted — switch --rf on to unmute)'}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    print("  drift begins at on-air (RF on).")
+    if drifting:
+        print("  drift runs on its own timeline from start; --rf is a pure mute, "
+              "--restart re-runs the sweep.")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
     ctrl = script.live_control(args)
-    t0 = time.monotonic() if state["rf_on"] else None
+    # The drift runs on its own timeline from start — independent of RF. RF on/off is
+    # a pure mute; only --restart re-runs the sweep from the start frequency.
+    t0 = time.monotonic() if drifting else None
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -310,13 +315,13 @@ def main() -> int:
                     else:
                         ctrl.report("gain", round(state["gain"], 2))
                 elif change.name == "rf":
+                    # Pure mute/unmute — does NOT start or restart the sweep (the
+                    # drift keeps its own timeline; use --restart to re-run it).
                     on = str(change.value).strip().lower() in ("on", "1", "true", "yes")
                     state["rf_on"] = on
                     if on:
                         tb.set_amplitude(AMPLITUDE)
                         tb.set_gain(state["gain"])
-                        if t0 is None:
-                            t0 = time.monotonic()      # on-air → the drift starts now
                     else:
                         tb.set_gain(0.0)
                         tb.set_amplitude(0.0)
