@@ -9,7 +9,7 @@ Generates a **bit-exact** GPS **L5** signal (1176.45 MHz): the QPSK of two
     L5Q (quadrature, pilot) : 10230-chip primary × NH20 secondary (20 ms)
 
 Precomputed and replayed from a file so a Raspberry Pi can sustain the 40+ MS/s
-an L5 signal needs (same recipe as gps_prn_tx.py / mcode_boc_tx.py).
+an L5 signal needs (same recipe as gps_l1ca_tx.py / mcode_boc_tx.py).
 
 Code fidelity — these are the real IS-GPS-705 codes
 ───────────────────────────────────────────────────
@@ -31,7 +31,7 @@ normally carry CNAV, so it's like a constant data bit.)
    Transmit ONLY into a shielded / conducted setup you are LICENSED / AUTHORISED
    to use — never radiate over the air.
 
-Why it runs on a Pi + live tuning: see gps_prn_tx.py. Precompute + loop from a
+Why it runs on a Pi + live tuning: see gps_l1ca_tx.py. Precompute + loop from a
 /dev/shm file, sc8 over the wire, quiet, 1:1 master clock. Live knobs: gain and
 amplitude (instant). PRN / carrier / channel / sample rate / otw fixed per run.
 

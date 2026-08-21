@@ -46,7 +46,7 @@ validated bit-exact against the ICD's published check values — the "Initial
 Sequence" (first-24-chip) hex column of Tables 17–20, all 4×50 = 200 primary
 codes — by --self-test.
 
-How it streams fast on a Pi (same three levers as gps_prn_tx)
+How it streams fast on a Pi (same three levers as gps_l1ca_tx)
 ────────────────────────────────────────────────────────────
 1. PRECOMPUTE + LOOP: build the 100 ms buffer once, DMA bytes at runtime.
 2. sc8 OVER THE WIRE: otw_format=sc8 halves USB payload.

@@ -4,7 +4,7 @@ FM-chirp transmitter for GNU Radio + UHD (Ettus B200-mini family).
 
 A sine / triangle / sawtooth / square frequency sweep, precomputed and replayed
 from a file so a Raspberry Pi can sustain a high sample rate (40–60 MS/s) — the
-same recipe as gps_prn_tx.py, applied to the swept-tone chirp from TriangleChirp.
+same recipe as gps_l1ca_tx.py, applied to the swept-tone chirp from TriangleChirp.
 
 The instantaneous frequency is  f(t) = waveform(t) · (sweep_bw / 2), i.e. it
 sweeps ±sweep_bw/2 around the carrier, and the modulating waveform repeats at
@@ -13,7 +13,7 @@ sweeps ±sweep_bw/2 around the carrier, and the modulating waveform repeats at
 ⚠  RF SAFETY / LEGAL: transmit ONLY into a shielded / conducted setup (cable +
    attenuators) on frequencies you are LICENSED / AUTHORISED to use.
 
-Why this reaches 40–60 MS/s on a Pi (see gps_prn_tx.py for the full write-up)
+Why this reaches 40–60 MS/s on a Pi (see gps_l1ca_tx.py for the full write-up)
 ────────────────────────────────────────────────────────────────────────────
   1. PRECOMPUTE + LOOP — one whole sweep is built once and replayed with
      blocks.file_source(repeat=True); no per-sample NumPy in a work() block

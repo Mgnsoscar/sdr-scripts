@@ -6,7 +6,7 @@ Reproduces the GPS **M-code modulation** — sine-phased **BOC(10,5)**: a ±1
 spreading code at 5.115 Mcps multiplied by a 10.23 MHz square subcarrier — which
 gives M-code's characteristic **split spectrum** (two lobes at ±10.23 MHz around
 the carrier, ~30 MHz total). Precomputed and replayed from a file so a Raspberry
-Pi can sustain the 40–60 MS/s needed to carry it (same recipe as gps_prn_tx.py).
+Pi can sustain the 40–60 MS/s needed to carry it (same recipe as gps_l1ca_tx.py).
 
 ⚠  NOT the real M-code. The actual military spreading sequence is CLASSIFIED and
    encrypted and cannot be generated here. This uses an UNCLASSIFIED surrogate
@@ -35,7 +35,7 @@ those alias near the main lobes, so **60 MS/s is noticeably cleaner** for
 BOC(10,5). A true M-code simulator would band-limit; this ships the full square
 subcarrier (what M-code actually transmits).
 
-Why it runs on a Pi, and live tuning: see gps_prn_tx.py. In short — precompute +
+Why it runs on a Pi, and live tuning: see gps_l1ca_tx.py. In short — precompute +
 loop from a /dev/shm file, sc8 over the wire, quiet, 1:1 master clock. Live
 knobs: gain and amplitude (instant). PRN / carrier / sample rate / otw are fixed
 per run (BOC(10,5)'s code and subcarrier rates are fixed by definition).
