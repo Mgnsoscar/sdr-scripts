@@ -176,6 +176,16 @@ class Param:
 
 # ── Value resolution (preset key OR raw value) + range checking ──────────────
 
+def _int_flexible(s: str) -> int:
+    """Parse an int, honouring a 0x/0o/0b prefix (base 0) but also accepting a plain
+    decimal with leading zeros like '08' or '0123' — which base 0 rejects, an easy
+    trap for an operator who pads a PRN or count."""
+    try:
+        return int(s, 0)
+    except ValueError:
+        return int(s, 10)
+
+
 def _make_resolver(param: Param, cast: Callable[[str], Any]) -> Callable[[str], Any]:
     """Build the argparse `type` callable for a numeric parameter.
 
@@ -360,7 +370,7 @@ class Script:
             if p.kind == NUMBER:
                 kwargs["type"] = _make_resolver(p, float)
             elif p.kind == INTEGER:
-                kwargs["type"] = _make_resolver(p, lambda s: int(s, 0))
+                kwargs["type"] = _make_resolver(p, _int_flexible)
             elif p.kind == CHOICE:
                 kwargs["choices"] = p.choices
                 kwargs["type"] = str
