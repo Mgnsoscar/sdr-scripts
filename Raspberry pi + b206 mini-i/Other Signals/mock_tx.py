@@ -110,24 +110,24 @@ def build_script() -> Script:
         .number("-Power", "--power", unit="dBm",
                 min=round(power_map().min_power_dbm, 2),
                 max=round(power_map().max_power_dbm, 2),
-                default=round(power_map().max_power_dbm, 2), required=True, live=True,
-                help="Target output power at the delivered plane. With a calibration "
-                     "file this reads through the unit's measured curve at its real "
-                     "plane (e.g. EIRP); without it, the baked SDR-port scale. The "
-                     "schema bounds track whichever is active. Live — retune while "
-                     "running.")
+                default=round(power_map().max_power_dbm, 2), required=False, live=True,
+                help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
+                     "unit's calibration when present (e.g. EIRP), else the baked "
+                     "SDR-port scale. Ignored if --gain is given. Live.")
         .choice("-RF", "--rf", options=["on", "off"], default="on",
                 required=False, live=True,
                 help="RF output on/off (mock: on-air vs muted). Live. Power changes "
                      "made while OFF are staged and applied when you switch ON.")
         .number("-Heartbeat", "--interval", unit="s", min=0.5, max=60.0, default=2.0,
                 help="How often to log an on-air/muted heartbeat line.")
+        # RELATIVE power: raw SDR gain (dB). No default → its presence selects
+        # relative mode and overrides --power.
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
+                     "bypassing the dBm calibration. When given, overrides --power. "
+                     "Live.")
     )
-    # ── CALIBRATION KNOB (normally commented OUT) ───────────────────────────────
-    # Uncomment to drive raw TX gain (dB) directly, bypassing the dBm mapping.
-    # s = s.number("-Cal-gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
-    #              default=HW_MAX_GAIN_DB, required=False, live=True,
-    #              help="CALIBRATION ONLY — raw gain, overrides --power.")
     return s
 
 

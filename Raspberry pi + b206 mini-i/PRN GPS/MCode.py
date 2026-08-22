@@ -299,10 +299,10 @@ def build_script() -> Script:
         .number("-Power", "--power", unit="dBm",
                 min=round(power_map().min_power_dbm, 2),
                 max=round(power_map().max_power_dbm, 2),
-                default=round(power_map().max_power_dbm, 2), required=True, live=True,
-                help="Target output power at the delivered plane (after cable loss + "
-                     "amplifier gain). Max = what the SDR produces at its calibrated "
-                     "max gain; raise it by editing the calibration constants.")
+                default=round(power_map().max_power_dbm, 2), required=False, live=True,
+                help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
+                     "unit's calibration when present. Ignored if --gain is given "
+                     "(relative wins). Live.")
         .number("-Sample-rate", "--sample_rate", unit="MHz", min=30.0, max=61.44,
                 default=40.0,
                 help="Host/DAC sample rate; master clock pinned equal (1:1). "
@@ -315,17 +315,15 @@ def build_script() -> Script:
                 help="RF output on/off. OFF mutes the signal (gain AND baseband "
                      "amplitude to 0); ON restores them. Change the power (or the "
                      "calibration gain) while OFF and it takes effect when you turn ON.")
+        # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
+        # No default, so its PRESENCE selects relative mode (it overrides --power).
+        # This is also the calibration knob — set it while measuring output vs gain.
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
+                     "bypassing the dBm calibration. When given, overrides --power. "
+                     "Live.")
     )
-    # ── CALIBRATION KNOB (normally commented OUT) ───────────────────────────────
-    # Uncomment to expose a raw TX-gain slider (dB) so you can measure output power
-    # vs gain on a spectrum analyser and fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB
-    # above. While present it OVERRIDES --power (whichever you touch last wins).
-    # s = s.number(
-    #     "-Cal-gain", "--gain", unit="dB",
-    #     min=0, max=HW_MAX_GAIN_DB, default=HW_MAX_GAIN_DB,
-    #     required=False, live=True,
-    #     help="CALIBRATION ONLY — set SDR TX gain directly, bypassing the dBm "
-    #          "mapping. Comment out again for normal dBm operation.")
     return s
 
 
