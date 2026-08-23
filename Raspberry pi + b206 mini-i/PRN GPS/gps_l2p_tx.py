@@ -77,7 +77,14 @@ os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")        # skip slow pref scan
 # NumPy and GNU Radio are imported lazily so --self-test / --describe-params run
 # anywhere, including CI and dev boxes without a radio stack.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paramkit import Script
+from paramkit import Script, PowerMap
+
+# Stable calibration signal id. When a task sets SDR_CAL_SIGNAL_ID to this value the
+# agent injects this unit's resolved calibration (SDR_CALIBRATION_FILE); calkit reads
+# it and --power maps through the unit's MEASURED curve at its real operating plane
+# (e.g. EIRP). Absent it, the baked USER CALIBRATION constants below are used
+# (unchanged behaviour). See the agent's docs/calibration.md.
+CAL_SIGNAL_ID = "gps_l2_p"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -131,21 +138,22 @@ MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 HW_MAX_GAIN_DB = 89.75
 
 
-def gain_for_power(delivered_dbm: float) -> float:
-    """TX gain (dB) that puts `delivered_dbm` at the far end of the RF chain. Undo
-    the chain to get the power needed at the SDR port, then map port power to gain
-    against the calibration anchor (1 dB gain ≈ 1 dB power). Clamped to
-    [0, GAIN_AT_MAX_DB] so it can never command more than the calibrated maximum."""
-    port_dbm = delivered_dbm + CABLE_LOSS_DB - AMPLIFIER_GAIN_DB
-    gain = GAIN_AT_MAX_DB + (port_dbm - OUTPUT_POWER_DBM)
-    return max(0.0, min(GAIN_AT_MAX_DB, gain))
+# ── Power map: the unit's injected calibration curve if present, else the baked
+#    constants above (identical to the old single-anchor slope-1 behaviour) ────────
+
+_PMAP = None
 
 
-def power_for_gain(gain_db: float) -> float:
-    """Inverse of gain_for_power: the delivered power (dBm) for an actual hardware
-    gain — used to report what the radio really settled on after quantisation."""
-    port_dbm = OUTPUT_POWER_DBM - (GAIN_AT_MAX_DB - gain_db)
-    return port_dbm - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
+def power_map() -> PowerMap:
+    """The active power map: the unit's injected calibration curve if present
+    (SDR_CALIBRATION_FILE), else the baked constants above. Cached, so build_script and
+    main share one — and so --power's schema bounds match the real operating range
+    (calibrated → e.g. EIRP; else the baked SDR-port range)."""
+    global _PMAP
+    if _PMAP is None:
+        _PMAP = PowerMap.load(PowerMap.from_linear(
+            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+    return _PMAP
 
 
 # ── Signal constants (fixed for this script — it IS GPS L2 P-code) ──────────────
@@ -269,7 +277,7 @@ def build_iq_buffer(prn: int, chip_rate_hz: float, samp_rate_hz: float):
 # ── Flowgraph ──────────────────────────────────────────────────────────────────
 
 def _build_top_block(code_file: str, center_freq_hz: float, samp_rate_hz: float,
-                     gain_db: float, otw_format: str, extra_args: str):
+                     gain_db: float, amplitude: float, otw_format: str, extra_args: str):
     """Construct the GNU Radio top_block. Imported lazily so the module loads
     without a radio stack for --self-test / --describe-params."""
     from gnuradio import gr, blocks, uhd
@@ -297,7 +305,7 @@ def _build_top_block(code_file: str, center_freq_hz: float, samp_rate_hz: float,
             self.usrp.set_gain(gain_db, 0)
 
             self.src = blocks.file_source(gr.sizeof_gr_complex, code_file, repeat=True)
-            self.amp = blocks.multiply_const_cc(AMPLITUDE)   # fixed calibration amplitude
+            self.amp = blocks.multiply_const_cc(amplitude)   # calibration amplitude
             self.connect(self.src, self.amp, self.usrp)
 
         # ── live setters (called from the main loop, device-safe) ──────────────
@@ -336,12 +344,13 @@ def build_script() -> Script:
         .number(
             "-Power", "--power",
             unit="dBm",
-            min=round(MIN_DELIVERED_DBM, 2), max=round(MAX_DELIVERED_DBM, 2),
-            default=round(MAX_DELIVERED_DBM, 2),
+            min=round(power_map().min_power_dbm, 2),
+            max=round(power_map().max_power_dbm, 2),
+            default=round(power_map().max_power_dbm, 2),
             required=True, live=True,
-            help="Target output power at the delivered plane (after cable loss + "
-                 "amplifier gain). The maximum is what the SDR can produce at its "
-                 "calibrated max gain; raise it by editing the calibration constants."
+            help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
+                 "unit's calibration when present (e.g. EIRP), else the baked "
+                 "SDR-port scale. Ignored if --gain is given (relative wins). Live."
         )
         .number(
             "-Sample-rate", "--samp_rate",
@@ -365,34 +374,34 @@ def build_script() -> Script:
                  "amplitude to 0); ON restores them. Change the power (or the "
                  "calibration gain) while OFF and it takes effect when you turn ON."
         )
+        # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
+        # No default, so its PRESENCE selects relative mode (it overrides --power).
+        # This is also the calibration knob — set it while measuring output vs gain
+        # on a spectrum analyser to fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB above.
+        .number(
+            "-Gain", "--gain", unit="dB",
+            min=0, max=HW_MAX_GAIN_DB, required=False, live=True,
+            help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
+                 "bypassing the dBm calibration. When given, overrides --power. Live."
+        )
     )
-    # ── CALIBRATION KNOB (normally commented OUT) ───────────────────────────────
-    # Uncomment to expose a raw TX-gain slider (dB) so you can measure output power
-    # vs gain on a spectrum analyser and fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB
-    # above. While present it OVERRIDES --power (whichever you touch last wins).
-    # s = s.number(
-    #     "-Cal-gain", "--gain", unit="dB",
-    #     min=0, max=HW_MAX_GAIN_DB, default=HW_MAX_GAIN_DB,
-    #     required=False, live=True,
-    #     help="CALIBRATION ONLY — set SDR TX gain directly, bypassing the dBm "
-    #          "mapping. Comment out again for normal dBm operation.")
     return s
 
 
 # ── Live-change dispatch ────────────────────────────────────────────────────────
 
-def _apply_live_change(tb, ctrl, state, name: str, value) -> None:
+def _apply_live_change(tb, ctrl, state, pmap, amplitude, name: str, value) -> None:
     """Live-tune dispatch. `state` carries the RF on/off flag and the gain that RF-on
     should apply, so power/gain edits made while RF is OFF are staged and reach the
     hardware only when RF is switched ON."""
     if name == "power":
         # dBm → gain via the calibration; stage it, apply to the radio only if RF is on.
-        state["gain"] = gain_for_power(float(value))
+        state["gain"] = pmap.gain_for_power(float(value))
         if state["rf_on"]:
             tb.set_gain(state["gain"])
-            ctrl.report("power", round(power_for_gain(tb.actual_gain()), 2))
+            ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
         else:
-            ctrl.report("power", round(power_for_gain(state["gain"]), 2))
+            ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
     elif name == "gain":
         # Calibration knob: raw TX gain (dB), bypassing the dBm mapping.
         state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
@@ -405,7 +414,7 @@ def _apply_live_change(tb, ctrl, state, name: str, value) -> None:
         on = str(value).strip().lower() in ("on", "1", "true", "yes")
         state["rf_on"] = on
         if on:
-            tb.set_amplitude(AMPLITUDE)   # restore staged level, then unmute gain
+            tb.set_amplitude(amplitude)   # restore staged level, then unmute gain
             tb.set_gain(state["gain"])
         else:
             tb.set_gain(0.0)
@@ -427,10 +436,14 @@ def main() -> int:
     args = script.parse()
 
     samp_rate_hz = args.samp_rate * 1e6
-    # A raw calibration gain (the normally-commented --gain knob) overrides the dBm
-    # mapping when present, so you can measure output power at a chosen gain.
+    # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
+    # else the baked constants above (identical to the old single-anchor behaviour).
+    pmap = power_map()
+    amplitude = pmap.amplitude
+    # A raw --gain (relative / calibration knob) overrides the dBm mapping when present,
+    # so you can command a gain directly or measure output power at it.
     gain_cal = getattr(args, "gain", None)
-    gain_db = float(gain_cal) if gain_cal is not None else gain_for_power(args.power)
+    gain_db = float(gain_cal) if gain_cal is not None else pmap.gain_for_power(args.power)
 
     # Temp dir for the period file: prefer /dev/shm (RAM-backed → fast, no SD wear);
     # fall back to the default temp location if it's absent.
@@ -446,7 +459,7 @@ def main() -> int:
 
     tb = _build_top_block(
         code_file=code_file, center_freq_hz=CARRIER_HZ, samp_rate_hz=samp_rate_hz,
-        gain_db=gain_db, otw_format=args.otw, extra_args="")
+        gain_db=gain_db, amplitude=amplitude, otw_format=args.otw, extra_args="")
 
     # RF on/off state + the gain that RF-on applies. Starting with --rf off builds
     # the flow muted; power/gain edits made while OFF are staged into state["gain"]
@@ -466,10 +479,10 @@ def main() -> int:
           f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
     print(f"  code rate      : {CODE_RATE_MCPS:g} Mcps "
           f"(~{2*CODE_RATE_MCPS:g} MHz null-to-null)")
-    print(f"  power (target) : {args.power:g} dBm delivered "
-          f"(cable −{CABLE_LOSS_DB:g} dB, amp +{AMPLIFIER_GAIN_DB:g} dB)")
-    print(f"  → gain         : {gain_db:.2f} dB (max {GAIN_AT_MAX_DB:g}), "
-          f"amplitude {AMPLITUDE:g}")
+    print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
+          f"amplitude {amplitude:g}")
+    print(f"  calibration    : {pmap.source}")
     print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
@@ -487,7 +500,7 @@ def main() -> int:
     try:
         while not stop.is_set():
             for change in ctrl.drain():
-                _apply_live_change(tb, ctrl, state, change.name, change.value)
+                _apply_live_change(tb, ctrl, state, pmap, amplitude, change.name, change.value)
             time.sleep(0.1)
     finally:
         ctrl.close()

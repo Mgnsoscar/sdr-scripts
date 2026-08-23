@@ -101,21 +101,6 @@ MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
 MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 
 
-def gain_for_power(delivered_dbm: float) -> float:
-    """TX gain (dB) that puts `delivered_dbm` at the far end of the RF chain, clamped
-    to [0, GAIN_AT_MAX_DB] so it can never exceed the calibrated maximum."""
-    port_dbm = float(delivered_dbm) + CABLE_LOSS_DB - AMPLIFIER_GAIN_DB
-    gain = GAIN_AT_MAX_DB + (port_dbm - OUTPUT_POWER_DBM)
-    return max(0.0, min(GAIN_AT_MAX_DB, gain))
-
-
-def power_for_gain(gain_db: float) -> float:
-    """Delivered power (dBm) for an actual hardware gain — to report what the radio
-    really settled on after quantisation."""
-    port_dbm = OUTPUT_POWER_DBM - (GAIN_AT_MAX_DB - float(gain_db))
-    return port_dbm - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
-
-
 _PMAP = None
 
 

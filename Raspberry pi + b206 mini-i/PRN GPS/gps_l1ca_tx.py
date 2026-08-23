@@ -136,23 +136,6 @@ MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 HW_MAX_GAIN_DB = 89.75
 
 
-def gain_for_power(delivered_dbm: float) -> float:
-    """TX gain (dB) that puts `delivered_dbm` at the far end of the RF chain. Undo
-    the chain to get the power needed at the SDR port, then map port power to gain
-    against the calibration anchor (1 dB gain ≈ 1 dB power). Clamped to
-    [0, GAIN_AT_MAX_DB] so it can never command more than the calibrated maximum."""
-    port_dbm = delivered_dbm + CABLE_LOSS_DB - AMPLIFIER_GAIN_DB
-    gain = GAIN_AT_MAX_DB + (port_dbm - OUTPUT_POWER_DBM)
-    return max(0.0, min(GAIN_AT_MAX_DB, gain))
-
-
-def power_for_gain(gain_db: float) -> float:
-    """Inverse of gain_for_power: the delivered power (dBm) for an actual hardware
-    gain — used to report what the radio really settled on after quantisation."""
-    port_dbm = OUTPUT_POWER_DBM - (GAIN_AT_MAX_DB - gain_db)
-    return port_dbm - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
-
-
 _PMAP = None
 
 
