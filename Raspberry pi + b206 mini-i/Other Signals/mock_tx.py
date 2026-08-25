@@ -55,7 +55,7 @@ OUTPUT_POWER_DBM = -20.0    # max delivered power (dBm) at GAIN_AT_MAX_DB and AM
 GAIN_AT_MAX_DB = 89.75      # gain that produced it; also the fallback ceiling
 CABLE_LOSS_DB = 0.0
 AMPLIFIER_GAIN_DB = 0.0
-AMPLITUDE = 0.8
+AMPLITUDE = 0.5
 HW_MAX_GAIN_DB = 89.75
 
 MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
@@ -178,6 +178,8 @@ def main() -> int:
     log.info("  → gain         : %.2f dB (max %g), amplitude %g",
              gain_db, pmap.max_gain_db, amplitude)
     log.info("  calibration    : %s", pmap.source)
+    if pmap.warning:                       # calibration measured at another amplitude
+        log.info("  ⚠ CALIBRATION  : %s", pmap.warning)
     log.info("  RF             : %s", "ON" if state["rf_on"] else "OFF (muted)")
     if gain_cal is not None:
         log.info("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
