@@ -87,40 +87,31 @@ CAL_SIGNAL_ID = "glonass_of"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USER CALIBRATION — MEASURE THESE ONCE, THEN EDIT THE VALUES BELOW
+# RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
+# only from the unit's injected calibration; uncalibrated, the script runs on a
+# relative gain (never invented power levels). GAIN_AT_MAX_DB is the safety ceiling.
 # ═══════════════════════════════════════════════════════════════════════════════
-# Set the transmit level in dBm. That works only if the script knows how the SDR's
-# gain maps to output power, established once with a spectrum analyser: leave AMPLITUDE
-# below, run --power at its max (commands GAIN_AT_MAX_DB), measure the port power, and
-# put it in OUTPUT_POWER_DBM. CABLE_LOSS_DB / AMPLIFIER_GAIN_DB describe the RF chain
-# after the port, so --power is the power delivered at the far end.
-OUTPUT_POWER_DBM = -20.0    # max output (dBm) at GAIN_AT_MAX_DB and AMPLITUDE — MEASURE THIS
 GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling the script commands
-CABLE_LOSS_DB = 0.0         # cabling insertion loss after the SDR port (positive dB)
-AMPLIFIER_GAIN_DB = 0.0     # external amplifier gain after the SDR port (positive dB)
 
 # Fixed baseband digital amplitude (0..1). NOT a user control and never a task
 # parameter: the calibration is measured at THIS amplitude, so a unit calibrated at a
 # different amplitude no longer matches. calkit detects that at load and runs
-# UNCALIBRATED (baked levels) with a loud warning until it is re-calibrated here.
+# UNCALIBRATED with a loud warning until it is re-calibrated here.
 AMPLITUDE = 0.5
 
 HW_MAX_GAIN_DB = 89.75       # B200-mini physical TX-gain ceiling
 
-MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
-MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 
 _PMAP = None
 
 
 def power_map() -> PowerMap:
     """Active power map: the unit's injected calibration curve if present
-    (SDR_CALIBRATION_FILE), else the baked constants above. Cached, so build_script and
+    (SDR_CALIBRATION_FILE), else uncalibrated (relative gain only). Cached, so build_script and
     main share one and --power's schema bounds match the real operating range."""
     global _PMAP
     if _PMAP is None:
-        _PMAP = PowerMap.load(PowerMap.from_linear(
-            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+        _PMAP = PowerMap.load(PowerMap.uncalibrated(0.0, GAIN_AT_MAX_DB, AMPLITUDE))
     return _PMAP
 
 
@@ -298,9 +289,7 @@ def build_script() -> Script:
                  help="FDMA channel number k (−7..+6). Sets the carrier in channel "
                       "mode; ignored in band mode. Fixed per run.")
         .number("-Power", "--power", unit="dBm",
-                min=round(power_map().min_power_dbm, 2),
-                max=round(power_map().max_power_dbm, 2),
-                default=round(power_map().max_power_dbm, 2), required=False, live=True,
+                **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
                      "unit's calibration when present (e.g. EIRP), else the baked "
                      "SDR-port scale. Ignored if --gain is given (relative wins). Live.")
@@ -373,8 +362,19 @@ def main() -> int:
     # constants above. A raw --gain (relative) overrides the dBm mapping when present.
     pmap = power_map()
     amplitude = pmap.amplitude
-    gain_cal = getattr(args, "gain", None)
-    gain_db = float(gain_cal) if gain_cal is not None else pmap.gain_for_power(args.power)
+    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+    if gain_cal is not None:
+        gain_db = float(gain_cal)
+    elif power_map().has_absolute:                  # calibrated: the authored absolute --power
+        gain_db = power_map().gain_for_power(args.power)
+    else:                                           # uncalibrated: a persisted fallback gain, or refuse
+        _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
+        if _fb is None:
+            print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
+                  "has no meaning here; set a relative gain (the client does this for you).",
+                  file=sys.stderr)
+            return 2
+        gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
     tb = _build_top_block(iq_path, center, samp_rate_hz, gain_db, amplitude,
                           args.otw, "")
@@ -393,7 +393,8 @@ def main() -> int:
     print(f"  sample rate    : requested {samp_rate_hz/1e6:g} MHz, "
           f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
     print(f"  code           : 511-chip C/A @ 0.511 Mcps (BPSK)")
-    print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+    if power_map().has_absolute:
+        print(f"  power (target) : {args.power:g} dBm  ({power_map().label})")
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.source}")
