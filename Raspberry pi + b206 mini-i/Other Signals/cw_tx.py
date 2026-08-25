@@ -79,10 +79,11 @@ GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling t
 CABLE_LOSS_DB = 0.0         # cabling insertion loss after the SDR port (positive dB)
 AMPLIFIER_GAIN_DB = 0.0     # external amplifier gain after the SDR port (positive dB)
 
-# Fixed baseband digital amplitude (0..1). NOT a user control: OUTPUT_POWER_DBM is
-# calibrated at THIS amplitude, so changing it invalidates the dBm↔gain mapping —
-# if you change it, re-measure OUTPUT_POWER_DBM at GAIN_AT_MAX_DB.
-AMPLITUDE = 0.8
+# Fixed baseband digital amplitude (0..1). NOT a user control and never a task
+# parameter: the calibration is measured at THIS amplitude, so a unit calibrated at a
+# different amplitude no longer matches. calkit detects that at load and runs
+# UNCALIBRATED (baked levels) with a loud warning until it is re-calibrated here.
+AMPLITUDE = 0.5
 
 # Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
 # from GAIN_AT_MAX_DB. The (normally-commented) calibration gain knob uses it.
@@ -289,6 +290,8 @@ def main() -> int:
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.source}")
+    if pmap.warning:                       # e.g. calibration amplitude != this
+        print(f"  ⚠ CALIBRATION  : {pmap.warning}")   # script's fixed amplitude
     print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted — switch --rf on to unmute)'}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
