@@ -140,9 +140,16 @@ def run_channel(script, args, build: Callable, *, title: str = "channel-task",
             time.sleep(0.1)
         ctrl.close()
     finally:
+        # Best-effort cleanup: the connection may already be gone (the engine
+        # crashed, or the socket dropped), so tolerate any error here — a failed
+        # release must never mask the real exit or raise a secondary
+        # BrokenPipeError over the original traceback.
         try:
             eng.release(ch, owner)
-        except EngineError:
+        except Exception:
             pass
-        eng.close()
+        try:
+            eng.close()
+        except Exception:
+            pass
     return 0

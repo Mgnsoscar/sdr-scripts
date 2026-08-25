@@ -71,7 +71,7 @@ Every signal lowers to one of these engine modes:
 |---|---|---|
 | **expanded** | one device-rate buffer, replayed | C/A, P(Y), L2C, L5, M-code, B1I/B2b/B3I/B2a, E5, PRS, AltBOC, chirp, GLONASS |
 | **composite** | a few distinct period-blocks + a per-period selector sequence; streams the full (e.g. 18 s overlay) signal from a handful of blocks, byte-identical to a fully-baked buffer | L1C, B1C, E1, E6 |
-| **tone** | a **generated** continuous-phase CW at a baseband offset — no buffer; the frequency can be drifted live | CW / drift-CW |
+| **tone** | a **generated** continuous-phase CW at a baseband offset — no buffer; the frequency can be drifted live, and a wide sweep pins the analog LO and moves the hardware NCO | CW / drift-CW |
 
 ---
 
@@ -89,6 +89,89 @@ Every signal lowers to one of these engine modes:
    ```
 
    It opens the device, sets the master clock, and waits — all channels idle/muted.
+
+   **Two playback backends (`--backend stream | replay`).** This is the main
+   throughput decision:
+
+   - **`stream`** (default) — the ARM streams every sample in real time. Simple,
+     supports live drifting CW, and the only path that needs the format/throughput
+     knobs below. It underflows once a per-channel rate outruns the ARM (≈10 MS/s+).
+   - **`replay`** — each signal's loop is uploaded to **FPGA DRAM once** and the
+     RFNoC **Replay block** streams it to the radio, looping, straight from DRAM.
+     Nothing per-sample touches the host, so **61.44 MS/s is as cheap as 1 MS/s and
+     underflows are structurally impossible**. The one-time upload does the
+     `fc32→sc16` conversion off the RF deadline, so you keep full 16-bit fidelity
+     with no host real-time cost. This is the right path for wide signals (E5
+     AltBOC, etc.). Needs a Replay-capable FPGA image (e.g. the stock `X4_200`).
+
+     ```sh
+     # first confirm the loaded FPGA image actually has a Replay/DRAM block:
+     python3 x410_engine.py --list_rfnoc
+     #   → lists every RFNoC block; needs a line containing "Replay"
+
+     python3 x410_engine.py --backend replay --master_clock 245.76
+     ```
+
+     **Requires a Replay-capable FPGA image — which means UHD ≥ 4.5 on the X410.**
+     The stock `X4_200` image only gained a Replay/DRAM block in **UHD 4.5**; older
+     devices (e.g. UHD 4.1) show only Radio + DDC + DUC blocks and `--list_rfnoc`
+     reports no Replay. An FPGA image is locked to its MPM/UHD version, so you can't
+     drop a 4.5 `.bit` onto a 4.1 device — getting Replay means upgrading the whole
+     X410 to UHD ≥ 4.5 (device filesystem/MPM/FPGA + a compatible host UHD). That's
+     a full firmware upgrade of the unit; on a deployed system, weigh it against
+     staying on `--backend stream` with the int16-host memcpy path (below), which
+     needs no firmware change.
+
+     Notes: `--otw`/`--cpu`/`--send_ms` don't apply (there's no host sample loop).
+     Digital `amplitude` acts as play/mute (0 = not playing); set the level with
+     `gain`. A **static** CW works (a baked loop); a **drifting** CW re-bakes per
+     step, so run sweeps on `--backend stream`. Each channel gets an equal slice of
+     DRAM; a loop bigger than its slice is rejected (lower the rate or shorten it).
+     The engine logs the discovered RFNoC topology and every device call under
+     `[engine/replay]`, so a first-run mismatch on your image points to the exact
+     block/port to adjust.
+
+   **Wire / host sample format & throughput** (`--otw`, `--cpu`, `--send_ms`;
+   `stream` backend only). At high per-channel rates (≳10 MS/s) the ARM can
+   underflow. Three levers, all about moving fewer bytes and doing less per-sample
+   work — or just switch to `--backend replay` above:
+
+   - **`--cpu sc16`** (with the default `sc16` wire) — **the one that works and the
+     one to use.** It builds the samples **already in the wire layout**, so `send()`
+     is a pure memcpy — no `fc32→sc16` conversion on the ARM, which is the real cost
+     at 61.44 MS/s. IQ is packed once, at load, not on every send. The packing
+     interleaves I/Q ints and presents them as one wide scalar per sample (int32 for
+     `sc16`) — a byte-exact wire layout UHD accepts (a numpy *record* dtype does
+     **not** work — it garbles TX). Confirmed on hardware: `--cpu sc16` and `--cpu
+     fc32` produce identical spectra, so `sc16` gives full 16-bit fidelity at memcpy
+     cost.
+   - `--send_ms` — how many ms of samples go out per `send()` call (default 10).
+     Bigger = far fewer Python/UHD calls per second (the real ARM cost) at the
+     price of live-tune latency.
+   - `--otw sc8` / `--cpu sc8` — **avoid.** UHD's 8-bit host/wire format reorders
+     bytes within each 32-bit word in a version-specific way that a raw memcpy does
+     not match, so the spectrum comes out wrong (verified on hardware), and this UHD
+     build also lacks the `fc32→sc8` converter. `sc16` memcpy already removes the
+     conversion cost at full fidelity, so 8-bit isn't needed; the engine prints a
+     warning if you select `sc8`.
+
+   Recipe for full-fidelity high rate without a firmware change: **`--cpu sc16
+   --send_ms 20`** (memcpy, 16-bit). Underflows are reported per channel in the
+   log and in `status` (see *Underflow monitoring*).
+
+   **Verifying the integer host path.** The packing math is unit-tested, but that
+   UHD interprets the buffer correctly can only be confirmed on the radio. Send one
+   signal both ways into your analyzer and confirm they're identical:
+
+   ```sh
+   # A: baseline (proven)     python3 x410_engine.py --cpu fc32 ...
+   # B: memcpy path           python3 x410_engine.py --cpu sc16 ...
+   # then run e.g. fm_chirp or gps_prn at ~20 MS/s and compare the spectra —
+   # same centre, same shape, no mirror image (an I/Q swap reverses a chirp).
+   ```
+
+   Once B matches A at 20 MS/s, push the rate to 61.44 and watch the log for
+   `[engine] chN TX underflow` — zero underflows means you've cleared the wall.
 
 3. **Run channel-tasks** against the engine socket, one per signal. Each is an
    ordinary agent task. Example (GPS L1 C/A on RF0):
@@ -114,6 +197,18 @@ follows this pattern, which fits the client's timeline:
 
 `freq`, `gain`, `amplitude` are live on every signal. The CW task adds a live
 `restart` trigger (re-run the drift from the start).
+
+### Underflow monitoring
+
+The engine normally suppresses UHD's fastpath `U` markers, so a struggling
+channel used to fail silently. Each channel now runs a lightweight async monitor:
+TX underflows are **counted per channel and exposed in `status`** (the
+`underflows` field), and a throttled `[engine] chN TX underflow …` line is logged
+to stderr. If a channel underflows, it's asking for more samples/s than the ARM
+can generate — lower that channel's `--samp_rate`, or move a wide signal off a
+crowded scene. The generated `tone` mode caches its per-sample phasor ramp (only
+rebuilt when the frequency changes), so a pure or drifting CW now streams cleanly
+at the wide rates too.
 
 ---
 
@@ -143,7 +238,7 @@ negotiates to the nearest supported rate.
 | `glonass_sf_channel` | GLONASS **L1SF/L2SF** (FDMA P-code) | expanded | `--band L1\|L2`, `--mode channel\|band`, `--k -7..6` |
 | `iridium_stl_channel` | **Iridium / STL** DQPSK bursts *(surrogate)* | expanded | `--freq` (STL band), `--payload_symbols`, `--burst_period`, `--frames` |
 | `fm_chirp_channel` | FM chirp (swept tone) | expanded | `--freq`, `--bw`, `--rate`, `--waveform` |
-| `cw_channel` | **CW** tone + optional slow drift | tone | `--freq`, `--freq_end`, `--duration ≤1200`, `--drift once\|loop\|pingpong`, `--restart` |
+| `cw_channel` | **CW** tone + optional slow drift (wide spans sweep on the NCO) | tone | `--freq`, `--freq_end`, `--duration ≤1200`, `--drift once\|loop\|pingpong`, `--lo_span`, `--hop_blank`, `--restart` |
 
 **Surrogates:** M-code, PRS and Iridium/STL reproduce the correct RF/spectral (and,
 for Iridium, burst-timing) shape over an unclassified stand-in — the real sequences
@@ -162,14 +257,38 @@ continuous-phase and costs no buffer however slow it is.
 # pure CW at L1 (leave --freq_end unset)
 cw_channel.py --channel 0 --freq 1575.42e6 --gain 45 --amplitude 0
 
-# drift 1575.42 → 1575.43 MHz over 20 minutes, restartable from a tune-step
+# narrow drift 1575.42 → 1575.43 MHz over 20 min, restartable from a tune-step
 cw_channel.py --channel 1 --freq 1575.42e6 --freq_end 1575.43e6 \
     --duration 1200 --drift once --samp_rate 2.048
+
+# WIDE sweep 1600 → 1545 MHz over 15 min — swept on the hardware NCO
+cw_channel.py --channel 0 --freq 1600e6 --freq_end 1545e6 \
+    --duration 900 --drift once --samp_rate 2.048 --lo_span 60
 ```
 
 The drift begins at on-air (first `amplitude > 0`); the live `restart` flag re-runs
-it from the start. The drift range `|end−start|` must fit the baseband, so keep
-`--samp_rate` above it. (For a slowly-drifting narrow tone this stays small.)
+it from the start.
+
+**Narrow vs. wide sweeps** — a *software* baseband tone can only occupy
+±`samp_rate`/2, so the task picks the regime automatically:
+
+- **Narrow** (span ≤ one baseband window): the LO stays fixed at the drift centre
+  and the whole sweep is carried in the software baseband tone — perfectly
+  continuous, no retunes.
+- **Wide** (span bigger than a window, e.g. the 55 MHz `1600→1545`): the sweep is
+  carried by the **hardware DUC/NCO**. The analog LO is *pinned* (a manual-LO tune)
+  and the digital NCO moves the carrier across a ±`lo_span`/2 window — a purely
+  digital frequency change, so no analog synth relock, no settle glitch, and a flat
+  amplitude across the window (this is what removes the old ~8 dB droop and the
+  "tone jumps forward then snaps back" transient, which was a software-baseband vs.
+  analog-LO race). The analog LO only re-anchors when the tone leaves the window;
+  set `--lo_span` ≥ the span and it never moves at all — a fully glitchless sweep.
+  Those rare re-anchors are blanked (`--hop_blank`, default 5 ms) to hide the
+  retune. A wide sweep is a near-DC signal, so a **low** `--samp_rate` (1–2 MHz) is
+  ideal and keeps ARM load minimal.
+
+  `--lo_span` must stay within the channel's NCO/analog range (start ~40–60 MHz and
+  widen it on the bench until the tone can't reach the sweep edges, then back off).
 
 ---
 
@@ -197,8 +316,15 @@ device. In order:
    python3 x410_engine.py --benchmark 10 --bench_rates 61.44,8.192,8.192,8.192
    ```
 
-   A clean (0-underflow) result confirms the per-channel-replay approach at that
-   scene; underflows tell you the real rate ceiling.
+   A clean (0-underflow) result confirms the per-channel streaming approach at that
+   scene; underflows tell you the real rate ceiling of the `stream` backend. The
+   benchmark uses the same `--cpu`/`--send_ms` path as live tasks, so re-run it with
+   the format you plan to use — e.g. **`--cpu sc16 --send_ms 20`** to see how much
+   headroom the memcpy path (no `fc32→sc16` conversion) buys at ≥10 MS/s.
+
+   If `--cpu sc16` still can't sustain the widest channel, the only host-independent
+   fix is **`--backend replay`** (FPGA-DRAM playback, no underflow ceiling) — which
+   on this X410 needs a UHD ≥ 4.5 image, see the backend note above.
 
 2. **One signal into a cable + attenuator.** Start the engine, run one channel-task,
    and confirm a receiver/analyzer acquires it.

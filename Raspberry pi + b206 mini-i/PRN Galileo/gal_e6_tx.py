@@ -62,7 +62,7 @@ Carrier is fixed at E6; SVID / sample rate / otw are fixed per run.
 
 CLI
 ───
-    gal_e6_tx.py --svid 1 --gain 55 --amplitude 0.9
+    gal_e6_tx.py --svid 1 --power -30 --rf on
     gal_e6_tx.py --self-test        # verify codes vs Technical Note, no hardware
     gal_e6_tx.py --describe-params  # paramkit JSON schema for the GUI
 """
@@ -80,6 +80,52 @@ os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paramkit import Script
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# USER CALIBRATION — MEASURE THESE ONCE, THEN EDIT THE VALUES BELOW
+# ═══════════════════════════════════════════════════════════════════════════════
+# You set the transmit level in dBm. That only works if the script knows how the
+# SDR's gain maps to real output power, which you establish once with a spectrum
+# analyser: leave AMPLITUDE at the value below, run with --power at its maximum
+# (that commands GAIN_AT_MAX_DB), measure the actual output power at the SDR RF
+# port, and put that number in OUTPUT_POWER_DBM. From that anchor the script maps
+# any requested power to a gain (1 dB gain ≈ 1 dB power, across the B200's linear
+# range). CABLE_LOSS_DB / AMPLIFIER_GAIN_DB describe the RF chain AFTER the port,
+# so the number you dial in is the power delivered at the far end.
+
+OUTPUT_POWER_DBM = -20.0    # max output (dBm) at GAIN_AT_MAX_DB and AMPLITUDE — MEASURE THIS
+GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling the script commands
+CABLE_LOSS_DB = 0.0         # cabling insertion loss after the SDR port (positive dB)
+AMPLIFIER_GAIN_DB = 0.0     # external amplifier gain after the SDR port (positive dB)
+
+# Fixed baseband digital amplitude (0..1). NOT a user control: OUTPUT_POWER_DBM is
+# calibrated at THIS amplitude, so changing it invalidates the dBm↔gain mapping —
+# if you change it, re-measure OUTPUT_POWER_DBM at GAIN_AT_MAX_DB.
+AMPLITUDE = 0.8
+
+# Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
+# from GAIN_AT_MAX_DB. The (normally-commented) calibration gain knob uses it.
+HW_MAX_GAIN_DB = 89.75
+
+# Derived delivered-power limits (computed — do not edit).
+MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
+MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
+
+
+def gain_for_power(delivered_dbm: float) -> float:
+    """TX gain (dB) that puts `delivered_dbm` at the far end of the RF chain, clamped
+    to [0, GAIN_AT_MAX_DB] so it can never exceed the calibrated maximum."""
+    port_dbm = float(delivered_dbm) + CABLE_LOSS_DB - AMPLIFIER_GAIN_DB
+    gain = GAIN_AT_MAX_DB + (port_dbm - OUTPUT_POWER_DBM)
+    return max(0.0, min(GAIN_AT_MAX_DB, gain))
+
+
+def power_for_gain(gain_db: float) -> float:
+    """Delivered power (dBm) for an actual hardware gain — to report what the radio
+    really settled on after quantisation."""
+    port_dbm = OUTPUT_POWER_DBM - (GAIN_AT_MAX_DB - float(gain_db))
+    return port_dbm - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -409,10 +455,26 @@ def build_script() -> Script:
         .integer("-SVID", "--svid", min=1, max=50, default=1,
                  help="Galileo SVID / primary-code number (1..50; operational "
                       "1..36). Fixed per run.")
-        .number("-Gain", "--gain", unit="dB", min=0, max=89.75, default=50,
-                live=True, help="USRP TX gain.")
-        .number("-Amplitude", "--amplitude", min=0.0, max=1.0, default=0.9,
-                live=True, help="Baseband digital amplitude (0..1). Live.")
+        .number("-Power", "--power", unit="dBm",
+                min=round(MIN_DELIVERED_DBM, 2), max=round(MAX_DELIVERED_DBM, 2),
+                default=round(MAX_DELIVERED_DBM, 2), required=True, live=True,
+                help="Target output power at the delivered plane (after cable loss + "
+                     "amplifier gain). Max = what the SDR produces at its calibrated "
+                     "max gain; raise it by editing the calibration constants.")
+        .choice("-RF", "--rf", options=["on", "off"], default="on",
+                required=False, live=True,
+                help="RF output on/off. OFF mutes the signal (gain AND baseband "
+                     "amplitude to 0); ON restores them. Change the power (or the "
+                     "calibration gain) while OFF and it takes effect when you turn ON.")
+        # ── CALIBRATION KNOB (normally commented OUT) ───────────────────────────
+        # Uncomment to expose a raw TX-gain slider (dB) so you can measure output
+        # power vs gain on a spectrum analyser and fill in OUTPUT_POWER_DBM /
+        # GAIN_AT_MAX_DB above. While present it OVERRIDES --power (last touch wins).
+        # .number("-Cal-gain", "--gain", unit="dB",
+        #         min=0, max=HW_MAX_GAIN_DB, default=HW_MAX_GAIN_DB,
+        #         required=False, live=True,
+        #         help="CALIBRATION ONLY — set SDR TX gain directly, bypassing the "
+        #              "dBm mapping. Comment out again for normal dBm operation.")
         .number("-Sample-rate", "--samp_rate", unit="MHz", min=10.23, max=61.44,
                 presets=SR_PRESETS, default=DEFAULT_SR_HZ / 1e6,
                 help="Host/DAC sample rate; master clock pinned equal to it (1:1). "
@@ -425,13 +487,33 @@ def build_script() -> Script:
     )
 
 
-def _apply_live_change(tb, ctrl, name, value):
-    if name == "gain":
-        tb.set_gain(value)
-        ctrl.report("gain", tb.actual_gain())
-    elif name == "amplitude":
-        tb.set_amplitude(value)
-        ctrl.report("amplitude", value)
+def _apply_live_change(tb, ctrl, state, name, value):
+    # power/gain edits are staged into state["gain"] and only reach the radio when
+    # RF is on; the --rf toggle mutes/restores gain AND baseband amplitude.
+    if name == "power":
+        state["gain"] = gain_for_power(float(value))
+        if state["rf_on"]:
+            tb.set_gain(state["gain"])
+            ctrl.report("power", round(power_for_gain(tb.actual_gain()), 2))
+        else:
+            ctrl.report("power", round(power_for_gain(state["gain"]), 2))
+    elif name == "gain":
+        state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
+        if state["rf_on"]:
+            tb.set_gain(state["gain"])
+            ctrl.report("gain", round(tb.actual_gain(), 2))
+        else:
+            ctrl.report("gain", round(state["gain"], 2))
+    elif name == "rf":
+        on = str(value).strip().lower() in ("on", "1", "true", "yes")
+        state["rf_on"] = on
+        if on:
+            tb.set_amplitude(AMPLITUDE)
+            tb.set_gain(state["gain"])
+        else:
+            tb.set_gain(0.0)
+            tb.set_amplitude(0.0)
+        ctrl.report("rf", "on" if on else "off")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
@@ -451,6 +533,10 @@ def main() -> int:
         return 2
 
     samp_rate_hz = args.samp_rate * 1e6
+    # A raw calibration gain (the normally-commented --gain knob) overrides the dBm
+    # mapping when present, so you can measure output power at a chosen gain.
+    gain_cal = getattr(args, "gain", None)
+    gain_db = float(gain_cal) if gain_cal is not None else gain_for_power(args.power)
     shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
     tmpdir = tempfile.mkdtemp(prefix="gal_e6_", dir=shm)
     atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
@@ -465,8 +551,17 @@ def main() -> int:
     print(f"[prebuilt] E6 SVID {args.svid} → {nsamp} samples "
           f"({nper}×100 ms period, {spc} samp/chip, {nsamp*8/1e6:.1f} MB) → {iq_path}")
 
-    tb = _build_top_block(iq_path, E6_HZ, samp_rate_hz, args.gain, args.amplitude,
+    tb = _build_top_block(iq_path, E6_HZ, samp_rate_hz, gain_db, AMPLITUDE,
                           args.otw, "")
+
+    # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
+    # flow muted; power/gain edits made while OFF are staged and reach the radio
+    # only when RF is switched ON.
+    state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
+    if not state["rf_on"]:
+        tb.set_gain(0.0)
+        tb.set_amplitude(0.0)
+
     print("── Galileo E6 TX ───────────────────────────────────────────")
     print(f"  signal         : E6-B data + E6-C pilot, BPSK(5) (½(e_B−e_C))")
     print(f"  SVID           : {args.svid}")
@@ -474,8 +569,14 @@ def main() -> int:
     print(f"  sample rate    : requested {args.samp_rate:g} MHz, "
           f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
     print(f"  chip rate      : 5.115 Mcps (~10.23 MHz null-to-null)")
-    print(f"  otw / gain     : {args.otw} / {args.gain:g} dB")
-    print(f"  amplitude      : {args.amplitude:g}")
+    print(f"  power (target) : {args.power:g} dBm delivered "
+          f"(cable −{CABLE_LOSS_DB:g} dB, amp +{AMPLIFIER_GAIN_DB:g} dB)")
+    print(f"  → gain         : {gain_db:.2f} dB (max {GAIN_AT_MAX_DB:g}), "
+          f"amplitude {AMPLITUDE:g}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
+    if gain_cal is not None:
+        print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
+    print(f"  otw            : {args.otw}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
@@ -487,7 +588,7 @@ def main() -> int:
     try:
         while not stop.is_set():
             for change in ctrl.drain():
-                _apply_live_change(tb, ctrl, change.name, change.value)
+                _apply_live_change(tb, ctrl, state, change.name, change.value)
             time.sleep(0.1)
     finally:
         ctrl.close()

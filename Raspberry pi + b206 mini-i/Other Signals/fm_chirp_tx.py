@@ -4,7 +4,7 @@ FM-chirp transmitter for GNU Radio + UHD (Ettus B200-mini family).
 
 A sine / triangle / sawtooth / square frequency sweep, precomputed and replayed
 from a file so a Raspberry Pi can sustain a high sample rate (40–60 MS/s) — the
-same recipe as gps_prn_tx.py, applied to the swept-tone chirp from TriangleChirp.
+same recipe as gps_l1ca_tx.py, applied to the swept-tone chirp from TriangleChirp.
 
 The instantaneous frequency is  f(t) = waveform(t) · (sweep_bw / 2), i.e. it
 sweeps ±sweep_bw/2 around the carrier, and the modulating waveform repeats at
@@ -13,7 +13,7 @@ sweeps ±sweep_bw/2 around the carrier, and the modulating waveform repeats at
 ⚠  RF SAFETY / LEGAL: transmit ONLY into a shielded / conducted setup (cable +
    attenuators) on frequencies you are LICENSED / AUTHORISED to use.
 
-Why this reaches 40–60 MS/s on a Pi (see gps_prn_tx.py for the full write-up)
+Why this reaches 40–60 MS/s on a Pi (see gps_l1ca_tx.py for the full write-up)
 ────────────────────────────────────────────────────────────────────────────
   1. PRECOMPUTE + LOOP — one whole sweep is built once and replayed with
      blocks.file_source(repeat=True); no per-sample NumPy in a work() block
@@ -38,8 +38,8 @@ Live tuning (retune while transmitting, via paramkit.live)
 ──────────────────────────────────────────────────────────
     freq       → UHD tune_request        (instant)
     lo_offset  → UHD tune_request        (instant)
-    gain       → UHD set_gain            (instant)
-    amplitude  → multiply_const_cc.set_k (instant — baseband digital scale)
+    power      → dBm → set_gain          (instant — see the USER CALIBRATION block)
+    rf         → on/off mute/unmute      (instant — gain AND amplitude to 0 / back)
     bw         → rebuild buffer + swap    ┐ shape changes: regenerate one sweep
     sweep_rate → rebuild buffer + swap    │ into a new /dev/shm file and
     waveform   → rebuild buffer + swap    ┘ file_source.open() it (one brief seam
@@ -50,7 +50,7 @@ Sample rate and otw are fixed per run (restart to change them).
 
 CLI
 ───
-    fm_chirp_tx.py --freq 1.57542e9 --bw 20 --rate 0.2 --waveform Sawtooth --gain 50
+    fm_chirp_tx.py --freq 1.57542e9 --bw 20 --rate 0.2 --waveform Sawtooth --power -30
     fm_chirp_tx.py --self-test        # verify seamless phase closure, no hardware
     fm_chirp_tx.py --describe-params  # paramkit JSON schema for the GUI
 """
@@ -68,7 +68,63 @@ os.environ.setdefault("UHD_LOG_FASTPATH_DISABLE", "1")
 os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from paramkit import Script
+from paramkit import Script, PowerMap
+
+# Stable calibration signal id. When a task sets SDR_CAL_SIGNAL_ID to this value the
+# agent injects this unit's resolved calibration (SDR_CALIBRATION_FILE); calkit reads
+# it and --power maps through the unit's MEASURED curve at its real operating plane
+# (e.g. EIRP). Absent it, the baked USER CALIBRATION constants below are used
+# (unchanged behaviour). See the agent's docs/calibration.md.
+CAL_SIGNAL_ID = "fm_chirp"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# USER CALIBRATION — MEASURE THESE ONCE, THEN EDIT THE VALUES BELOW
+# ═══════════════════════════════════════════════════════════════════════════════
+# You set the transmit level in dBm. That only works if the script knows how the
+# SDR's gain maps to real output power, which you establish once with a spectrum
+# analyser: leave AMPLITUDE at the value below, run with --power at its maximum
+# (that commands GAIN_AT_MAX_DB), measure the actual output power at the SDR RF
+# port, and put that number in OUTPUT_POWER_DBM. From that anchor the script maps
+# any requested power to a gain (1 dB gain ≈ 1 dB power, across the B200's linear
+# range). CABLE_LOSS_DB / AMPLIFIER_GAIN_DB describe the RF chain AFTER the port,
+# so the number you dial in is the power delivered at the far end.
+
+OUTPUT_POWER_DBM = -20.0    # max output (dBm) at GAIN_AT_MAX_DB and AMPLITUDE — MEASURE THIS
+GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling the script commands
+CABLE_LOSS_DB = 0.0         # cabling insertion loss after the SDR port (positive dB)
+AMPLIFIER_GAIN_DB = 0.0     # external amplifier gain after the SDR port (positive dB)
+
+# Fixed baseband digital amplitude (0..1). NOT a user control: OUTPUT_POWER_DBM is
+# calibrated at THIS amplitude, so changing it invalidates the dBm↔gain mapping —
+# if you change it, re-measure OUTPUT_POWER_DBM at GAIN_AT_MAX_DB.
+AMPLITUDE = 0.8
+
+# Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
+# from GAIN_AT_MAX_DB. The (normally-commented) calibration gain knob uses it.
+HW_MAX_GAIN_DB = 89.75
+
+# Derived delivered-power limits (computed — do not edit).
+MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
+MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
+
+
+# ── Power map: the unit's injected calibration curve if present, else the baked
+#    constants above (identical to the old single-anchor slope-1 behaviour) ────────
+
+_PMAP = None
+
+
+def power_map() -> PowerMap:
+    """The active power map: the unit's injected calibration curve if present
+    (SDR_CALIBRATION_FILE), else the baked constants above. Cached, so build_script and
+    main share one — and so --power's schema bounds match the real operating range
+    (calibrated → e.g. EIRP; else the baked SDR-port range)."""
+    global _PMAP
+    if _PMAP is None:
+        _PMAP = PowerMap.load(PowerMap.from_linear(
+            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+    return _PMAP
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -233,7 +289,7 @@ def _build_top_block(initial_file: str, center_freq_hz: float, lo_offset_hz: flo
 # ── Parameter schema ────────────────────────────────────────────────────────────
 
 def build_script() -> Script:
-    return (
+    s = (
         Script("FM-chirp transmitter (sine/triangle/sawtooth/square sweep), "
                "file-replay at high sample rate. Transmit only into an "
                "authorised, shielded setup.")
@@ -249,11 +305,13 @@ def build_script() -> Script:
         .choice("-Waveform", "--waveform", options=WAVEFORMS, default="Sawtooth",
                 required=True, live=True,
                 help="Sweep shape. Live (regenerates).")
-        .number("-Gain", "--gain", unit="dB", min=0, max=89.75, default=50,
-                required=True, live=True, help="USRP TX gain. Live.")
-        .number("-Amplitude", "--amplitude", min=0.0, max=1.0, default=0.9,
-                required=True, live=True,
-                help="Baseband digital amplitude (0..1). Live.")
+        .number("-Power", "--power", unit="dBm",
+                min=round(power_map().min_power_dbm, 2),
+                max=round(power_map().max_power_dbm, 2),
+                default=round(power_map().max_power_dbm, 2), required=True, live=True,
+                help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
+                     "unit's calibration when present (e.g. EIRP), else the baked "
+                     "SDR-port scale. Ignored if --gain is given (relative wins). Live.")
         .number("-LO-offset", "--lo_offset", unit="MHz", min=-30.0, max=30.0,
                 default=0.0, live=True,
                 help="LO offset to push LO leakage out of band. Live.")
@@ -264,7 +322,21 @@ def build_script() -> Script:
         .choice("-OTW-format", "--otw", options=["sc8", "sc16"], default="sc8",
                 help="Over-the-wire format. sc8 halves USB load (needed for "
                      "40–60 MS/s on a Pi); sc16 for more dynamic range.")
+        .choice("-RF", "--rf", options=["on", "off"], default="on",
+                required=False, live=True,
+                help="RF output on/off. OFF mutes the signal (gain AND baseband "
+                     "amplitude to 0); ON restores them. Change the power (or the "
+                     "calibration gain) while OFF and it takes effect when you turn ON.")
+        # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
+        # No default, so its PRESENCE selects relative mode (it overrides --power).
+        # This is also the calibration knob — set it while measuring output vs gain on
+        # a spectrum analyser to fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB above.
+        .number("-Gain", "--gain", unit="dB",
+                min=0, max=HW_MAX_GAIN_DB, required=False, live=True,
+                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
+                     "bypassing the dBm calibration. When given, overrides --power. Live.")
     )
+    return s
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
@@ -280,6 +352,14 @@ def main() -> int:
     script = build_script()
     args = script.parse()
     samp_rate_hz = args.sample_rate * 1e6
+    # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
+    # else the baked constants above (identical to the old single-anchor behaviour).
+    pmap = power_map()
+    amplitude = pmap.amplitude
+    # A raw --gain (relative / calibration knob) overrides the dBm mapping when present,
+    # so you can command a gain directly or measure output power at it.
+    gain_cal = getattr(args, "gain", None)
+    gain_db = float(gain_cal) if gain_cal is not None else pmap.gain_for_power(args.power)
 
     shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
     tmpdir = tempfile.mkdtemp(prefix="fm_chirp_", dir=shm)
@@ -303,8 +383,16 @@ def main() -> int:
     tb = _build_top_block(
         initial_file=cur_file, center_freq_hz=args.freq,
         lo_offset_hz=args.lo_offset * 1e6, samp_rate_hz=samp_rate_hz,
-        gain_db=args.gain, amplitude=args.amplitude, otw_format=args.otw,
+        gain_db=gain_db, amplitude=amplitude, otw_format=args.otw,
         extra_args="")
+
+    # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
+    # flow muted; power/gain edits made while OFF are staged and reach the radio
+    # only when RF is switched ON.
+    state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
+    if not state["rf_on"]:
+        tb.set_gain(0.0)
+        tb.set_amplitude(0.0)
 
     box = {"file": cur_file}   # mutable holder so the closure can swap/clean up
 
@@ -330,8 +418,14 @@ def main() -> int:
     print(f"  sweep bw       : {args.bw:g} MHz (±{args.bw/2:g} MHz)")
     print(f"  sweep rate     : requested {args.rate*1e3:g} kHz, "
           f"got {actual_rate/1e3:.3f} kHz ({n_per} samples/period × {reps} reps)")
-    print(f"  otw / gain     : {args.otw} / {args.gain:g} dB")
-    print(f"  amplitude      : {args.amplitude:g}")
+    print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
+          f"amplitude {amplitude:g}")
+    print(f"  calibration    : {pmap.source}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
+    if gain_cal is not None:
+        print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
+    print(f"  otw            : {args.otw}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
@@ -344,12 +438,32 @@ def main() -> int:
         elif name == "lo_offset":
             tb.set_lo_offset(value * 1e6)
             ctrl.report("lo_offset", value)
+        elif name == "power":
+            # power/gain edits are staged into state["gain"] and only reach the radio
+            # when RF is on; the --rf toggle mutes/restores gain AND amplitude.
+            state["gain"] = pmap.gain_for_power(float(value))
+            if state["rf_on"]:
+                tb.set_gain(state["gain"])
+                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
+            else:
+                ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
         elif name == "gain":
-            tb.set_gain(value)
-            ctrl.report("gain", tb.actual_gain())
-        elif name == "amplitude":
-            tb.set_amplitude(value)
-            ctrl.report("amplitude", value)
+            state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
+            if state["rf_on"]:
+                tb.set_gain(state["gain"])
+                ctrl.report("gain", round(tb.actual_gain(), 2))
+            else:
+                ctrl.report("gain", round(state["gain"], 2))
+        elif name == "rf":
+            on = str(value).strip().lower() in ("on", "1", "true", "yes")
+            state["rf_on"] = on
+            if on:
+                tb.set_amplitude(amplitude)
+                tb.set_gain(state["gain"])
+            else:
+                tb.set_gain(0.0)
+                tb.set_amplitude(0.0)
+            ctrl.report("rf", "on" if on else "off")
         elif name in ("bw", "rate", "waveform"):
             if name == "bw":
                 shape["bw_hz"] = value * 1e6

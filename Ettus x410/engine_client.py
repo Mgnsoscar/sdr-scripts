@@ -133,7 +133,7 @@ class EngineClient:
 
     def set(self, channel: int, owner: str, *, amplitude: Optional[float] = None,
             freq_hz: Optional[float] = None, gain_db: Optional[float] = None,
-            tone_hz: Optional[float] = None) -> None:
+            tone_hz: Optional[float] = None, rf_freq_hz: Optional[float] = None) -> None:
         msg: Dict[str, Any] = {"cmd": "set", "channel": channel, "owner": owner}
         if amplitude is not None:
             msg["amplitude"] = amplitude
@@ -143,6 +143,8 @@ class EngineClient:
             msg["gain_db"] = gain_db
         if tone_hz is not None:
             msg["tone_hz"] = tone_hz
+        if rf_freq_hz is not None:
+            msg["rf_freq_hz"] = rf_freq_hz
         self.request(msg)
 
 

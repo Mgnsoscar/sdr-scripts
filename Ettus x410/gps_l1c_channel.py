@@ -417,11 +417,16 @@ def main() -> int:
             time.sleep(0.1)
         ctrl.close()
     finally:
+        # Best-effort: tolerate a dropped connection so cleanup never raises a
+        # secondary BrokenPipeError over the original traceback.
         try:
             eng.release(ch, owner)
-        except EngineError:
+        except Exception:
             pass
-        eng.close()
+        try:
+            eng.close()
+        except Exception:
+            pass
     return 0
 
 
