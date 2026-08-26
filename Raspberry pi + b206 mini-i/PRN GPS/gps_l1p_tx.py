@@ -187,6 +187,13 @@ def build_script() -> Script:
                 help="Host/DAC sample rate; master clock pinned equal to it (1:1). Both "
                      "options are integer samples/chip so the P-code main lobe (±10.23 MHz) "
                      "is represented exactly. Fixed per run.")
+        .number("-Analog-bandwidth", "--bandwidth", unit="MHz", min=0.0, max=56.0,
+                default=0.0, required=False,
+                help="AD9361 analog TX filter bandwidth (MHz) — the real baseband LPF, set "
+                     "independently of the sample rate. 0 = let UHD pick it from the sample "
+                     "rate (the old behaviour). Set it to band-limit the transmitted signal "
+                     "WITHOUT changing the master clock (e.g. 20.46 to pass just the P-code "
+                     "main lobe). Coerced to the radio's range; the banner reports the actual.")
         .choice("-OTW-format", "--otw", options=["sc8", "sc16"], default="sc8",
                 help="Over-the-wire sample format. sc8 halves USB load (helps at 20+ MS/s "
                      "on a Pi); sc16 for more dynamic range.")
@@ -407,6 +414,9 @@ def main() -> int:
             self.usrp = uhd.usrp_sink(
                 dev, uhd.stream_args(cpu_format="fc32", otw_format=args.otw, channels=[0]))
             self.usrp.set_samp_rate(samp_rate_hz)
+            _bw = float(getattr(args, "bandwidth", 0.0) or 0.0)
+            if _bw > 0:                                   # AD9361 analog LPF, independent of Fs
+                self.usrp.set_bandwidth(_bw * 1e6, 0)
             self.usrp.set_center_freq(uhd.tune_request(CARRIER_HZ), 0)
             self.usrp.set_gain(state["gain"], 0)
             self.src = blocks.file_source(gr.sizeof_gr_complex, fifo_path, repeat=False)
@@ -421,6 +431,11 @@ def main() -> int:
 
     tb = _PTx()                                           # file_source opens the read end → producer unblocks
     tb.start()
+    try:
+        _auto = " — auto from Fs" if not float(getattr(args, "bandwidth", 0.0) or 0.0) else ""
+        print(f"  analog TX BW   : {tb.usrp.get_bandwidth(0)/1e6:.3f} MHz (AD9361 filter{_auto})")
+    except Exception:      # noqa: BLE001
+        pass
 
     last = (state["gain"], state["rf_on"])
     try:
