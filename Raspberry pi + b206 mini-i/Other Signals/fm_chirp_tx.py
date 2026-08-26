@@ -316,6 +316,13 @@ def build_script() -> Script:
         # No default, so its PRESENCE selects relative mode (it overrides --power).
         # This is also the calibration knob — set it while measuring output vs gain on
         # a spectrum analyser to fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB above.
+        .number("-Analog-bandwidth", "--bandwidth", unit="MHz", min=0.0, max=56.0,
+                default=0.0, required=False,
+                help="AD9361 analog TX filter bandwidth (MHz) — the real baseband LPF, set "
+                     "independently of the sample rate. 0 = auto (UHD picks it from the "
+                     "sample rate, the old behaviour); a positive value band-limits the "
+                     "signal WITHOUT changing the master clock. Coerced to the radio's "
+                     "range; the banner reports the actual.")
         .number("-Gain", "--gain", unit="dB",
                 min=0, max=HW_MAX_GAIN_DB, required=False, live=True,
                 help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
@@ -478,6 +485,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
+    _bw = float(getattr(args, "bandwidth", 0.0) or 0.0)
+    if _bw > 0:                                   # AD9361 analog LPF, independent of master clock
+        tb.usrp.set_bandwidth(_bw * 1e6, 0)
+    try:
+        print(f"  analog TX BW   : {tb.usrp.get_bandwidth(0)/1e6:.3f} MHz (AD9361 filter"
+              f"{'' if _bw > 0 else ' — auto from Fs'})")
+    except Exception:      # noqa: BLE001
+        pass
     tb.start()
     try:
         while not stop.is_set():
