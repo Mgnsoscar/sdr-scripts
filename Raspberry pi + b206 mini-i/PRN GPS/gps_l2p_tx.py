@@ -359,14 +359,24 @@ def main() -> int:
 
     # ── real hardware: stream via UHD's tx_streamer (no GNU Radio) ──────────────────
     import uhd
-    args_str = (f"master_clock_rate={samp_rate_hz:.0f},"
-                "num_send_frames=512,send_frame_size=16000")
-    usrp = uhd.usrp.MultiUSRP(args_str)
+    # Device ADDRESS args select the radio only (empty = the one attached; set SDR_UHD_ARGS
+    # e.g. "serial=..." or "type=b200" if you have several). Transport/clock args must NOT
+    # go here — putting master_clock_rate / num_send_frames in the address makes UHD's device
+    # discovery look for a device advertising those keys and find nothing.
+    usrp = uhd.usrp.MultiUSRP(os.environ.get("SDR_UHD_ARGS", ""))
+    # Pin the master clock == sample rate (1:1, no FPGA resampling) via the API.
+    try:
+        usrp.set_master_clock_rate(samp_rate_hz)
+    except Exception as exc:                     # noqa: BLE001 — fall back to UHD's auto rate
+        print(f"  ⚠ could not pin master clock to {samp_rate_hz/1e6:g} MHz ({exc}); "
+              f"UHD will auto-select", file=sys.stderr)
     usrp.set_tx_rate(samp_rate_hz)
     usrp.set_tx_freq(uhd.types.TuneRequest(CARRIER_HZ), 0)
     usrp.set_tx_gain(state["gain"], 0)
     st = uhd.usrp.StreamArgs("fc32", args.otw)
     st.channels = [0]
+    # Transport frame tuning belongs on the STREAM args (helps sustain 20+ MS/s on USB).
+    st.args = "num_send_frames=512,send_frame_size=16000"
     tx = usrp.get_tx_stream(st)
     md = uhd.types.TXMetadata()
     md.start_of_burst = True
