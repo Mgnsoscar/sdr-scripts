@@ -77,6 +77,13 @@ from paramkit import Script, PowerMap
 # (unchanged behaviour). See the agent's docs/calibration.md.
 CAL_SIGNAL_ID = "fm_chirp"
 
+# Which parameter carries the transmit frequency. A frequency-dependent calibration chain
+# (a cable/antenna whose loss varies with frequency) has a --power scale that MOVES with
+# frequency, so the map is folded at THIS param's value — and it is live, so retuning the
+# chirp's centre re-scales --power on the fly. The client folds the --power range shown in
+# the Run / sequence form at the same frequency. See calkit / calibration-v2.
+CAL_FREQ_PARAM = "freq"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
@@ -354,7 +361,9 @@ def main() -> int:
     if gain_cal is not None:
         gain_db = float(gain_cal)
     elif power_map().has_absolute:                  # calibrated: the authored absolute --power
-        gain_db = power_map().gain_for_power(args.power)
+        # Fold the calibration at the transmit frequency so a frequency-dependent chain maps
+        # --power on the right scale (the chirp can retune live — see apply_change).
+        gain_db = power_map().gain_for_power(args.power, freq=args.freq)
     else:                                           # uncalibrated: a persisted fallback gain, or refuse
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -392,7 +401,11 @@ def main() -> int:
     # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
     # flow muted; power/gain edits made while OFF are staged and reach the radio
     # only when RF is switched ON.
-    state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
+    # Track the live transmit frequency and (in absolute mode) the held target power, so a
+    # live retune can re-map --power at the new frequency on a frequency-dependent chain.
+    _target_power = args.power if (pmap.has_absolute and gain_cal is None) else None
+    state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db,
+             "freq": float(args.freq), "power": _target_power}
     if not state["rf_on"]:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
@@ -440,20 +453,37 @@ def main() -> int:
     def apply_change(name, value):
         if name == "freq":
             tb.set_center_frequency(value)
+            state["freq"] = float(value)
             ctrl.report("freq", tb.actual_freq())
+            # A frequency-dependent calibration re-scales --power with frequency, so re-map
+            # the held target power at the new frequency — delivered power stays as requested.
+            if state.get("power") is not None:
+                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"])
+                if state["rf_on"]:
+                    tb.set_gain(state["gain"])
+                    ctrl.report("power",
+                                round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"]), 2))
+                else:
+                    ctrl.report("power",
+                                round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
         elif name == "lo_offset":
             tb.set_lo_offset(value * 1e6)
             ctrl.report("lo_offset", value)
         elif name == "power":
             # power/gain edits are staged into state["gain"] and only reach the radio
-            # when RF is on; the --rf toggle mutes/restores gain AND amplitude.
-            state["gain"] = pmap.gain_for_power(float(value))
+            # when RF is on; the --rf toggle mutes/restores gain AND amplitude. Folded at
+            # the current transmit frequency (frequency-dependent chains).
+            state["power"] = float(value)
+            state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"])
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
+                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"]), 2))
             else:
-                ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
+                ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
         elif name == "gain":
+            # A raw gain overrides the dBm mapping — drop any held target power so a later
+            # frequency change doesn't re-map back to it.
+            state["power"] = None
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
             if state["rf_on"]:
                 tb.set_gain(state["gain"])

@@ -61,6 +61,12 @@ from paramkit import Script, PowerMap
 # (unchanged behaviour). See the agent's docs/calibration.md.
 CAL_SIGNAL_ID = "cw_tone"
 
+# Which parameter carries the transmit frequency. A frequency-dependent calibration chain
+# (a cable/antenna whose loss varies with frequency) has a --power scale that MOVES with
+# frequency, so the map is folded at THIS param's value — and the client folds the --power
+# range shown in the Run / sequence form at the same frequency. See calkit / calibration-v2.
+CAL_FREQ_PARAM = "freq"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
@@ -248,7 +254,9 @@ def main() -> int:
     if gain_cal is not None:
         gain_db = float(gain_cal)
     elif power_map().has_absolute:                  # calibrated: the authored absolute --power
-        gain_db = power_map().gain_for_power(args.power)
+        # Fold the calibration at the transmit frequency (the drift START) so a
+        # frequency-dependent chain maps --power on the right scale.
+        gain_db = power_map().gain_for_power(args.power, freq=args.freq)
     else:                                           # uncalibrated: a persisted fallback gain, or refuse
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -311,13 +319,16 @@ def main() -> int:
         while not stop.is_set():
             for change in ctrl.drain():
                 if change.name == "power":
-                    # dBm → gain via the calibration; staged, applied only when RF is on.
-                    state["gain"] = pmap.gain_for_power(float(change.value))
+                    # dBm → gain via the calibration (folded at the transmit frequency);
+                    # staged, applied only when RF is on.
+                    state["gain"] = pmap.gain_for_power(float(change.value), freq=args.freq)
                     if state["rf_on"]:
                         tb.set_gain(state["gain"])
-                        ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
+                        ctrl.report("power",
+                                    round(pmap.power_for_gain(tb.actual_gain(), freq=args.freq), 2))
                     else:
-                        ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
+                        ctrl.report("power",
+                                    round(pmap.power_for_gain(state["gain"], freq=args.freq), 2))
                 elif change.name == "gain":
                     # Calibration knob: raw TX gain (dB), bypassing the dBm mapping.
                     state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(change.value)))
