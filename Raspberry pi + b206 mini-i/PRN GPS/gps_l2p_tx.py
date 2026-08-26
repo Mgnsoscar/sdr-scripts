@@ -12,9 +12,11 @@ one week (6.187104e12 chips at 10.23 Mcps), so it can neither be prebuilt nor lo
     patterns (with the ICD's 343/37/380-chip end-of-epoch holds); ~30 MB, built in ~1 s.
   • any window of the week is then `P_i[c] = X1[c mod L1] XOR X2[(c-i) mod L2]` — two
     modular gathers + an XOR, O(n), far faster than real time (no LFSR in the hot path).
-  • a producer thread generates GPS-time-aligned IQ chunks into a bounded queue; a consumer
-    thread streams them straight to the SDR via UHD's own tx_streamer.send() (self-pacing on
-    the radio clock). No GNU Radio, no custom block; the queue rides out scheduler jitter.
+  • a producer thread generates GPS-time-aligned IQ chunks and streams them into a named
+    pipe (FIFO) that a GNU Radio `blocks.file_source` reads into `uhd.usrp_sink` — the same
+    proven device path the C/A script uses, no custom block. (UHD's standalone Python
+    bindings can't reliably enumerate a USB B2xx in this image; gnuradio's usrp_sink can.)
+    The FIFO + the radio's own buffering ride out scheduler jitter.
 
 The generator is validated bit-exact against IS-GPS-200N (§3.3.2.2, Tables 3-Ia / 3-VII):
 `--self-test` checks the four register code vectors, maximal-length taps, the tiling/hold
@@ -251,8 +253,6 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import queue
-
     dry_run = "--dry-run" in sys.argv[1:]
     if dry_run:                                   # not a paramkit param — strip before parse
         sys.argv = [a for a in sys.argv if a != "--dry-run"]
@@ -310,104 +310,141 @@ def main() -> int:
           f"{time.perf_counter()-t0:.2f}s")
     print("────────────────────────────────────────────────────────────")
 
-    # shared state the producer reads each chunk (live-tunable).
-    state = {"rf_on": getattr(args, "rf", "on") == "on", "amp": amplitude,
+    # shared state (live-tunable). amplitude is applied by the flowgraph, so the producer
+    # always generates FULL-SCALE ±1 chips — --rf/level changes never re-generate buffers.
+    state = {"rf_on": getattr(args, "rf", "on") == "on",
              "gain": gain_db, "stop": False}
     CHUNK_CHIPS = 102_300               # 0.01 s of chips per buffer
-    QUEUE_DEPTH = 20                    # ~0.2 s prebuffer to ride out jitter
-    q: "queue.Queue" = queue.Queue(maxsize=QUEUE_DEPTH)
-
-    def producer():
-        c = start_chip
-        while not state["stop"]:
-            amp = state["amp"] if state["rf_on"] else 0.0
-            iq = _make_iq(pc, prn, c, CHUNK_CHIPS, spc, amp)
-            c += CHUNK_CHIPS
-            try:
-                q.put(iq, timeout=1.0)
-            except queue.Full:
-                if state["stop"]:
-                    break
 
     stop_evt = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop_evt.set())
     signal.signal(signal.SIGINT, lambda *_: stop_evt.set())
 
-    prod = threading.Thread(target=producer, daemon=True)
-    prod.start()
-
     ctrl = script.live_control(args)
 
     def apply_live():
+        """Drain live edits into `state` (gain/rf). Returns True if anything changed."""
+        changed = False
         for ch in ctrl.drain():
             if ch.name == "power" and pmap.has_absolute:
-                state["gain"] = pmap.gain_for_power(float(ch.value))
+                state["gain"] = pmap.gain_for_power(float(ch.value)); changed = True
                 ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
             elif ch.name == "gain":
-                state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(ch.value)))
+                state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(ch.value))); changed = True
                 ctrl.report("gain", round(state["gain"], 2))
             elif ch.name == "rf":
                 state["rf_on"] = str(ch.value).strip().lower() in ("on", "1", "true", "yes")
+                changed = True
                 ctrl.report("rf", "on" if state["rf_on"] else "off")
+        return changed
 
     duration = float(getattr(args, "duration", 0.0) or 0.0)
     deadline = (time.monotonic() + duration) if duration > 0 else None
 
     if dry_run:
+        import queue
+        q: "queue.Queue" = queue.Queue(maxsize=20)
+
+        def producer_q():
+            c = start_chip
+            while not state["stop"]:
+                try:
+                    q.put(_make_iq(pc, prn, c, CHUNK_CHIPS, spc, 1.0), timeout=1.0)
+                    c += CHUNK_CHIPS
+                except queue.Full:
+                    if state["stop"]:
+                        break
+        prod = threading.Thread(target=producer_q, daemon=True); prod.start()
         return _dry_run_consumer(q, state, stop_evt, apply_live, deadline,
                                  samp_rate_hz, spc, prod)
 
-    # ── real hardware: stream via UHD's tx_streamer (no GNU Radio) ──────────────────
-    import uhd
-    # Device ADDRESS args select the radio only (empty = the one attached; set SDR_UHD_ARGS
-    # e.g. "serial=..." or "type=b200" if you have several). Transport/clock args must NOT
-    # go here — putting master_clock_rate / num_send_frames in the address makes UHD's device
-    # discovery look for a device advertising those keys and find nothing.
-    usrp = uhd.usrp.MultiUSRP(os.environ.get("SDR_UHD_ARGS", ""))
-    # Pin the master clock == sample rate (1:1, no FPGA resampling) via the API.
-    try:
-        usrp.set_master_clock_rate(samp_rate_hz)
-    except Exception as exc:                     # noqa: BLE001 — fall back to UHD's auto rate
-        print(f"  ⚠ could not pin master clock to {samp_rate_hz/1e6:g} MHz ({exc}); "
-              f"UHD will auto-select", file=sys.stderr)
-    usrp.set_tx_rate(samp_rate_hz)
-    usrp.set_tx_freq(uhd.types.TuneRequest(CARRIER_HZ), 0)
-    usrp.set_tx_gain(state["gain"], 0)
-    st = uhd.usrp.StreamArgs("fc32", args.otw)
-    st.channels = [0]
-    # Transport frame tuning belongs on the STREAM args (helps sustain 20+ MS/s on USB).
-    st.args = "num_send_frames=512,send_frame_size=16000"
-    tx = usrp.get_tx_stream(st)
-    md = uhd.types.TXMetadata()
-    md.start_of_burst = True
-    md.end_of_burst = False
-    md.has_time_spec = False
+    # ── real hardware: GNU Radio usrp_sink (the fleet's proven device path) fed by a FIFO ──
+    # UHD's standalone Python bindings can't always enumerate a USB B2xx in this image, but
+    # gnuradio's usrp_sink opens it exactly as the C/A script does. The Python producer streams
+    # generated IQ into a named pipe that blocks.file_source reads — no custom block, no loop.
+    import fcntl
+    import tempfile
+    from gnuradio import gr, blocks, uhd
 
-    def send_all(buf):
-        """Push the whole buffer, honouring partial sends (start-of-burst only once)."""
-        sent = 0
-        while sent < buf.size and not stop_evt.is_set():
-            sent += tx.send(buf[sent:], md, 1.0)
-            md.start_of_burst = False
+    tmpdir = tempfile.mkdtemp(prefix="gps_l2p_", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+    fifo_path = os.path.join(tmpdir, "iq.fifo")
+    os.mkfifo(fifo_path)
 
-    last_gain = state["gain"]
+    def producer_fifo():
+        c = start_chip
+        try:
+            fd = os.open(fifo_path, os.O_WRONLY)          # blocks until file_source opens read end
+        except OSError:
+            return
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 1 << 20)  # ~1 MB pipe buffer (best effort)
+        except (OSError, AttributeError):
+            pass
+        try:
+            while not stop_evt.is_set() and not state["stop"]:
+                iq = _make_iq(pc, prn, c, CHUNK_CHIPS, spc, 1.0)   # full-scale ±1
+                c += CHUNK_CHIPS
+                os.write(fd, iq.tobytes())
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    prod = threading.Thread(target=producer_fifo, daemon=True)
+    prod.start()                                          # opens the write end (blocks until read end)
+
+    class _PTx(gr.top_block):
+        def __init__(self):
+            super().__init__(f"{SIGNAL_NAME} TX")
+            dev = (f"master_clock_rate={samp_rate_hz:.0f},"
+                   "num_send_frames=512,send_frame_size=16000")
+            extra = os.environ.get("SDR_UHD_ARGS", "")
+            if extra:
+                dev += "," + extra
+            self.usrp = uhd.usrp_sink(
+                dev, uhd.stream_args(cpu_format="fc32", otw_format=args.otw, channels=[0]))
+            self.usrp.set_samp_rate(samp_rate_hz)
+            self.usrp.set_center_freq(uhd.tune_request(CARRIER_HZ), 0)
+            self.usrp.set_gain(state["gain"], 0)
+            self.src = blocks.file_source(gr.sizeof_gr_complex, fifo_path, repeat=False)
+            self.amp = blocks.multiply_const_cc(amplitude if state["rf_on"] else 0.0)
+            self.connect(self.src, self.amp, self.usrp)
+
+        def set_gain(self, g):
+            self.usrp.set_gain(g, 0)
+
+        def set_amplitude(self, a):
+            self.amp.set_k(a)
+
+    tb = _PTx()                                           # file_source opens the read end → producer unblocks
+    tb.start()
+
+    last = (state["gain"], state["rf_on"])
     try:
         while not stop_evt.is_set():
-            apply_live()
-            if state["gain"] != last_gain:
-                usrp.set_tx_gain(state["gain"], 0)
-                last_gain = state["gain"]
-            send_all(q.get())
+            if apply_live() and (state["gain"], state["rf_on"]) != last:
+                tb.set_gain(state["gain"])
+                tb.set_amplitude(amplitude if state["rf_on"] else 0.0)
+                last = (state["gain"], state["rf_on"])
             if deadline is not None and time.monotonic() >= deadline:
                 break
+            time.sleep(0.05)
     finally:
         state["stop"] = True
-        md.end_of_burst = True
+        stop_evt.set()
         try:
-            tx.send(np.zeros(0, dtype=np.complex64), md)
+            tb.stop(); tb.wait()
         except Exception:      # noqa: BLE001
             pass
+        prod.join(timeout=1.0)
         ctrl.close()
+        try:
+            os.remove(fifo_path); os.rmdir(tmpdir)
+        except OSError:
+            pass
     print(f"{SIGNAL_NAME} stopped.")
     return 0
 
