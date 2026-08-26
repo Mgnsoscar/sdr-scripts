@@ -134,11 +134,10 @@ SIGNAL_NAME = "GPS L1 C/A"
 CODE_LEN = 1023                # chips in a GPS C/A Gold code period
 
 SAMPLE_RATES = {
-    "4.092 MHz (Minimum -> Just main lobe + first skirt)": 4.092,
-    "20.46 MHz (Default -> Most faithful representation)": 20.46,
-    "61.38 MHz (Maximum -> Captures the widest skirts)": 61.38,
+    "Legacy GPS (20.48 MHz)": 20.48,
+    "GPS III (30.69 MHz)": 30.69
 }
-DEFAULT_SAMPLE_RATE = 20.46
+DEFAULT_SAMPLE_RATE = 30.69
 
 # GPS ICD-200 Table 3-Ia: G2 code-phase tap pairs (1-indexed) selecting each
 # satellite's C/A code. Verified against the ICD "first 10 chips" column (--self-test).
@@ -312,18 +311,25 @@ def build_script() -> Script:
                  "unit's calibration when present (e.g. EIRP), else the baked "
                  "SDR-port scale. Ignored if --gain is given (relative wins). Live."
         )
-        .number(
+        .choice(
             "-Sample-rate", "--samp_rate",
-            unit="MHz", min=1.23, max=61.44,
-            default=DEFAULT_SAMPLE_RATE,
-            presets=SAMPLE_RATES,
+            options=SAMPLE_RATES,
+            default="GPS III (30.69 MHz)",
             help="Host/DAC sample rate; master clock is pinned equal to it (1:1). "
                  "Fixed per run."
         )
+        #.number(
+        #    "-Sample-rate", "--samp_rate",
+        #    unit="MHz", min=1.23, max=61.44,
+        #    default=DEFAULT_SAMPLE_RATE,
+        #    presets=SAMPLE_RATES,
+        #    help="Host/DAC sample rate; master clock is pinned equal to it (1:1). "
+        #         "Fixed per run."
+        #)
         .choice(
             "-OTW-format", "--otw",
             options=["sc8", "sc16"],
-            default="sc8",
+            default="sc16",
             help="Over-the-wire sample format. sc8 halves USB load (needed for "
                  "high MS/s on a Pi); sc16 for more dynamic range."
         )
