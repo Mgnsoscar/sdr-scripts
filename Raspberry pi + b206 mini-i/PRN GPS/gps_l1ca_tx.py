@@ -51,7 +51,7 @@ for, so samples-per-chip and the loop length stay exact.
 
 CLI
 ───
-    gps_l1ca_tx.py --prn 5 --power -30 --samp_rate 20.46   # absolute dBm (calibrated)
+    gps_l1ca_tx.py --prn 5 --power -30 --samp_rate 20.48   # absolute dBm (calibrated)
     gps_l1ca_tx.py --prn 5 --gain 60                       # relative: raw SDR gain
     gps_l1ca_tx.py --self-test        # verify the Gold-code generator, no hardware
     gps_l1ca_tx.py --describe-params  # paramkit JSON schema for the GUI
@@ -133,11 +133,14 @@ SIGNAL_NAME = "GPS L1 C/A"
 
 CODE_LEN = 1023                # chips in a GPS C/A Gold code period
 
-SAMPLE_RATES = {
-    "Legacy GPS (20.48 MHz)": 20.48,
-    "GPS III (30.69 MHz)": 30.69
+# The two sample-rate presets the GUI offers, as {value: label}: the choice hands the
+# script the KEY (the rate in MHz, as a string) and shows the label. Keep it a literal
+# dict so the agent's static param extractor can read it without running the script.
+SAMPLE_RATE_CHOICES = {
+    "20.48": "Legacy GPS (20.48 MHz)",
+    "30.69": "GPS III (30.69 MHz)",
 }
-DEFAULT_SAMPLE_RATE = 30.69
+DEFAULT_SAMPLE_RATE = "30.69"
 
 # GPS ICD-200 Table 3-Ia: G2 code-phase tap pairs (1-indexed) selecting each
 # satellite's C/A code. Verified against the ICD "first 10 chips" column (--self-test).
@@ -313,19 +316,15 @@ def build_script() -> Script:
         )
         .choice(
             "-Sample-rate", "--samp_rate",
-            options=SAMPLE_RATES,
-            default="GPS III (30.69 MHz)",
+            # .choice() options are {value: label}: the KEY is what the script receives
+            # (the MHz as a string), the label is what the GUI shows. Keep this an inline
+            # literal so the agent's STATIC param extractor can read the menu without
+            # running the script (a comprehension or str() call wouldn't be evaluated).
+            options=SAMPLE_RATE_CHOICES,
+            default=DEFAULT_SAMPLE_RATE,
             help="Host/DAC sample rate; master clock is pinned equal to it (1:1). "
                  "Fixed per run."
         )
-        #.number(
-        #    "-Sample-rate", "--samp_rate",
-        #    unit="MHz", min=1.23, max=61.44,
-        #    default=DEFAULT_SAMPLE_RATE,
-        #    presets=SAMPLE_RATES,
-        #    help="Host/DAC sample rate; master clock is pinned equal to it (1:1). "
-        #         "Fixed per run."
-        #)
         .choice(
             "-OTW-format", "--otw",
             options=["sc8", "sc16"],
@@ -402,7 +401,7 @@ def main() -> int:
     script = build_script()
     args = script.parse()
 
-    samp_rate_hz = args.samp_rate * 1e6
+    samp_rate_hz = float(args.samp_rate) * 1e6      # --samp_rate is a choice value ("30.69")
 
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
     # else it runs uncalibrated — a relative gain only (no baked behaviour).
@@ -453,7 +452,7 @@ def main() -> int:
     print(f"── {SIGNAL_NAME} TX ─────────────────────────────────────────")
     print(f"  PRN            : {args.prn}")
     print(f"  carrier        : {CARRIER_HZ/1e6:.3f} MHz")
-    print(f"  sample rate    : requested {args.samp_rate:g} MHz, "
+    print(f"  sample rate    : requested {float(args.samp_rate):g} MHz, "
           f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
     print(f"  code rate      : {CODE_RATE_MCPS:g} Mcps "
           f"(~{2*CODE_RATE_MCPS:g} MHz null-to-null)")
