@@ -49,29 +49,23 @@ log = logging.getLogger("mock_tx")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USER CALIBRATION — FALLBACK CONSTANTS (used only when the unit has no calibration)
+# RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
+# only from the unit's injected calibration; uncalibrated, it runs on a relative gain.
 # ═══════════════════════════════════════════════════════════════════════════════
-OUTPUT_POWER_DBM = -20.0    # max delivered power (dBm) at GAIN_AT_MAX_DB and AMPLITUDE
-GAIN_AT_MAX_DB = 89.75      # gain that produced it; also the fallback ceiling
-CABLE_LOSS_DB = 0.0
-AMPLIFIER_GAIN_DB = 0.0
-AMPLITUDE = 0.8
+GAIN_AT_MAX_DB = 89.75      # gain ceiling: never command a gain above this
 HW_MAX_GAIN_DB = 89.75
-
-MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
-MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
+AMPLITUDE = 0.5
 
 _PMAP = None
 
 
 def power_map() -> PowerMap:
     """The active power map: the unit's injected calibration curve if present
-    (SDR_CALIBRATION_FILE), else the baked constants. Cached, so --power's schema
-    bounds match the real operating range (calibrated → e.g. EIRP; else baked)."""
+    (SDR_CALIBRATION_FILE), else an uncalibrated (relative gain only) map — no baked dBm
+    scale. Cached, so --power's schema bounds match the real operating range when present."""
     global _PMAP
     if _PMAP is None:
-        _PMAP = PowerMap.load(PowerMap.from_linear(
-            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+        _PMAP = PowerMap.load(PowerMap.uncalibrated(0.0, GAIN_AT_MAX_DB, AMPLITUDE))
     return _PMAP
 
 
@@ -108,9 +102,7 @@ def build_script() -> Script:
                 default=1575.42e6,
                 help="Informational carrier for the log lines. Fixed per run.")
         .number("-Power", "--power", unit="dBm",
-                min=round(power_map().min_power_dbm, 2),
-                max=round(power_map().max_power_dbm, 2),
-                default=round(power_map().max_power_dbm, 2), required=False, live=True,
+                **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
                      "unit's calibration when present (e.g. EIRP), else the baked "
                      "SDR-port scale. Ignored if --gain is given. Live.")
@@ -139,6 +131,10 @@ def _self_test() -> int:
     log.info("power map source : %s", pmap.source)
     log.info("operating label  : %s", pmap.label)
     log.info("gain limits      : %.2f … %.2f dB", pmap.min_gain_db, pmap.max_gain_db)
+    if not pmap.has_absolute:
+        log.info("power range      : (uncalibrated — no absolute dBm scale; use --gain)")
+        log.info("SELF-TEST OK")
+        return 0
     log.info("power range      : %.2f … %.2f dBm", pmap.min_power_dbm, pmap.max_power_dbm)
     for req in (pmap.max_power_dbm, pmap.max_power_dbm - 10, pmap.max_power_dbm - 30):
         g = pmap.gain_for_power(req)
@@ -165,8 +161,19 @@ def main() -> int:
     pmap = power_map()
     amplitude = pmap.amplitude
 
-    gain_cal = getattr(args, "gain", None)
-    gain_db = float(gain_cal) if gain_cal is not None else pmap.gain_for_power(args.power)
+    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+    if gain_cal is not None:
+        gain_db = float(gain_cal)
+    elif pmap.has_absolute:                          # calibrated: the authored absolute --power
+        gain_db = pmap.gain_for_power(args.power)
+    else:                                            # uncalibrated: a persisted fallback gain, or refuse
+        _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
+        if _fb is None:
+            print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
+                  "has no meaning here; set a relative gain (the client does this for you).",
+                  file=sys.stderr)
+            return 2
+        gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
     radio = FakeRadio(args.freq)
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
@@ -174,10 +181,13 @@ def main() -> int:
     log.info("── mock TX (no hardware) ───────────────────────────────────")
     log.info("  signal id      : %s", CAL_SIGNAL_ID)
     log.info("  carrier (info) : %.3f MHz", args.freq / 1e6)
-    log.info("  power (target) : %g dBm  (%s)", args.power, pmap.label)
+    if pmap.has_absolute:
+        log.info("  power (target) : %g dBm  (%s)", args.power, pmap.label)
     log.info("  → gain         : %.2f dB (max %g), amplitude %g",
              gain_db, pmap.max_gain_db, amplitude)
     log.info("  calibration    : %s", pmap.source)
+    if pmap.warning:                       # calibration measured at another amplitude
+        log.info("  ⚠ CALIBRATION  : %s", pmap.warning)
     log.info("  RF             : %s", "ON" if state["rf_on"] else "OFF (muted)")
     if gain_cal is not None:
         log.info("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")

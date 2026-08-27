@@ -71,34 +71,22 @@ CAL_SIGNAL_ID = "gps_l1_mcode"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# USER CALIBRATION — FALLBACK CONSTANTS (used only when the unit has no calibration)
+# RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
+# only from the unit's injected calibration; uncalibrated, the script runs on a
+# relative gain (never invented power levels). GAIN_AT_MAX_DB is the safety ceiling.
 # ═══════════════════════════════════════════════════════════════════════════════
-# You set the transmit level in dBm. That only works if the script knows how the
-# SDR's gain maps to real output power, which you establish once with a spectrum
-# analyser: leave AMPLITUDE at the value below, run with --power at its maximum
-# (that commands GAIN_AT_MAX_DB), measure the actual output power at the SDR RF
-# port, and put that number in OUTPUT_POWER_DBM. From that anchor the script maps
-# any requested power to a gain (1 dB gain ≈ 1 dB power, across the B200's linear
-# range). CABLE_LOSS_DB / AMPLIFIER_GAIN_DB describe the RF chain AFTER the port,
-# so the number you dial in is the power delivered at the far end.
-
-OUTPUT_POWER_DBM = -20.0    # max output (dBm) at GAIN_AT_MAX_DB and AMPLITUDE — MEASURE THIS
 GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling the script commands
-CABLE_LOSS_DB = 0.0         # cabling insertion loss after the SDR port (positive dB)
-AMPLIFIER_GAIN_DB = 0.0     # external amplifier gain after the SDR port (positive dB)
 
-# Fixed baseband digital amplitude (0..1). NOT a user control: OUTPUT_POWER_DBM is
-# calibrated at THIS amplitude, so changing it invalidates the dBm↔gain mapping —
-# if you change it, re-measure OUTPUT_POWER_DBM at GAIN_AT_MAX_DB.
-AMPLITUDE = 0.8
+# Fixed baseband digital amplitude (0..1). NOT a user control and never a task
+# parameter: the calibration is measured at THIS amplitude, so a unit calibrated at a
+# different amplitude no longer matches. calkit detects that at load and runs
+# UNCALIBRATED with a loud warning until it is re-calibrated here.
+AMPLITUDE = 0.5
 
 # Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
 # from GAIN_AT_MAX_DB. The (normally-commented) calibration gain knob uses it.
 HW_MAX_GAIN_DB = 89.75
 
-# Derived delivered-power limits (computed — do not edit).
-MAX_DELIVERED_DBM = OUTPUT_POWER_DBM - CABLE_LOSS_DB + AMPLIFIER_GAIN_DB
-MIN_DELIVERED_DBM = MAX_DELIVERED_DBM - GAIN_AT_MAX_DB
 
 
 _PMAP = None
@@ -106,13 +94,12 @@ _PMAP = None
 
 def power_map() -> PowerMap:
     """The active power map: the unit's injected calibration curve if present
-    (SDR_CALIBRATION_FILE), else the baked constants above. Cached, so build_script
+    (SDR_CALIBRATION_FILE), else uncalibrated (relative gain only). Cached, so build_script
     and main share one — and so --power's schema bounds match the real operating
     range (calibrated → e.g. EIRP; else the baked SDR-port range)."""
     global _PMAP
     if _PMAP is None:
-        _PMAP = PowerMap.load(PowerMap.from_linear(
-            0.0, GAIN_AT_MAX_DB, MIN_DELIVERED_DBM, MAX_DELIVERED_DBM, AMPLITUDE))
+        _PMAP = PowerMap.load(PowerMap.uncalibrated(0.0, GAIN_AT_MAX_DB, AMPLITUDE))
     return _PMAP
 
 
@@ -282,9 +269,7 @@ def build_script() -> Script:
                 presets=FREQUENCIES, default=L1_HZ, required=True,
                 help="RF carrier (M-code is on L1 and L2). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
-                min=round(power_map().min_power_dbm, 2),
-                max=round(power_map().max_power_dbm, 2),
-                default=round(power_map().max_power_dbm, 2), required=False, live=True,
+                **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
                      "unit's calibration when present. Ignored if --gain is given "
                      "(relative wins). Live.")
@@ -303,6 +288,13 @@ def build_script() -> Script:
         # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
         # No default, so its PRESENCE selects relative mode (it overrides --power).
         # This is also the calibration knob — set it while measuring output vs gain.
+        .number("-Analog-bandwidth", "--bandwidth", unit="MHz", min=0.0, max=56.0,
+                default=0.0, required=False,
+                help="AD9361 analog TX filter bandwidth (MHz) — the real baseband LPF, set "
+                     "independently of the sample rate. 0 = auto (UHD picks it from the "
+                     "sample rate, the old behaviour); a positive value band-limits the "
+                     "signal WITHOUT changing the master clock. Coerced to the radio's "
+                     "range; the banner reports the actual.")
         .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
                 required=False, live=True,
                 help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
@@ -327,14 +319,25 @@ def main() -> int:
     samp_rate_hz = args.sample_rate * 1e6
 
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
-    # else the baked constants above (identical to the old single-anchor behaviour).
+    # else it runs uncalibrated — a relative gain only (no baked behaviour).
     pmap = power_map()
     amplitude = pmap.amplitude
 
     # A raw calibration gain (the normally-commented --gain knob) overrides the dBm
     # mapping when present, so you can measure output power at a chosen gain.
-    gain_cal = getattr(args, "gain", None)
-    gain_db = float(gain_cal) if gain_cal is not None else pmap.gain_for_power(args.power)
+    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+    if gain_cal is not None:
+        gain_db = float(gain_cal)
+    elif power_map().has_absolute:                  # calibrated: the authored absolute --power
+        gain_db = power_map().gain_for_power(args.power)
+    else:                                           # uncalibrated: a persisted fallback gain, or refuse
+        _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
+        if _fb is None:
+            print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
+                  "has no meaning here; set a relative gain (the client does this for you).",
+                  file=sys.stderr)
+            return 2
+        gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
     shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
     tmpdir = tempfile.mkdtemp(prefix="mcode_boc_", dir=shm)
@@ -365,10 +368,13 @@ def main() -> int:
     print(f"  modulation     : BOC(10,5) — {CODE_RATE_HZ/1e6:g} Mcps code, "
           f"{SUBCARRIER_HZ/1e6:g} MHz subcarrier (lobes at ±{SUBCARRIER_HZ/1e6:g} MHz)")
     print(f"  buffer         : {nsamp} samples ({nper} code period(s))")
-    print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+    if power_map().has_absolute:
+        print(f"  power (target) : {args.power:g} dBm  ({power_map().label})")
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.source}")
+    if pmap.warning:                       # e.g. calibration amplitude != this
+        print(f"  ⚠ CALIBRATION  : {pmap.warning}")   # script's fixed amplitude
     print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
@@ -410,6 +416,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
+    _bw = float(getattr(args, "bandwidth", 0.0) or 0.0)
+    if _bw > 0:                                   # AD9361 analog LPF, independent of master clock
+        tb.usrp.set_bandwidth(_bw * 1e6, 0)
+    try:
+        print(f"  analog TX BW   : {tb.usrp.get_bandwidth(0)/1e6:.3f} MHz (AD9361 filter"
+              f"{'' if _bw > 0 else ' — auto from Fs'})")
+    except Exception:      # noqa: BLE001
+        pass
     tb.start()
     try:
         while not stop.is_set():
