@@ -29,9 +29,10 @@ Fixed radio setup
   • sample rate 61.38 MHz (the max), master clock pinned 1:1;
   • over-the-wire sc8 (halves USB load);
   • baseband amplitude 0.5 (the amplitude the calibration is measured at — not a knob).
-The whole comb is carried at baseband around an auto-placed LO, so it must fit the usable
-band: every knife has to sit within ±25 MHz of the LO (≈ 0.4·Fs, inside the analog
-reconstruction filter), i.e. the span (last−first) can be at most ~50 MHz.
+The whole comb is carried at baseband around the LO, which sits at the comb centre, so it
+must fit the usable band: every knife has to sit within ±25 MHz of the LO (≈ 0.4·Fs, inside
+the analog reconstruction filter), i.e. the span (last−first) can be at most ~50 MHz. With an
+odd knife count the centre knife lands on the LO (DC); it is emitted at the LO like any other.
 
 Seamless loop + clean tones
 ───────────────────────────
@@ -115,11 +116,11 @@ def power_map() -> PowerMap:
 def comb_plan(first_hz: float, spacing_hz: float, last_hz: float):
     """Resolve the comb. SPACING is authoritative and `last_hz` is a ceiling: knives are
     first, first+spacing, … up to the largest ≤ last. Returns a dict with the knife count,
-    the (bin-quantised) knife frequencies, the auto-placed LO, and the per-knife DFT bins.
+    the (bin-quantised) knife frequencies, the LO (comb centre), and the per-knife DFT bins.
 
-    The LO is set a quarter-spacing off the comb midpoint so NO knife lands on the LO (DC),
-    where carrier leakage would sit. Each knife is snapped to the nearest 100 Hz bin while
-    keeping the spacing an exact integer number of bins (perfectly uniform)."""
+    The LO sits at the comb midpoint. Each knife is snapped to the nearest 100 Hz bin while
+    keeping the spacing an exact integer number of bins (perfectly uniform); with an odd knife
+    count the centre knife therefore lands on the LO (DC)."""
     if spacing_hz <= 0:
         raise ValueError("spacing must be > 0")
     if last_hz < first_hz:
@@ -127,9 +128,7 @@ def comb_plan(first_hz: float, spacing_hz: float, last_hz: float):
 
     n = int(math.floor((last_hz - first_hz) / spacing_hz + 1e-9)) + 1
     top_hz = first_hz + (n - 1) * spacing_hz          # actual top knife (≤ last_hz)
-    mid = 0.5 * (first_hz + top_hz)
-    dc_guard = spacing_hz / 4.0 if n > 1 else 0.5e6   # keep knives off the LO/DC
-    lo = mid - dc_guard
+    lo = 0.5 * (first_hz + top_hz)                     # LO at the comb centre
 
     # Snap to the 100 Hz bin grid, keeping the spacing an exact integer number of bins.
     bin_spacing = int(round(spacing_hz / FREQ_RES_HZ))
