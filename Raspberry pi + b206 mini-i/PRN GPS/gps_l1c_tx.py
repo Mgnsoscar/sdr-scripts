@@ -442,13 +442,6 @@ def build_script() -> Script:
                "optional power-preserving digital passband filter. Level is set in dBm via the "
                "unit's calibration; uncalibrated it runs on a relative gain. Authorised, "
                "shielded setups only.")
-        .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
-                 help="GPS satellite PRN (1..63). Fixed per run.")
-        .choice("-Component", "--component", options=["both", "pilot", "data"], default="both",
-                help="both = full L1C (25/75); pilot = L1Cp TMBOC only; data = L1Cd.")
-        .choice("-Secondary", "--secondary", options=["full", "off"], default="full",
-                help="full = apply the 1800-symbol pilot overlay (18 s, runtime multiply); "
-                     "off = 10 ms primary loop only.")
         .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
                 presets=FREQUENCIES, default=L1_HZ / 1e6,
                 help="RF carrier in MHz (default L1 = 1575.42). Fixed per run.")
@@ -457,6 +450,17 @@ def build_script() -> Script:
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
                      "calibration and snaps to its achievable grid; ignored if --gain is "
                      "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
+        .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
+                 help="GPS satellite PRN (1..63). Fixed per run.")
+        .choice("-Component", "--component", options=["both", "pilot", "data"], default="both",
+                help="both = full L1C (25/75); pilot = L1Cp TMBOC only; data = L1Cd.")
+        .choice("-Secondary", "--secondary", options=["full", "off"], default="full",
+                help="full = apply the 1800-symbol pilot overlay (18 s, runtime multiply); "
+                     "off = 10 ms primary loop only.")
         .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
                 help="Digital passband filter on the looped buffers (unity passband gain, so "
@@ -473,10 +477,6 @@ def build_script() -> Script:
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
-        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
-                required=False, live=True,
-                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
-                     "calibration. When given, overrides --power. Live.")
     )
 
 

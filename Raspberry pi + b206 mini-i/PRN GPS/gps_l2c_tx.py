@@ -403,12 +403,6 @@ def build_script() -> Script:
                "power-preserving digital passband filter. Level is set in dBm via the unit's "
                "calibration; uncalibrated it runs on a relative gain. Authorised, shielded "
                "setups only.")
-        .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
-                 help="GPS satellite PRN (1..63) — the real L2C code. Fixed per run.")
-        .choice("-Loop", "--loop", options=["full", "cm"], default="full",
-                help="full = whole 1.5 s CL period (bit-exact CL phase, complete spectrum; "
-                     "~736 MB in RAM at 61.38 MHz); cm = 20 ms CM period (CL truncated; "
-                     "~9.8 MB, envelope-correct) for tight RAM.")
         .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
                 presets=FREQUENCIES, default=L2_HZ / 1e6,
                 help="RF carrier in MHz (default L2 = 1227.60). Fixed per run.")
@@ -417,6 +411,16 @@ def build_script() -> Script:
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
                      "calibration and snaps to its achievable grid; ignored if --gain is "
                      "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
+        .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
+                 help="GPS satellite PRN (1..63) — the real L2C code. Fixed per run.")
+        .choice("-Loop", "--loop", options=["full", "cm"], default="full",
+                help="full = whole 1.5 s CL period (bit-exact CL phase, complete spectrum; "
+                     "~736 MB in RAM at 61.38 MHz); cm = 20 ms CM period (CL truncated; "
+                     "~9.8 MB, envelope-correct) for tight RAM.")
         .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
                 help="Digital passband filter on the looped buffer (unity passband gain, so "
@@ -432,10 +436,6 @@ def build_script() -> Script:
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
-        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
-                required=False, live=True,
-                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
-                     "calibration. When given, overrides --power. Live.")
     )
 
 

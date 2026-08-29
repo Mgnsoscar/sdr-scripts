@@ -334,8 +334,6 @@ def build_script() -> Script:
                "passband filter. Surrogate test signal, NOT the classified M-code. Level is "
                "set in dBm via the unit's calibration; uncalibrated it runs on a relative "
                "gain. Authorised, shielded setups only.")
-        .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
-                 help="Surrogate Gold-code index (1..32). Fixed per run.")
         .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
                 presets=FREQUENCIES, default=L1_HZ / 1e6, required=True,
                 help="RF carrier in MHz (M-code is on L1 = 1575.42 and L2 = 1227.60). "
@@ -345,6 +343,12 @@ def build_script() -> Script:
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
                      "calibration and snaps to its achievable grid; ignored if --gain is "
                      "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
+        .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
+                 help="Surrogate Gold-code index (1..32). Fixed per run.")
         .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
                 help="Digital passband filter on the looped buffer (unity passband gain, so "
@@ -362,10 +366,6 @@ def build_script() -> Script:
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
-        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
-                required=False, live=True,
-                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
-                     "calibration. When given, overrides --power. Live.")
     )
 
 

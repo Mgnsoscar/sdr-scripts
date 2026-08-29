@@ -276,13 +276,13 @@ def build_script() -> Script:
                 help="ABSOLUTE TOTAL power of the comb at the delivered plane (dBm). Maps "
                      "through the unit's calibration and snaps to its achievable grid; "
                      "ignored if --gain is given. Live.")
-        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
-                help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
-                     "restores them. Live.")
         .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
                 required=False, live=True,
                 help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
                      "calibration. When given, overrides --power. Live.")
+        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
+                     "restores them. Live.")
     )
 
 

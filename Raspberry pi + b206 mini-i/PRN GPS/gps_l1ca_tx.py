@@ -81,11 +81,13 @@ GAIN_AT_MAX_DB = 89.75       # operating gain ceiling (also the hard cap the scr
 HW_MAX_GAIN_DB = 89.75       # B200-mini physical TX-gain ceiling
 
 # ── Signal constants (fixed — this IS GPS L1 C/A) ───────────────────────────────────
-CARRIER_HZ = 1575.42e6        # GPS L1
+CARRIER_HZ = 1575.42e6        # GPS L1 (the --freq default; retunable for bench testing)
 CODE_RATE_HZ = 1.023e6        # C/A chip rate (~2 MHz null-to-null)
 SIGNAL_NAME = "GPS L1 C/A"
 CODE_LEN = 1023               # chips in a C/A Gold code period
 CA_NULL_HZ = 1.023e6          # main-lobe null spacing == the chip rate; sidelobes step by this
+
+FREQUENCIES = {"GPS L1 (1575.42 MHz)": CARRIER_HZ / 1e6}   # presets are in MHz
 
 # Filter presets: {label: number of C/A sidelobes to KEEP}. The passband is the main lobe
 # plus that many sidelobes, i.e. a ±(n+1)·1.023 MHz band. Max keeps the band inside ±Fs/2.
@@ -254,7 +256,7 @@ def _self_test() -> int:
 
 # ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def _build_top_block(initial_file: str, gain_db: float, amplitude: float):
+def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float, amplitude: float):
     """The GNU Radio top_block, imported lazily so the module loads without a radio stack."""
     from gnuradio import gr, blocks, uhd
 
@@ -266,7 +268,7 @@ def _build_top_block(initial_file: str, gain_db: float, amplitude: float):
             self.usrp = uhd.usrp_sink(
                 args, uhd.stream_args(cpu_format="fc32", otw_format=OTW_FORMAT, channels=[0]))
             self.usrp.set_samp_rate(SAMP_RATE_HZ)
-            self.usrp.set_center_freq(uhd.tune_request(CARRIER_HZ), 0)
+            self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
             self.src = blocks.file_source(gr.sizeof_gr_complex, initial_file, repeat=True)
             self.amp = blocks.multiply_const_cc(amplitude)
@@ -297,13 +299,20 @@ def build_script() -> Script:
         Script(f"{SIGNAL_NAME} (C/A Gold code) transmitter — fixed 61.38 MHz / sc8, looped "
                "buffer, optional power-preserving digital passband filter. Level is set in "
                "dBm via the unit's calibration; uncalibrated it runs on a relative gain.")
-        .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
-                 help="GPS satellite PRN / Gold code index (1..32). Fixed per run.")
+        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=CARRIER_HZ / 1e6,
+                help="RF carrier in MHz (default L1 = 1575.42). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
                      "calibration and snaps to its achievable grid; ignored if --gain is "
                      "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
+        .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
+                 help="GPS satellite PRN / Gold code index (1..32). Fixed per run.")
         .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
                 help="Digital passband filter on the looped buffer (unity passband gain, so "
@@ -319,10 +328,6 @@ def build_script() -> Script:
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
-        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
-                required=False, live=True,
-                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
-                     "calibration. When given, overrides --power. Live.")
     )
 
 
@@ -338,6 +343,7 @@ def main() -> int:
 
     script = build_script()
     args = script.parse()
+    center_freq_hz = args.freq * 1e6
 
     pmap = power_map()
     amplitude = pmap.amplitude
@@ -347,7 +353,7 @@ def main() -> int:
     if gain_cal is not None:
         gain_db = float(gain_cal)
     elif pmap.has_absolute:
-        gain_db = pmap.gain_for_power(args.power, freq=CARRIER_HZ)
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
     else:
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -387,7 +393,8 @@ def main() -> int:
     iq0, finfo = make_current()
     box = {"file": write_buffer(iq0)}
 
-    tb = _build_top_block(initial_file=box["file"], gain_db=gain_db, amplitude=amplitude)
+    tb = _build_top_block(initial_file=box["file"], center_freq_hz=center_freq_hz,
+                          gain_db=gain_db, amplitude=amplitude)
 
     def regenerate():
         """Rebuild the loop for the current filter shape and swap it in (one seam, then it
@@ -416,13 +423,13 @@ def main() -> int:
 
     print(f"── {SIGNAL_NAME} TX ─────────────────────────────────────────")
     print(f"  PRN            : {args.prn}")
-    print(f"  carrier        : {CARRIER_HZ/1e6:.3f} MHz")
+    print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz")
     print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  code rate      : 1.023 Mcps (~2.046 MHz null-to-null), loop {nsamp} samples")
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
         print(f"  power (achieved on grid): "
-              f"{pmap.power_for_gain(gain_db, freq=CARRIER_HZ):.2f} dBm")
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.describe()}")
     if pmap.warning:
@@ -439,10 +446,10 @@ def main() -> int:
 
     def apply_change(name, value):
         if name == "power" and pmap.has_absolute:
-            state["gain"] = pmap.gain_for_power(float(value), freq=CARRIER_HZ)
+            state["gain"] = pmap.gain_for_power(float(value), freq=center_freq_hz)
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-            ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=CARRIER_HZ), 2))
+            ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=center_freq_hz), 2))
         elif name == "gain":
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
             if state["rf_on"]:
