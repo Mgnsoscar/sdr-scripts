@@ -32,14 +32,16 @@ Uncalibrated, there is no dBm scale — use --gain. (See docs/calibration-v2.md.
 
 Loop length (--loop)
 ────────────────────
-  cm (default) : one CM period = 20 ms (CL truncated to its first 10230 chips). At
-                 61.38 MHz that is ~9.8 MB — the BPSK-R(1) envelope is exact and the
-                 live digital filter re-shapes it in a blink. The CL line structure
-                 appears at 50 Hz rather than its true 0.667 Hz (both unresolvable at
-                 practical RBW). This is the sane default at the fixed high rate.
-  full         : one whole CL period = 1.5 s (CM repeats 75×). Bit-exact CL phase, but
-                 ~736 MB in /dev/shm at 61.38 MHz and a heavy one-off FFT to (re)filter,
-                 so the live filter is slow here. Use it only when the true CL phase matters.
+  full (default) : one whole CL period = 1.5 s (CM repeats 75×). Bit-exact CL phase and
+                 complete spectrum. ~736 MB in /dev/shm at 61.38 MHz (it must live in RAM
+                 to stream at rate), so the host needs the headroom. The live filter stays
+                 responsive because it uses a memory-bounded overlap-add convolution (no
+                 92-Msample monolithic FFT) and the flowgraph keeps looping the old buffer
+                 until the new one is ready.
+  cm             : one CM period = 20 ms (CL truncated to its first 10230 chips), ~9.8 MB.
+                 The BPSK-R(1) envelope is identical; the CL line structure appears at 50 Hz
+                 rather than its true 0.667 Hz (both unresolvable at practical RBW). Pick it
+                 when RAM is tight or the true CL phase does not matter.
 
 Digital passband filter (on the looped buffer — no runtime DSP)
 ──────────────────────────────────────────────────────────────
@@ -192,7 +194,8 @@ def build_l2c_buffer(prn: int, loop: str):
     """The complex64 L2C baseband buffer at SAMP_RATE_HZ (real BPSK, Q=0). loop='cm' →
     one 20 ms CM period (CL truncated); loop='full' → one 1.5 s CL period. Each is a whole
     number of combined chips that is an exact integer sample count, so it loops with no
-    seam. Returns (iq, n_samples)."""
+    seam. Filled in chunks so the full 92-Msample loop needs only its own storage plus a
+    small working set (not several int64 copies of it). Returns (iq, n_samples)."""
     import numpy as np
 
     n_cl = CL_LEN if loop == "full" else CM_LEN
@@ -203,12 +206,17 @@ def build_l2c_buffer(prn: int, loop: str):
     sr = int(round(SAMP_RATE_HZ))
     n_samples = int(round(period_s * sr))
 
-    n = np.arange(n_samples, dtype=np.int64)
-    gchip = n * COMBINED_CHIP_RATE // sr         # 0 .. 2*n_cl-1
-    half = (gchip >> 1)
-    is_cl = (gchip & 1) == 1
-    bit = np.where(is_cl, cl[half % n_cl], cm[half % CM_LEN])
-    return (1.0 - 2.0 * bit).astype(np.complex64), n_samples
+    out = np.empty(n_samples, dtype=np.complex64)
+    chunk = 1 << 22                              # ~4 M samples/pass → bounded working set
+    for s in range(0, n_samples, chunk):
+        e = min(s + chunk, n_samples)
+        n = np.arange(s, e, dtype=np.int64)
+        gchip = n * COMBINED_CHIP_RATE // sr     # 0 .. 2*n_cl-1
+        half = gchip >> 1
+        is_cl = (gchip & 1) == 1
+        bit = np.where(is_cl, cl[half % n_cl], cm[half % CM_LEN])
+        out[s:e] = (1.0 - 2.0 * bit).astype(np.complex64)
+    return out, n_samples
 
 
 # ── Digital passband filter (unity gain, circular → loop-preserving) ────────────────
@@ -231,18 +239,48 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
+def _circular_convolve(x, h):
+    """Circular convolution of period len(x) between complex `x` and real FIR `h` (len ≤ len(x)).
+    For a short filter on a huge loop (the 1.5 s CL buffer is ~92 M samples at 61.38 MHz) a single
+    monolithic DFT would need several GB, so this uses OVERLAP-ADD with a small block FFT and then
+    aliases the (M−1)-sample linear-convolution tail back to the head — which is exactly what makes
+    the result circular, so the filtered loop still repeats with no seam. Peak memory is one
+    complex64 copy of the loop plus O(block), not O(len·16 bytes)."""
+    import numpy as np
+    n = len(x)
+    m = len(h)
+    if m >= n:                                        # tiny loop — a direct DFT is fine
+        return np.fft.ifft(np.fft.fft(x) * np.fft.fft(h, n)).astype(np.complex64)
+    nfft = 1
+    while nfft < 4 * m:                               # comfortably larger than the filter
+        nfft <<= 1
+    step = nfft - (m - 1)                             # samples consumed per block
+    hf = np.fft.fft(h, nfft)
+    y = np.zeros(n, dtype=np.complex64)               # accumulator (bounded memory)
+    for start in range(0, n, step):
+        blk = x[start:start + step]
+        yb = np.fft.ifft(np.fft.fft(blk, nfft) * hf)  # linear conv of this block (len blk + m − 1)
+        yb = yb[:len(blk) + m - 1]
+        end = start + len(yb)
+        if end <= n:
+            y[start:end] += yb
+        else:                                         # wrap the tail → circular aliasing
+            first = n - start
+            y[start:n] += yb[:first]
+            y[0:len(yb) - first] += yb[first:]
+    return y
+
+
 def filter_buffer(base_iq, sidelobes: int, trans_hz: float):
     """Circularly filter the looped L2C buffer to keep the main lobe + `sidelobes` sidelobes.
-    Circular convolution (multiply the buffer's DFT by the filter's) keeps the result exactly
-    periodic, so the filtered loop has no seam; unity passband gain leaves the kept lobes'
-    power unchanged. Returns (filtered_iq, n_taps, passband_edge_hz)."""
-    import numpy as np
+    Circular convolution keeps the result exactly periodic, so the filtered loop has no seam;
+    unity passband gain leaves the kept lobes' power unchanged. Returns (filtered_iq, n_taps,
+    passband_edge_hz)."""
     fp = (int(sidelobes) + 1) * L2C_NULL_HZ          # flat passband edge (kept up to here)
     fc = fp + trans_hz / 2.0                          # −6 dB cutoff = edge + half the transition
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
-    filtered = np.fft.ifft(np.fft.fft(base_iq) * np.fft.fft(h, n)).astype(np.complex64)
-    return filtered, m, fp
+    return _circular_convolve(base_iq, h), m, fp
 
 
 # ── Self-test (generator vs official sheet + check values; filter when numpy present) ──
@@ -367,10 +405,10 @@ def build_script() -> Script:
                "setups only.")
         .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
                  help="GPS satellite PRN (1..63) — the real L2C code. Fixed per run.")
-        .choice("-Loop", "--loop", options=["cm", "full"], default="cm",
-                help="cm = 20 ms CM period (CL truncated; small, envelope-correct, snappy "
-                     "live filter); full = whole 1.5 s CL period (bit-exact CL phase, but "
-                     "~736 MB and a slow filter at 61.38 MHz).")
+        .choice("-Loop", "--loop", options=["full", "cm"], default="full",
+                help="full = whole 1.5 s CL period (bit-exact CL phase, complete spectrum; "
+                     "~736 MB in RAM at 61.38 MHz); cm = 20 ms CM period (CL truncated; "
+                     "~9.8 MB, envelope-correct) for tight RAM.")
         .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
                 presets=FREQUENCIES, default=L2_HZ / 1e6,
                 help="RF carrier in MHz (default L2 = 1227.60). Fixed per run.")

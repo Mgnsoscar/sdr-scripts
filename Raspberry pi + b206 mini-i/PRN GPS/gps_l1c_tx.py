@@ -59,17 +59,20 @@ the filtered buffers still loop with no seam and there is no per-sample runtime 
 UNITY passband gain, so whatever it passes is unchanged in power. The same filter is applied
 to the pilot and data component buffers (filtering is linear, and the overlay is a ±1 per-
 period sign that commutes with it), so the summed signal is filtered identically. L1C is a
-BOC signal (BOC(1,1) lobes at ±1.023 MHz, TMBOC BOC(6,1) lobes at ±6.138 MHz), so the
-passband is set directly as a half-bandwidth in MHz; the default keeps the full TMBOC.
+split (BOC) signal — BOC(1,1) lobes at ±1.023 MHz, TMBOC BOC(6,1) lobes at ±6.138 MHz — so a
+plain "sidelobe count" is awkward; instead the passband edge SNAPS TO THE SPECTRAL NULLS. The
+underlying code is 1.023 Mcps, so the nulls sit at every 1.023 MHz: --nulls n puts the edge at
+±n·1.023 MHz, i.e. exactly on the null between lobes. n=2 cuts just outside the BOC(1,1) core;
+n=7 keeps the full TMBOC (just outside the BOC(6,1) lobes).
   • --filter on/off             enable/disable (live);
-  • --passband <MHz>            half-bandwidth kept each side of the carrier (live, presets);
+  • --nulls <n>                 passband edge at the nth null, ±n·1.023 MHz (live, presets);
   • --transition <MHz>          skirt steepness — the transition width beyond the edge (live).
 
 CLI
 ───
     gps_l1c_tx.py --prn 5 --power -30                          # calibrated dBm, no filter
     gps_l1c_tx.py --component pilot --secondary full --gain 60 # pilot only, full overlay
-    gps_l1c_tx.py --prn 5 --gain 60 --filter on --passband 8   # keep full TMBOC (±8 MHz)
+    gps_l1c_tx.py --prn 5 --gain 60 --filter on --nulls 7      # keep full TMBOC (±7.16 MHz)
     gps_l1c_tx.py --self-test
     gps_l1c_tx.py --describe-params
 """
@@ -120,15 +123,17 @@ SIGNAL_NAME = "GPS L1C"
 
 FREQUENCIES = {"GPS L1 (1575.42 MHz)": L1_HZ / 1e6}   # presets are in MHz now
 
-# Filter presets: {label: passband half-bandwidth in MHz}. BOC(1,1) lobes sit at ±1.023 MHz
-# and the TMBOC BOC(6,1) pilot lobes at ±6.138 MHz, so 8 MHz keeps the full TMBOC while
-# stripping the far-out subcarrier structure; 4 MHz keeps only the BOC(1,1) core.
-MIN_PASSBAND_MHZ = 2.0
-MAX_PASSBAND_MHZ = 30.69
-PASSBAND_PRESETS = {
-    "BOC(1,1) core (±4.0 MHz)": 4.0,
-    "Full TMBOC incl. BOC(6,1) (±8.0 MHz)": 8.0,
-    "Wide (±15.0 MHz)": 15.0,
+# The L1C code is 1.023 Mcps, so its spectral nulls sit at every 1.023 MHz. The filter's
+# passband edge snaps to these nulls: --nulls n → edge at ±n·1.023 MHz (right on the null
+# between lobes). BOC(1,1) core is bounded by the n=2 null; the BOC(6,1) lobes by the n=7
+# null. Max keeps the edge inside ±Fs/2.
+L1C_NULL_HZ = 1.023e6
+MAX_NULLS = 30
+NULL_PRESETS = {
+    "BOC(1,1) core (±2.05 MHz)": 2,
+    "Between the lobes (±4.09 MHz)": 4,
+    "Include BOC(6,1) lobes (±7.16 MHz)": 7,
+    "Wide (±14.32 MHz)": 14,
 }
 
 # Per-PRN (Weil index w, insertion index p), IS-GPS-800 (validated vs the sheet).
@@ -279,13 +284,13 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
-def filter_buffer(base_iq, passband_hz: float, trans_hz: float):
-    """Circularly filter a looped L1C component buffer to a ±`passband_hz` band. Circular
-    convolution keeps the result exactly periodic, so the filtered loop has no seam; unity
-    passband gain leaves the kept lobes' power unchanged. Returns (filtered_iq, n_taps,
-    passband_edge_hz)."""
+def filter_buffer(base_iq, nulls: int, trans_hz: float):
+    """Circularly filter a looped L1C component buffer, passband edge snapped to the nth null
+    (±`nulls`·1.023 MHz). Circular convolution keeps the result exactly periodic, so the
+    filtered loop has no seam; unity passband gain leaves the kept lobes' power unchanged.
+    Returns (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
-    fp = float(passband_hz)                           # flat passband edge (kept up to here)
+    fp = int(nulls) * L1C_NULL_HZ                     # flat passband edge, on the nth null
     fc = fp + trans_hz / 2.0                          # −6 dB cutoff = edge + half the transition
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
@@ -344,14 +349,14 @@ def _self_test() -> int:
         return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
 
     # Filter each component (as the flow does) then sum — must equal filtering the sum.
-    df, taps, fp = filter_buffer(data_buf, passband_hz=8.0e6, trans_hz=1.0e6)
-    pf, _, _ = filter_buffer(pilot_buf, passband_hz=8.0e6, trans_hz=1.0e6)
+    df, taps, fp = filter_buffer(data_buf, nulls=7, trans_hz=1.0e6)      # full TMBOC (±7.16 MHz)
+    pf, _, _ = filter_buffer(pilot_buf, nulls=7, trans_hz=1.0e6)
     filt = df + pf
-    kept = 10 * np.log10(band(filt, 0, 8.0e6) / band(base, 0, 8.0e6))
+    kept = 10 * np.log10(band(filt, 0, fp) / band(base, 0, fp))
     cut = 10 * np.log10(band(filt, 12e6, 20e6) / max(band(base, 12e6, 20e6), 1e-30))
     peak = float(np.max(np.abs(filt)))
     f_ok = abs(kept) < 0.1 and cut < -40 and peak * AMPLITUDE < 1.0
-    print(f"filter (full TMBOC ±8 MHz, {taps} taps): kept band {kept:+.3f} dB, "
+    print(f"filter (nulls=7 → ±{fp/1e6:.2f} MHz, {taps} taps): kept band {kept:+.3f} dB, "
           f"out-of-band {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} [{'OK' if f_ok else 'FAIL'}]")
     ok = ok and f_ok
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
@@ -456,12 +461,11 @@ def build_script() -> Script:
                 required=False, live=True,
                 help="Digital passband filter on the looped buffers (unity passband gain, so "
                      "it preserves what it passes). Live.")
-        .number("-Passband", "--passband", unit="MHz",
-                min=MIN_PASSBAND_MHZ, max=MAX_PASSBAND_MHZ, default=8.0,
-                presets=PASSBAND_PRESETS, required=False, live=True,
-                help="Passband half-bandwidth kept each side of the carrier (MHz). BOC(1,1) "
-                     "sits at ±1.023 and the TMBOC BOC(6,1) lobes at ±6.138; the default (8) "
-                     "keeps the full TMBOC. Live (rebuilds the filtered loops).")
+        .integer("-Nulls", "--nulls", min=1, max=MAX_NULLS, default=7,
+                 presets=NULL_PRESETS, required=False, live=True,
+                 help="Passband edge, as the null it snaps to: ±n·1.023 MHz, right on the "
+                      "null between lobes. n=2 keeps the BOC(1,1) core, n=7 the full TMBOC "
+                      "(incl. the BOC(6,1) lobes). Live (rebuilds the filtered loops).")
         .number("-Transition", "--transition", unit="MHz", min=0.1, max=8.0, default=1.0,
                 required=False, live=True,
                 help="Filter skirt transition width beyond the passband edge (MHz) — the "
@@ -525,17 +529,18 @@ def main() -> int:
 
     # Filter "shape" (the regeneration-requiring params) — mutated by live changes.
     shape = {"on": getattr(args, "filter", "off") == "on",
-             "passband_hz": float(getattr(args, "passband", 8.0) or 8.0) * 1e6,
+             "nulls": int(getattr(args, "nulls", 7) or 7),
              "trans_hz": float(getattr(args, "transition", 1.0) or 1.0) * 1e6}
 
     def make_component(base):
         """Filtered (or bare) copy of one component buffer for the current shape."""
         if not shape["on"]:
             return base, {"on": False}
-        filtered, taps, fp = filter_buffer(base, shape["passband_hz"], shape["trans_hz"])
+        filtered, taps, fp = filter_buffer(base, shape["nulls"], shape["trans_hz"])
         return filtered, {"on": True, "taps": taps, "edge_hz": fp, "trans_hz": shape["trans_hz"]}
 
-    finfo = {"on": shape["on"], "edge_hz": shape["passband_hz"], "trans_hz": shape["trans_hz"]}
+    finfo = {"on": shape["on"], "edge_hz": shape["nulls"] * L1C_NULL_HZ,
+             "trans_hz": shape["trans_hz"]}
     data_file = pilot_file = None
     if want_data:
         iq, finfo = make_component(data_base)
@@ -554,7 +559,8 @@ def main() -> int:
     def regenerate():
         """Rebuild the filtered component loops for the current shape and swap them in (one
         seam, then they loop clean). Runs on the control thread; the flow keeps streaming."""
-        info = {"on": shape["on"], "edge_hz": shape["passband_hz"], "trans_hz": shape["trans_hz"]}
+        info = {"on": shape["on"], "edge_hz": shape["nulls"] * L1C_NULL_HZ,
+                "trans_hz": shape["trans_hz"]}
         if want_data:
             iq, info = make_component(data_base)
             new = write_buffer(iq)
@@ -634,12 +640,11 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
-        elif name in ("filter", "passband", "transition"):
+        elif name in ("filter", "nulls", "transition"):
             if name == "filter":
                 shape["on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
-            elif name == "passband":
-                shape["passband_hz"] = max(MIN_PASSBAND_MHZ, min(MAX_PASSBAND_MHZ,
-                                                                 float(value))) * 1e6
+            elif name == "nulls":
+                shape["nulls"] = max(1, min(MAX_NULLS, int(value)))
             else:
                 shape["trans_hz"] = float(value) * 1e6
             regenerate()
