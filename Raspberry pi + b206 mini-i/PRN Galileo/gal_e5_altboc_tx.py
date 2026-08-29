@@ -153,7 +153,23 @@ CHIP_RATE_HZ = 10.23e6         # E5 component chip rate
 SUBCARRIER_HZ = 15.345e6       # AltBOC side-band sub-carrier rate (15×1.023)
 PRIMARY_LEN = 10230
 EPOCHS_PER_LOOP = 100          # 100 primary epochs (1 ms each) = 100 ms period
-DEFAULT_SR_HZ = 61.38e6        # 6 samp/chip, 4 samp/sub-carrier period
+
+# ── Fixed radio setup (NOT parameters) ──────────────────────────────────────────────
+SAMP_RATE_HZ = 61.38e6         # 6 samp/chip, 4 samp/sub-carrier sub-period; the AltBOC needs
+                               # both ±15.345 MHz sidebands so it runs at the ceiling; 1:1 clock
+OTW_FORMAT = "sc8"            # over-the-wire; halves USB load
+FREQUENCIES = {"Galileo E5 centre (1191.795 MHz)": E5_HZ / 1e6}   # presets in MHz
+
+# Filter: AltBOC is a split spectrum (two sidebands at ±15.345 MHz reaching ±25.575 MHz),
+# so instead of a sidelobe count the passband is a direct half-bandwidth in MHz (a lowpass
+# edge each side of the carrier). The default keeps both full sidebands.
+MIN_PASSBAND_MHZ = 10.0
+MAX_PASSBAND_MHZ = 30.69
+PASSBAND_PRESETS = {
+    "Both sidebands (±25.6 MHz)": 25.575,
+    "Tight (±20.5 MHz)": 20.46,
+    "Full to Nyquist (±30.7 MHz)": 30.69,
+}
 
 # Feedback taps per component (ICD Table 16); register-1 start = all-ones.
 TAPS = {
@@ -393,30 +409,49 @@ def _self_test() -> int:
     ok = ok and table_ok
     print(f"AltBOC table vs direct formula: max|Δ|={maxerr:.2e} over 128 cases "
           f"[{'OK' if table_ok else 'FAIL'}]")
+
+    try:
+        import numpy as np
+    except ImportError:
+        print("(numpy absent — skipping the filter check)")
+        return 0 if ok else 1
+
+    base, n, _, _ = build_iq_buffer(1)
+
+    def band(x, lo, hi):
+        X = np.fft.fftshift(np.fft.fft(x))
+        f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
+        return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
+
+    filt, taps, fp = filter_buffer(base, passband_hz=25.575e6, trans_hz=1.5e6)   # both sidebands
+    kept = 10 * np.log10(band(filt, 0, fp) / band(base, 0, fp))
+    cut = 10 * np.log10(band(filt, 28e6, 30.69e6) / max(band(base, 28e6, 30.69e6), 1e-30))
+    peak = float(np.max(np.abs(filt)))
+    f_ok = abs(kept) < 0.1 and cut < -20 and peak * AMPLITUDE < 1.0
+    print(f"filter (both sidebands ±{fp/1e6:.2f} MHz, {taps} taps): kept band {kept:+.3f} dB, "
+          f"out-of-band {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} [{'OK' if f_ok else 'FAIL'}]")
+    ok = ok and f_ok
     print("ALL E5 AltBOC CHECKS PASSED" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
 
 # ── Baseband buffer (one seamless-looping 100 ms AltBOC period) ────────────────
 
-def build_iq_buffer(svid: int, samp_rate_hz: float):
+def build_iq_buffer(svid: int):
     """Build a complex64 constant-envelope AltBOC buffer for one whole number of
-    100 ms E5 periods that is also an exact integer number of samples (seamless).
-    Each sample is exp(j·π/4·k) from the ICD Table-7 look-up on the tiered code
-    quadruple and the sub-period index. Returns (iq, n_samples, n_periods, spc)."""
+    100 ms E5 periods that is also an exact integer number of samples (seamless) at
+    the fixed SAMP_RATE_HZ. Each sample is exp(j·π/4·k) from the ICD Table-7 look-up
+    on the tiered code quadruple and the sub-period index. Returns (iq, n_samples,
+    n_periods, spc)."""
     import numpy as np
     from fractions import Fraction
 
-    sr = int(round(samp_rate_hz))
+    sr = int(round(SAMP_RATE_HZ))
     cr = int(round(CHIP_RATE_HZ))
     sc = int(round(SUBCARRIER_HZ))
-    if sr % cr != 0:
-        raise ValueError(f"sample rate must be an integer multiple of "
-                         f"{CHIP_RATE_HZ/1e6:g} MHz; got {samp_rate_hz/1e6:g} MHz")
-    if (sr * 8) % sc != 0:
-        raise ValueError(f"sample rate must place sub-carrier sub-periods on the "
-                         f"grid (sr·8 divisible by {SUBCARRIER_HZ/1e6:g} MHz); "
-                         f"got {samp_rate_hz/1e6:g} MHz")
+    if sr % cr != 0 or (sr * 8) % sc != 0:
+        raise ValueError(f"fixed sample rate {SAMP_RATE_HZ/1e6:g} MHz must be a multiple of "
+                         f"{CHIP_RATE_HZ/1e6:g} MHz with sub-carrier sub-periods on the grid")
 
     chips_per_loop = PRIMARY_LEN * EPOCHS_PER_LOOP        # 10230*100 = 1_023_000
     spp = Fraction(sr * chips_per_loop, cr)
@@ -454,23 +489,55 @@ def build_iq_buffer(svid: int, samp_rate_hz: float):
     return iq, n_samples, n_periods, spc
 
 
+# ── Digital passband filter (unity gain, circular → loop-preserving) ────────────────
+
+def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
+    """Blackman-Harris windowed-sinc lowpass, UNITY passband gain. `fc_hz` is the −6 dB
+    cutoff; `trans_hz` sets the tap count (steeper skirt → more taps). Returns (h, n_taps)."""
+    import numpy as np
+    m = int(np.ceil(5.5 * SAMP_RATE_HZ / max(trans_hz, 1.0))) | 1     # odd
+    m = min(m, (max_taps | 1))
+    k = np.arange(m)
+    c = (m - 1) / 2.0
+    fcn = min(fc_hz / SAMP_RATE_HZ, 0.499)          # never above Nyquist
+    h = 2 * fcn * np.sinc(2 * fcn * (k - c))
+    n1 = m - 1
+    win = (0.35875 - 0.48829 * np.cos(2 * np.pi * k / n1)
+           + 0.14128 * np.cos(4 * np.pi * k / n1) - 0.01168 * np.cos(6 * np.pi * k / n1))
+    h = h * win
+    h = h / h.sum()                                 # unity DC (→ passband) gain
+    return h.astype(np.float64), m
+
+
+def filter_buffer(base_iq, passband_hz: float, trans_hz: float):
+    """Circularly filter the looped AltBOC buffer to a ±`passband_hz` band. Circular
+    convolution keeps the result exactly periodic (seam-free loop); unity passband gain
+    leaves the kept sidebands' power unchanged. NB filtering breaks the constant envelope
+    (that is inherent to band-limiting a split spectrum). Returns (filtered_iq, n_taps,
+    passband_edge_hz)."""
+    import numpy as np
+    fp = float(passband_hz)
+    fc = fp + trans_hz / 2.0
+    n = len(base_iq)
+    h, m = _design_lowpass(fc, trans_hz, n // 2)
+    filtered = np.fft.ifft(np.fft.fft(base_iq) * np.fft.fft(h, n)).astype(np.complex64)
+    return filtered, m, fp
+
+
 # ── Flowgraph ──────────────────────────────────────────────────────────────────
 
-def _build_top_block(iq_path, center_freq_hz, samp_rate_hz, gain_db, amplitude,
-                     otw_format, extra_args):
+def _build_top_block(iq_path, center_freq_hz, gain_db, amplitude):
     from gnuradio import gr, blocks, uhd
 
     class E5AltBocTx(gr.top_block):
         def __init__(self):
             super().__init__("Galileo E5 AltBOC TX")
-            args = (f"master_clock_rate={samp_rate_hz:.0f},"
+            args = (f"master_clock_rate={SAMP_RATE_HZ:.0f},"
                     "num_send_frames=512,send_frame_size=16000")
-            if extra_args:
-                args += "," + extra_args
             self.usrp = uhd.usrp_sink(
-                args, uhd.stream_args(cpu_format="fc32", otw_format=otw_format,
+                args, uhd.stream_args(cpu_format="fc32", otw_format=OTW_FORMAT,
                                       channels=[0]))
-            self.usrp.set_samp_rate(samp_rate_hz)
+            self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
             self.src = blocks.file_source(gr.sizeof_gr_complex, iq_path, repeat=True)
@@ -479,6 +546,7 @@ def _build_top_block(iq_path, center_freq_hz, samp_rate_hz, gain_db, amplitude,
 
         def set_amplitude(self, a): self.amp.set_k(a)
         def set_gain(self, g): self.usrp.set_gain(g, 0)
+        def swap_file(self, path): self.src.open(path, True)
         def actual_gain(self): return self.usrp.get_gain(0)
         def actual_samp_rate(self): return self.usrp.get_samp_rate()
 
@@ -490,68 +558,43 @@ def _build_top_block(iq_path, center_freq_hz, samp_rate_hz, gain_db, amplitude,
 def build_script() -> Script:
     return (
         Script("Galileo E5 AltBOC(15,10) transmitter — full wideband E5 (E5a+E5b, "
-               "constant-envelope 8-PSK, real tiered codes), file-replay. "
-               "Transmit only into an authorised, shielded setup.")
-        .integer("-SVID", "--svid", min=1, max=50, default=1,
-                 help="Galileo SVID / primary-code number (1..50; operational "
-                      "1..36). Fixed per run.")
+               "constant-envelope 8-PSK, real tiered codes) — fixed 61.38 MHz / sc8, looped "
+               "buffer, optional power-preserving digital passband filter. Level is set in dBm "
+               "via the unit's calibration; uncalibrated it runs on a relative gain. "
+               "Authorised, shielded setups only.")
+        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=E5_HZ / 1e6,
+                help="RF carrier in MHz (default E5 centre = 1191.795). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
-                **power_map().power_field_kwargs(), required=True, live=True,
-                help="Target output power at the delivered plane (after cable loss + "
-                     "amplifier gain). Max = what the SDR produces at its calibrated "
-                     "max gain; raise it by editing the calibration constants.")
-        .choice("-RF", "--rf", options=["on", "off"], default="on",
+                **power_map().power_field_kwargs(), required=False, live=True,
+                help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
+                     "calibration and snaps to its achievable grid; ignored if --gain is "
+                     "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
                 required=False, live=True,
-                help="RF output on/off. OFF mutes the signal (gain AND baseband "
-                     "amplitude to 0); ON restores them. Change the power (or the "
-                     "calibration gain) while OFF and it takes effect when you turn ON.")
-        # RELATIVE power (also the calibration knob): the SDR's raw TX gain (dB), bypassing
-        # the dBm mapping. No default, so its PRESENCE selects relative mode and OVERRIDES
-        # --power. Set it while measuring output vs gain to fill in OUTPUT_POWER_DBM /
-        # GAIN_AT_MAX_DB above.
-        .number("-Gain", "--gain", unit="dB",
-                min=0, max=HW_MAX_GAIN_DB, required=False, live=True,
-                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, bypassing "
-                     "the dBm calibration. When given, overrides --power. Live.")
-        .number("-Sample-rate", "--samp_rate", unit="MHz", min=30.69, max=61.44,
-                default=DEFAULT_SR_HZ / 1e6,
-                help="Host/DAC sample rate; master clock pinned equal to it (1:1). "
-                     "Must be a multiple of 10.23 MHz with sub-carrier sub-periods "
-                     "on-grid. Default/recommended 61.38 MHz (both ±15.345 MHz "
-                     "sidebands inside Nyquist). Fixed per run.")
-        .choice("-OTW-format", "--otw", options=["sc8", "sc16"], default="sc8",
-                help="Over-the-wire sample format. sc8 halves USB load (needed at "
-                     "61.38 MS/s on a Pi); sc16 for more dynamic range.")
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
+        .integer("-SVID", "--svid", min=1, max=50, default=1,
+                 help="Galileo SVID / primary-code number (1..50; operational 1..36). "
+                      "Fixed per run.")
+        .choice("-Filter", "--filter", options=["off", "on"], default="off",
+                required=False, live=True,
+                help="Digital passband filter on the looped buffer (unity passband gain, so "
+                     "it preserves what it passes; it does break the constant envelope). Live.")
+        .number("-Passband", "--passband", unit="MHz",
+                min=MIN_PASSBAND_MHZ, max=MAX_PASSBAND_MHZ, default=25.575,
+                presets=PASSBAND_PRESETS, required=False, live=True,
+                help="Passband half-bandwidth kept each side of the carrier (MHz). The two "
+                     "sidebands reach ±25.575 MHz; the default keeps them both. Live "
+                     "(rebuilds the filtered loop).")
+        .number("-Transition", "--transition", unit="MHz", min=0.1, max=8.0, default=1.5,
+                required=False, live=True,
+                help="Filter skirt transition width beyond the passband edge (MHz) — the "
+                     "steepness knob. Live (rebuilds the filtered loop).")
+        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
+                     "restores them. Live.")
     )
-
-
-def _apply_live_change(tb, ctrl, state, name, value):
-    # power/gain edits are staged into state["gain"] and only reach the radio when
-    # RF is on; the --rf toggle mutes/restores gain AND baseband amplitude.
-    if name == "power":
-        state["gain"] = gain_for_power(float(value))
-        if state["rf_on"]:
-            tb.set_gain(state["gain"])
-            ctrl.report("power", round(power_for_gain(tb.actual_gain()), 2))
-        else:
-            ctrl.report("power", round(power_for_gain(state["gain"]), 2))
-    elif name == "gain":
-        state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
-        if state["rf_on"]:
-            tb.set_gain(state["gain"])
-            ctrl.report("gain", round(tb.actual_gain(), 2))
-        else:
-            ctrl.report("gain", round(state["gain"], 2))
-    elif name == "rf":
-        on = str(value).strip().lower() in ("on", "1", "true", "yes")
-        state["rf_on"] = on
-        if on:
-            tb.set_amplitude(AMPLITUDE)
-            tb.set_gain(state["gain"])
-        else:
-            tb.set_gain(0.0)
-            tb.set_amplitude(0.0)
-        ctrl.report("rf", "on" if on else "off")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
@@ -566,19 +609,21 @@ def main() -> int:
 
     script = build_script()
     args = script.parse()
+    center_freq_hz = args.freq * 1e6
     if args.svid not in E5AI_S2:
         print(f"SVID {args.svid} out of range 1..50", file=sys.stderr)
         return 2
 
-    samp_rate_hz = args.samp_rate * 1e6
-    # A raw calibration gain (the normally-commented --gain knob) overrides the dBm
-    # mapping when present, so you can measure output power at a chosen gain.
-    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+    pmap = power_map()
+    amplitude = pmap.amplitude
+
+    # Gain precedence: explicit --gain (raw) > calibrated --power > refuse (uncalibrated).
+    gain_cal = getattr(args, "gain", None)
     if gain_cal is not None:
         gain_db = float(gain_cal)
-    elif power_map().has_absolute:                  # calibrated: the authored absolute --power
-        gain_db = power_map().gain_for_power(args.power)
-    else:                                           # uncalibrated: a persisted fallback gain, or refuse
+    elif pmap.has_absolute:
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
+    else:
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
             print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
@@ -586,54 +631,120 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
+
+    try:
+        base_iq, nsamp, nper, spc = build_iq_buffer(args.svid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
     shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
     tmpdir = tempfile.mkdtemp(prefix="gal_e5ab_", dir=shm)
     atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
 
-    try:
-        iq, nsamp, nper, spc = build_iq_buffer(args.svid, samp_rate_hz)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    iq_path = os.path.join(tmpdir, f"e5altboc_svid{args.svid}.fc32")
-    iq.tofile(iq_path)
-    print(f"[prebuilt] E5 AltBOC SVID {args.svid} → {nsamp} samples "
-          f"({nper}×100 ms period, {spc} samp/chip, {nsamp*8/1e6:.1f} MB) → {iq_path}")
+    def write_buffer(iq) -> str:
+        fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
+        os.close(fd)
+        iq.tofile(path)
+        return path
 
-    tb = _build_top_block(iq_path, E5_HZ, samp_rate_hz, gain_db, AMPLITUDE,
-                          args.otw, "")
+    shape = {"on": getattr(args, "filter", "off") == "on",
+             "passband_hz": float(getattr(args, "passband", 25.575) or 25.575) * 1e6,
+             "trans_hz": float(getattr(args, "transition", 1.5) or 1.5) * 1e6}
 
-    # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
-    # flow muted; power/gain edits made while OFF are staged and reach the radio
-    # only when RF is switched ON.
+    def make_current():
+        if not shape["on"]:
+            return base_iq, {"on": False}
+        filtered, taps, fp = filter_buffer(base_iq, shape["passband_hz"], shape["trans_hz"])
+        return filtered, {"on": True, "taps": taps, "edge_hz": fp,
+                          "trans_hz": shape["trans_hz"]}
+
+    iq0, finfo = make_current()
+    box = {"file": write_buffer(iq0)}
+
+    tb = _build_top_block(box["file"], center_freq_hz, gain_db, amplitude)
+
+    def regenerate():
+        iq, info = make_current()
+        new_file = write_buffer(iq)
+        tb.swap_file(new_file)
+        old, box["file"] = box["file"], new_file
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
+        return info
+
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
     if not state["rf_on"]:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
 
+    def _fmt_band(info):
+        if not info.get("on"):
+            return "off (full signal)"
+        return (f"on — passband ±{info['edge_hz']/1e6:.2f} MHz, "
+                f"{info['trans_hz']/1e6:g} MHz transition, {info['taps']} taps")
+
     print("── Galileo E5 AltBOC(15,10) TX ─────────────────────────────")
     print(f"  signal         : full E5 (E5a lower + E5b upper), constant-envelope")
     print(f"  SVID           : {args.svid}")
-    print(f"  carrier        : {E5_HZ/1e6:.3f} MHz  (E5a {E5A_HZ/1e6:.2f} / "
+    print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz  (E5a {E5A_HZ/1e6:.2f} / "
           f"E5b {E5B_HZ/1e6:.2f})")
-    print(f"  sample rate    : requested {args.samp_rate:g} MHz, "
-          f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
+    print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  sub-carrier    : 15.345 MHz AltBOC, chip 10.23 Mcps")
-    if power_map().has_absolute:
-        print(f"  power (target) : {args.power:g} dBm  ({power_map().label})")
-    print(f"  → gain         : {gain_db:.2f} dB (max {power_map().max_gain_db:g}), "
-          f"amplitude {AMPLITUDE:g}")
-    print(f"  calibration    : {power_map().source}")
-    if power_map().warning:                # calibration measured at another amplitude
-        print(f"  ⚠ CALIBRATION  : {power_map().warning}")
-    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
+    print(f"  buffer         : {nsamp} samples ({nper}×100 ms, {spc} samp/chip, "
+          f"{nsamp*8/1e6:.1f} MB)")
+    if pmap.has_absolute:
+        print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+        print(f"  power (achieved on grid): "
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
+    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), amplitude {amplitude:g}")
+    print(f"  calibration    : {pmap.describe()}")
+    if pmap.warning:
+        print(f"  ⚠ CALIBRATION  : {pmap.warning}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    print(f"  otw            : {args.otw}")
+    print(f"  filter         : {_fmt_band(finfo)}")
+    print(f"  otw            : {OTW_FORMAT}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
     ctrl = script.live_control(args)
+
+    def apply_change(name, value):
+        if name == "power" and pmap.has_absolute:
+            state["gain"] = pmap.gain_for_power(float(value), freq=center_freq_hz)
+            if state["rf_on"]:
+                tb.set_gain(state["gain"])
+            ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=center_freq_hz), 2))
+        elif name == "gain":
+            state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
+            if state["rf_on"]:
+                tb.set_gain(state["gain"])
+            ctrl.report("gain", round(state["gain"], 2))
+        elif name == "rf":
+            on = str(value).strip().lower() in ("on", "1", "true", "yes")
+            state["rf_on"] = on
+            if on:
+                tb.set_amplitude(amplitude)
+                tb.set_gain(state["gain"])
+            else:
+                tb.set_gain(0.0)
+                tb.set_amplitude(0.0)
+            ctrl.report("rf", "on" if on else "off")
+        elif name in ("filter", "passband", "transition"):
+            if name == "filter":
+                shape["on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
+            elif name == "passband":
+                shape["passband_hz"] = max(MIN_PASSBAND_MHZ, min(MAX_PASSBAND_MHZ,
+                                                                 float(value))) * 1e6
+            else:
+                shape["trans_hz"] = float(value) * 1e6
+            regenerate()
+            ctrl.report(name, value)
+
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -641,7 +752,7 @@ def main() -> int:
     try:
         while not stop.is_set():
             for change in ctrl.drain():
-                _apply_live_change(tb, ctrl, state, change.name, change.value)
+                apply_change(change.name, change.value)
             time.sleep(0.1)
     finally:
         ctrl.close()
