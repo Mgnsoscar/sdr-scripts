@@ -131,12 +131,30 @@ CHIP_RATE_HZ = 0.511e6         # GLONASS C/A chip rate
 CODE_LEN = 511                 # C/A code length (chips) — 1 ms period
 K_MIN, K_MAX = -7, 6           # FDMA channel numbers
 
+# ── Fixed radio setup (NOT parameters) ──────────────────────────────────────────────
+# GLONASS is a 0.511 Mcps FDMA plan (not a 1.023 MHz multiple), so the ceiling is the
+# highest 0.511 MHz multiple inside the B200's range: 61.32 MHz (= 120×0.511), which also
+# covers the ~9 MHz FDMA band whole. 120 samp/chip; master clock 1:1.
+SAMP_RATE_HZ = 61.32e6
+OTW_FORMAT = "sc8"            # over-the-wire; halves USB load
+
 # Per-band frequency plan: base carrier + channel spacing (ICD L1/L2, ed. 5.1).
 BANDS = {
-    "L1": {"base": 1602.0e6, "spacing": 0.5625e6, "chan_default_sr": 10.22e6},
-    "L2": {"base": 1246.0e6, "spacing": 0.4375e6, "chan_default_sr": 10.22e6},
+    "L1": {"base": 1602.0e6, "spacing": 0.5625e6},
+    "L2": {"base": 1246.0e6, "spacing": 0.4375e6},
 }
-BAND_DEFAULT_SR = 12.264e6     # BAND-mode default (24 samp/chip, covers ~8 MHz)
+
+# Filter: GLONASS is a lowpass job either way — a single BPSK channel (sinc², nulls every
+# 0.511 MHz) or the FDMA comb of 14 carriers — so the passband is a direct half-bandwidth in
+# MHz. The default (±5 MHz) keeps the whole FDMA band in band mode and the main lobe plus
+# several sidelobes in channel mode.
+MIN_PASSBAND_MHZ = 0.5
+MAX_PASSBAND_MHZ = 30.6
+PASSBAND_PRESETS = {
+    "Channel main lobe (±1.02 MHz)": 1.022,
+    "Channel + sidelobes (±3 MHz)": 3.0,
+    "Full FDMA band (±5 MHz)": 5.0,
+}
 
 
 # ── C/A ranging code (pure Python) ─────────────────────────────────────────────
@@ -189,6 +207,45 @@ def _self_test() -> int:
         lo, hi = channel_freq(band, K_MIN), channel_freq(band, K_MAX)
         print(f"{band}OF plan: k {K_MIN}..{K_MAX}  {lo/1e6:.4f}..{hi/1e6:.4f} MHz  "
               f"(spacing {BANDS[band]['spacing']/1e6:g} MHz)")
+
+    sr_ok = int(round(SAMP_RATE_HZ)) % int(round(CHIP_RATE_HZ)) == 0
+    print(f"fixed rate {SAMP_RATE_HZ/1e6:g} MHz = {SAMP_RATE_HZ/CHIP_RATE_HZ:.0f}×0.511 "
+          f"[{'OK' if sr_ok else 'FAIL'}]")
+    ok = ok and sr_ok
+
+    try:
+        import numpy as np
+    except ImportError:
+        print("(numpy absent — skipping the filter check)")
+        return 0 if ok else 1
+
+    # Channel mode: single BPSK sinc², main lobe preserved / far skirt cut.
+    base, n, _ = build_channel_buffer()
+
+    def band_p(x, lo, hi):
+        X = np.fft.fftshift(np.fft.fft(x))
+        f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
+        return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
+
+    filt, taps, fp = filter_buffer(base, passband_hz=3.0e6, trans_hz=0.3e6)
+    main = 10 * np.log10(band_p(filt, 0, CHIP_RATE_HZ) / band_p(base, 0, CHIP_RATE_HZ))
+    cut = 10 * np.log10(band_p(filt, 8e6, 20e6) / max(band_p(base, 8e6, 20e6), 1e-30))
+    peak = float(np.max(np.abs(filt)))
+    f_ok = abs(main) < 0.1 and cut < -40 and peak * AMPLITUDE < 1.0
+    print(f"filter (channel ±3 MHz, {taps} taps): main lobe {main:+.3f} dB, far skirt "
+          f"{cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} [{'OK' if f_ok else 'FAIL'}]")
+    ok = ok and f_ok
+
+    # Band mode: the whole FDMA band survives a ±5 MHz passband.
+    bb, _, _ = build_band_buffer("L1")
+    bfilt, btaps, bfp = filter_buffer(bb, passband_hz=5.0e6, trans_hz=0.3e6)
+    bkept = 10 * np.log10(band_p(bfilt, 0, bfp) / band_p(bb, 0, bfp))
+    bpeak = float(np.max(np.abs(bfilt)))
+    b_ok = abs(bkept) < 0.1 and bpeak * AMPLITUDE < 1.0
+    print(f"filter (band ±5 MHz, {btaps} taps): FDMA band {bkept:+.3f} dB, "
+          f"peak×amp {bpeak*AMPLITUDE:.2f} [{'OK' if b_ok else 'FAIL'}]")
+    ok = ok and b_ok
+
     print("ALL GLONASS CHECKS PASSED" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
@@ -204,11 +261,12 @@ def _validate_sr(samp_rate_hz: float) -> int:
     return sr // cr
 
 
-def build_channel_buffer(samp_rate_hz: float):
-    """One-channel real BPSK C/A buffer (carrier already at f_k, so baseband is
-    the code at DC). Returns (iq, n_samples, samp_per_chip). Real → I, Q = 0."""
+def build_channel_buffer():
+    """One-channel real BPSK C/A buffer at the fixed SAMP_RATE_HZ (carrier already at
+    f_k, so baseband is the code at DC). Returns (iq, n_samples, samp_per_chip). Real →
+    I, Q = 0."""
     import numpy as np
-    spc = _validate_sr(samp_rate_hz)
+    spc = _validate_sr(SAMP_RATE_HZ)
     bipolar = (1 - 2 * np.asarray(glonass_ca(), dtype=np.int8)).astype(np.float32)
     n_samples = CODE_LEN * spc                       # one 1 ms code period
     iq = np.empty(n_samples, dtype=np.complex64)
@@ -217,15 +275,15 @@ def build_channel_buffer(samp_rate_hz: float):
     return iq, n_samples, spc
 
 
-def build_band_buffer(band: str, samp_rate_hz: float):
-    """Full-band composite: all 14 channels summed at their frequency offsets
-    around the band centre. Each channel carries the same C/A code with a distinct
-    cyclic code phase (so the channels are not mutually coherent), frequency-
-    shifted to k·spacing. Two code periods (2 ms) so every offset completes a whole
-    number of cycles. Returns (iq, n_samples, samp_per_chip)."""
+def build_band_buffer(band: str):
+    """Full-band composite at the fixed SAMP_RATE_HZ: all 14 channels summed at their
+    frequency offsets around the band centre. Each channel carries the same C/A code with
+    a distinct cyclic code phase (so the channels are not mutually coherent), frequency-
+    shifted to k·spacing. Two code periods (2 ms) so every offset completes a whole number
+    of cycles. Returns (iq, n_samples, samp_per_chip)."""
     import numpy as np
-    spc = _validate_sr(samp_rate_hz)
-    sr = int(round(samp_rate_hz))
+    spc = _validate_sr(SAMP_RATE_HZ)
+    sr = int(round(SAMP_RATE_HZ))
     spacing = BANDS[band]["spacing"]
     bipolar = (1 - 2 * np.asarray(glonass_ca(), dtype=np.int8)).astype(np.float32)
 
@@ -242,23 +300,53 @@ def build_band_buffer(band: str, samp_rate_hz: float):
     return (comp / peak).astype(np.complex64), n_samples, spc
 
 
+# ── Digital passband filter (unity gain, circular → loop-preserving) ────────────────
+
+def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
+    """Blackman-Harris windowed-sinc lowpass, UNITY passband gain. Returns (h, n_taps)."""
+    import numpy as np
+    m = int(np.ceil(5.5 * SAMP_RATE_HZ / max(trans_hz, 1.0))) | 1     # odd
+    m = min(m, (max_taps | 1))
+    k = np.arange(m)
+    c = (m - 1) / 2.0
+    fcn = min(fc_hz / SAMP_RATE_HZ, 0.499)          # never above Nyquist
+    h = 2 * fcn * np.sinc(2 * fcn * (k - c))
+    n1 = m - 1
+    win = (0.35875 - 0.48829 * np.cos(2 * np.pi * k / n1)
+           + 0.14128 * np.cos(4 * np.pi * k / n1) - 0.01168 * np.cos(6 * np.pi * k / n1))
+    h = h * win
+    h = h / h.sum()                                 # unity DC (→ passband) gain
+    return h.astype(np.float64), m
+
+
+def filter_buffer(base_iq, passband_hz: float, trans_hz: float):
+    """Circularly filter the looped GLONASS buffer to a ±`passband_hz` band. Circular
+    convolution keeps the result exactly periodic (seam-free loop); unity passband gain
+    leaves the kept content's power unchanged. Returns (filtered_iq, n_taps,
+    passband_edge_hz)."""
+    import numpy as np
+    fp = float(passband_hz)
+    fc = fp + trans_hz / 2.0
+    n = len(base_iq)
+    h, m = _design_lowpass(fc, trans_hz, n // 2)
+    filtered = np.fft.ifft(np.fft.fft(base_iq) * np.fft.fft(h, n)).astype(np.complex64)
+    return filtered, m, fp
+
+
 # ── Flowgraph ──────────────────────────────────────────────────────────────────
 
-def _build_top_block(iq_path, center_freq_hz, samp_rate_hz, gain_db, amplitude,
-                     otw_format, extra_args):
+def _build_top_block(iq_path, center_freq_hz, gain_db, amplitude):
     from gnuradio import gr, blocks, uhd
 
     class GlonassTx(gr.top_block):
         def __init__(self):
             super().__init__("GLONASS OF TX")
-            args = (f"master_clock_rate={samp_rate_hz:.0f},"
+            args = (f"master_clock_rate={SAMP_RATE_HZ:.0f},"
                     "num_send_frames=512,send_frame_size=16000")
-            if extra_args:
-                args += "," + extra_args
             self.usrp = uhd.usrp_sink(
-                args, uhd.stream_args(cpu_format="fc32", otw_format=otw_format,
+                args, uhd.stream_args(cpu_format="fc32", otw_format=OTW_FORMAT,
                                       channels=[0]))
-            self.usrp.set_samp_rate(samp_rate_hz)
+            self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
             self.src = blocks.file_source(gr.sizeof_gr_complex, iq_path, repeat=True)
@@ -267,6 +355,7 @@ def _build_top_block(iq_path, center_freq_hz, samp_rate_hz, gain_db, amplitude,
 
         def set_amplitude(self, a): self.amp.set_k(a)
         def set_gain(self, g): self.usrp.set_gain(g, 0)
+        def swap_file(self, path): self.src.open(path, True)
         def actual_gain(self): return self.usrp.get_gain(0)
         def actual_samp_rate(self): return self.usrp.get_samp_rate()
 
@@ -277,42 +366,46 @@ def _build_top_block(iq_path, center_freq_hz, samp_rate_hz, gain_db, amplitude,
 
 def build_script() -> Script:
     return (
-        Script("GLONASS L1OF/L2OF (FDMA) transmitter — one channel or the whole "
-               "band, real 511-chip C/A code, file-replay. Transmit only into an "
-               "authorised, shielded setup.")
+        Script("GLONASS L1OF/L2OF (FDMA) transmitter — one channel or the whole band, real "
+               "511-chip C/A code — fixed 61.32 MHz / sc8, looped buffer, optional "
+               "power-preserving digital passband filter. Level is set in dBm via the unit's "
+               "calibration; uncalibrated it runs on a relative gain. Authorised, shielded "
+               "setups only.")
         .choice("-Band", "--band", options=["L1", "L2"], default="L1",
-                help="L1OF (~1602 MHz) or L2OF (~1246 MHz). Fixed per run.")
+                help="L1OF (~1602 MHz) or L2OF (~1246 MHz) — sets the carrier band. "
+                     "Fixed per run.")
         .choice("-Mode", "--mode", options=["channel", "band"], default="channel",
-                help="channel = one satellite on its FDMA carrier; band = all 14 "
-                     "channels summed around the band centre. Fixed per run.")
+                help="channel = one satellite on its FDMA carrier; band = all 14 channels "
+                     "summed around the band centre. Fixed per run.")
         .integer("-Channel", "--channel", min=K_MIN, max=K_MAX, default=0,
-                 help="FDMA channel number k (−7..+6). Sets the carrier in channel "
-                      "mode; ignored in band mode. Fixed per run.")
+                 help="FDMA channel number k (−7..+6) — sets the carrier in channel mode "
+                      "(base + k·spacing); ignored in band mode. Fixed per run.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
-                help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
-                     "unit's calibration when present (e.g. EIRP), else the baked "
-                     "SDR-port scale. Ignored if --gain is given (relative wins). Live.")
-        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False,
-                live=True,
-                help="RF output on/off. OFF mutes the signal (gain AND baseband "
-                     "amplitude to 0); ON restores them. Change the power (or the "
-                     "calibration gain) while OFF and it takes effect when you turn ON.")
-        # RELATIVE power (also the calibration knob): raw TX gain (dB), bypassing the dBm
-        # mapping. No default, so its PRESENCE selects relative mode and overrides --power.
+                help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
+                     "calibration and snaps to its achievable grid; ignored if --gain is "
+                     "given. Live.")
         .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
                 required=False, live=True,
-                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
-                     "bypassing the dBm calibration. When given, overrides --power. Live.")
-        .number("-Sample-rate", "--samp_rate", unit="MHz", min=5.11, max=61.44,
-                default=0.0,
-                help="Host/DAC sample rate; master clock pinned equal to it (1:1). "
-                     "Leave 0 for the mode default (channel 10.22, band 12.264 MHz). "
-                     "Must be a multiple of 0.511 MHz. Fixed per run.")
-        .choice("-OTW-format", "--otw", options=["sc8", "sc16"], default="sc8",
-                help="Over-the-wire sample format. sc8 halves USB load; the C/A "
-                     "signal is constant-modulus so sc8 is ideal (band mode is "
-                     "multi-level, sc16 optional there).")
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
+        .choice("-Filter", "--filter", options=["off", "on"], default="off",
+                required=False, live=True,
+                help="Digital passband filter on the looped buffer (unity passband gain, so "
+                     "it preserves what it passes). Live.")
+        .number("-Passband", "--passband", unit="MHz",
+                min=MIN_PASSBAND_MHZ, max=MAX_PASSBAND_MHZ, default=5.0,
+                presets=PASSBAND_PRESETS, required=False, live=True,
+                help="Passband half-bandwidth kept each side of the carrier (MHz). Default 5 "
+                     "keeps the whole FDMA band (band mode) or the main lobe + sidelobes "
+                     "(channel mode). Live (rebuilds the filtered loop).")
+        .number("-Transition", "--transition", unit="MHz", min=0.05, max=5.0, default=0.3,
+                required=False, live=True,
+                help="Filter skirt transition width beyond the passband edge (MHz) — the "
+                     "steepness knob. Live (rebuilds the filtered loop).")
+        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
+                     "restores them. Live.")
     )
 
 
@@ -329,45 +422,18 @@ def main() -> int:
     script = build_script()
     args = script.parse()
     band, mode = args.band, args.mode
+    center_freq_hz = BANDS[band]["base"] if mode == "band" else channel_freq(band, args.channel)
 
-    # Resolve sample rate: 0 → mode default.
-    if args.samp_rate <= 0:
-        samp_rate_hz = BAND_DEFAULT_SR if mode == "band" else BANDS[band]["chan_default_sr"]
-    else:
-        samp_rate_hz = args.samp_rate * 1e6
-
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="glonass_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
-
-    try:
-        if mode == "band":
-            iq, nsamp, spc = build_band_buffer(band, samp_rate_hz)
-            center = BANDS[band]["base"]
-            desc = f"{band}OF band composite (k {K_MIN}..{K_MAX}, 14 channels)"
-        else:
-            iq, nsamp, spc = build_channel_buffer(samp_rate_hz)
-            center = channel_freq(band, args.channel)
-            desc = f"{band}OF channel k={args.channel}"
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-
-    iq_path = os.path.join(tmpdir, f"glonass_{band}_{mode}.fc32")
-    iq.tofile(iq_path)
-    print(f"[prebuilt] {desc} → {nsamp} samples ({spc} samp/chip, "
-          f"{nsamp*8/1e6:.1f} MB) → {iq_path}")
-
-    # Power map: the unit's injected calibration curve if present, else the baked
-    # constants above. A raw --gain (relative) overrides the dBm mapping when present.
     pmap = power_map()
     amplitude = pmap.amplitude
-    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+
+    # Gain precedence: explicit --gain (raw) > calibrated --power (folded at the carrier) > refuse.
+    gain_cal = getattr(args, "gain", None)
     if gain_cal is not None:
         gain_db = float(gain_cal)
-    elif power_map().has_absolute:                  # calibrated: the authored absolute --power
-        gain_db = power_map().gain_for_power(args.power)
-    else:                                           # uncalibrated: a persisted fallback gain, or refuse
+    elif pmap.has_absolute:
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
+    else:
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
             print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
@@ -376,56 +442,97 @@ def main() -> int:
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
-    tb = _build_top_block(iq_path, center, samp_rate_hz, gain_db, amplitude,
-                          args.otw, "")
+    if mode == "band":
+        base_iq, nsamp, spc = build_band_buffer(band)
+        desc = f"{band}OF band composite (k {K_MIN}..{K_MAX}, 14 channels)"
+    else:
+        base_iq, nsamp, spc = build_channel_buffer()
+        desc = f"{band}OF channel k={args.channel}"
 
-    # RF on/off state + the gain RF-on applies. Starting with --rf off builds the flow
-    # muted; power/gain edits made while OFF are staged and reach the radio only on --rf on.
+    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    tmpdir = tempfile.mkdtemp(prefix="glonass_", dir=shm)
+    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+
+    def write_buffer(iq) -> str:
+        fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
+        os.close(fd)
+        iq.tofile(path)
+        return path
+
+    shape = {"on": getattr(args, "filter", "off") == "on",
+             "passband_hz": float(getattr(args, "passband", 5.0) or 5.0) * 1e6,
+             "trans_hz": float(getattr(args, "transition", 0.3) or 0.3) * 1e6}
+
+    def make_current():
+        if not shape["on"]:
+            return base_iq, {"on": False}
+        filtered, taps, fp = filter_buffer(base_iq, shape["passband_hz"], shape["trans_hz"])
+        return filtered, {"on": True, "taps": taps, "edge_hz": fp,
+                          "trans_hz": shape["trans_hz"]}
+
+    iq0, finfo = make_current()
+    box = {"file": write_buffer(iq0)}
+
+    tb = _build_top_block(box["file"], center_freq_hz, gain_db, amplitude)
+
+    def regenerate():
+        iq, info = make_current()
+        new_file = write_buffer(iq)
+        tb.swap_file(new_file)
+        old, box["file"] = box["file"], new_file
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
+        return info
+
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
     if not state["rf_on"]:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
 
+    def _fmt_band(info):
+        if not info.get("on"):
+            return "off (full signal)"
+        return (f"on — passband ±{info['edge_hz']/1e6:.2f} MHz, "
+                f"{info['trans_hz']/1e6:g} MHz transition, {info['taps']} taps")
+
     print("── GLONASS OF TX ───────────────────────────────────────────")
     print(f"  signal         : {desc}")
-    print(f"  carrier        : {center/1e6:.4f} MHz"
+    print(f"  carrier        : {center_freq_hz/1e6:.4f} MHz"
           + ("  (band centre)" if mode == "band" else f"  (channel {args.channel})"))
-    print(f"  sample rate    : requested {samp_rate_hz/1e6:g} MHz, "
-          f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
+    print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  code           : 511-chip C/A @ 0.511 Mcps (BPSK)")
-    if power_map().has_absolute:
-        print(f"  power (target) : {args.power:g} dBm  ({power_map().label})")
-    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
-          f"amplitude {amplitude:g}")
-    print(f"  calibration    : {pmap.source}")
-    if pmap.warning:                       # calibration measured at another amplitude
+    print(f"  buffer         : {nsamp} samples ({spc} samp/chip, {nsamp*8/1e6:.1f} MB)")
+    if pmap.has_absolute:
+        print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+        print(f"  power (achieved on grid): "
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
+    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), amplitude {amplitude:g}")
+    print(f"  calibration    : {pmap.describe()}")
+    if pmap.warning:
         print(f"  ⚠ CALIBRATION  : {pmap.warning}")
-    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    print(f"  otw            : {args.otw}")
+    print(f"  filter         : {_fmt_band(finfo)}")
+    print(f"  otw            : {OTW_FORMAT}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
     ctrl = script.live_control(args)
 
     def apply_change(name, value):
-        # power/gain edits stage into state["gain"] and reach the radio only when RF is on;
-        # --rf mutes/restores gain AND amplitude.
-        if name == "power":
-            state["gain"] = pmap.gain_for_power(float(value))
+        if name == "power" and pmap.has_absolute:
+            state["gain"] = pmap.gain_for_power(float(value), freq=center_freq_hz)
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
-            else:
-                ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
+            ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=center_freq_hz), 2))
         elif name == "gain":
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("gain", round(tb.actual_gain(), 2))
-            else:
-                ctrl.report("gain", round(state["gain"], 2))
+            ctrl.report("gain", round(state["gain"], 2))
         elif name == "rf":
             on = str(value).strip().lower() in ("on", "1", "true", "yes")
             state["rf_on"] = on
@@ -436,6 +543,16 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
+        elif name in ("filter", "passband", "transition"):
+            if name == "filter":
+                shape["on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
+            elif name == "passband":
+                shape["passband_hz"] = max(MIN_PASSBAND_MHZ, min(MAX_PASSBAND_MHZ,
+                                                                 float(value))) * 1e6
+            else:
+                shape["trans_hz"] = float(value) * 1e6
+            regenerate()
+            ctrl.report(name, value)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
