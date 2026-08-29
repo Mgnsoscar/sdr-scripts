@@ -31,13 +31,19 @@ not noise. So this uses the same real-time streaming path gps_l2p_tx.py uses for
     fleet's proven device path, no custom block, no loop. The FIFO + the radio's own
     buffering ride out scheduler jitter.
 
-Throughput — still runtime-generated, but light (no FFT)
-────────────────────────────────────────────────────────
-The only per-sample cost is the Gaussian draw, so this sustains far more than the filtered
-version — tens of MS/s on a desktop, and a healthy chunk of that on a Pi. It is still
-CPU-bound, though: past what the host can draw, the FIFO starves and the radio underflows
-("U…"). Measure YOUR unit's ceiling with `--dry-run` (it reports sustained MS/s and the
-×real-time factor) and drop `--samp_rate` if it can't keep up.
+Throughput — runtime-generated, parallelised across cores
+─────────────────────────────────────────────────────────
+The only per-sample cost is the Gaussian draw (no FFT), and numpy's draw releases the GIL,
+so the producer runs several worker threads that draw independent blocks on separate cores
+— for noise, block order doesn't matter, so this is embarrassingly parallel — and a single
+writer feeds them to the radio with a zero-copy write. Workers default to (cores − 1); set
+SDR_NOISE_WORKERS to override (fewer can stream more smoothly if the radio's threads starve).
+
+It is still CPU-bound: past what the host sustains, the FIFO starves and the radio underflows
+("U…"). Measure YOUR unit's real ceiling with `--dry-run` — it runs the ACTUAL producer
+through a real pipe drained by a reader (not a bare generate loop), so its number predicts
+hardware — and keep headroom (UHD's USB + GNU Radio threads also want CPU): run comfortably
+below the ×real-time it reports, not right at it.
 
 Level / calibration (same plumbing as the PRN scripts)
 ──────────────────────────────────────────────────────
@@ -58,6 +64,7 @@ CLI
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import sys
 import threading
@@ -135,25 +142,83 @@ def _block_len(fs: float) -> int:
 
 
 class NoiseSource:
-    """Continuous unit-power complex white-Gaussian source. Each pull draws fresh samples
-    (the RNG advances → never repeats); consecutive blocks are independent white noise, so
-    they join with no seam by construction (no filter state to carry)."""
+    """Unit-power complex white-Gaussian generator. `draw(rng)` produces one independent
+    block; consecutive/parallel blocks are independent white noise, so they join with no
+    seam (there's no filter state to carry — which is also why generation parallelises)."""
 
     def __init__(self, fs: float, seed=None):
         if np is None:
             raise RuntimeError("numpy is required to generate noise")
         self.block = _block_len(fs)
-        self.rng = np.random.default_rng(seed)
+        self._rng = np.random.default_rng(seed)          # for next_block() / the self-test
 
-    def next_block(self):
-        """The next `self.block` unit-power complex64 samples (float32 draws — the noise
-        draw is the only cost, so this sustains a high sample rate)."""
+    def draw(self, rng):
+        """One block of `self.block` unit-power complex64 samples, drawn with `rng` (float32
+        draws — the draw is the only cost, so it sustains a high rate)."""
         n = self.block
         z = np.empty(n, dtype=np.complex64)
-        z.real = self.rng.standard_normal(n, dtype=np.float32)
-        z.imag = self.rng.standard_normal(n, dtype=np.float32)
+        z.real = rng.standard_normal(n, dtype=np.float32)
+        z.imag = rng.standard_normal(n, dtype=np.float32)
         z *= np.float32(0.70710678)                      # unit power: var(I)+var(Q)=1
         return z
+
+    def next_block(self):
+        return self.draw(self._rng)
+
+
+def _n_workers() -> int:
+    """Number of generator worker threads. numpy's Gaussian draw releases the GIL, so N
+    threads draw ~N× faster on N cores — the key to sustaining a wide band. Defaults to
+    (cores − 1) to leave a core for UHD's USB + GNU Radio threads; override with the
+    SDR_NOISE_WORKERS env var."""
+    env = os.environ.get("SDR_NOISE_WORKERS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    return max(1, (os.cpu_count() or 2) - 1)
+
+
+class _ParallelProducer:
+    """N worker threads draw independent noise blocks into a bounded queue; a single consumer
+    pulls finished blocks (order is irrelevant for noise) and writes them to the radio — so
+    the CPU-bound generation runs across cores while the write to the FIFO stays serial."""
+
+    def __init__(self, src: "NoiseSource", n_workers: int, prebuffer: int = 8):
+        self.src = src
+        self.q: "queue.Queue" = queue.Queue(maxsize=max(2, prebuffer))
+        self._stop = threading.Event()
+        self._threads = [threading.Thread(target=self._work, daemon=True)
+                         for _ in range(max(1, n_workers))]
+
+    def _work(self):
+        rng = np.random.default_rng()                    # OS entropy → independent per worker
+        while not self._stop.is_set():
+            z = self.src.draw(rng)
+            while not self._stop.is_set():
+                try:
+                    self.q.put(z, timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+
+    def start(self):
+        for t in self._threads:
+            t.start()
+
+    def get(self, timeout: float = 0.5):
+        return self.q.get(timeout=timeout)
+
+    def stop(self):
+        self._stop.set()
+        try:
+            while True:
+                self.q.get_nowait()                      # unblock any worker stuck on put()
+        except queue.Empty:
+            pass
+        for t in self._threads:
+            t.join(timeout=1.0)
 
 
 # ── parameter schema ────────────────────────────────────────────────────────────────
@@ -268,13 +333,15 @@ def main() -> int:
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
     src = NoiseSource(samp_rate_hz)
+    n_workers = _n_workers()
 
     print("── White-noise TX ───────────────────────────────────────────")
     print(f"  carrier        : {float(args.freq)/1e6:.3f} MHz  (LO offset {args.lo_offset:g} MHz)")
     print(f"  sample rate    : {samp_rate_hz/1e6:g} MHz (1:1 master clock)")
     print(f"  noise band     : full ±{samp_rate_hz/2e6:g} MHz (white; shaped only by the "
           f"AD9361 analog filter)")
-    print(f"  block          : {src.block} samples")
+    print(f"  generator      : {n_workers} worker thread(s)  (SDR_NOISE_WORKERS to override), "
+          f"block {src.block} samples")
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), amplitude {amplitude:g}")
@@ -334,19 +401,7 @@ def main() -> int:
     deadline = (time.monotonic() + duration) if duration > 0 else None
 
     if dry_run:
-        import queue
-        q: "queue.Queue" = queue.Queue(maxsize=20)
-
-        def producer_q():
-            while not state["stop"]:
-                try:
-                    q.put(src.next_block(), timeout=1.0)
-                except queue.Full:
-                    if state["stop"]:
-                        break
-        prod = threading.Thread(target=producer_q, daemon=True)
-        prod.start()
-        return _dry_run_consumer(q, state, stop_evt, apply_live, deadline, samp_rate_hz, prod)
+        return _dry_run(src, samp_rate_hz, n_workers, stop_evt)
 
     # ── real hardware: usrp_sink fed by a FIFO (the gps_l2p_tx.py path) ──
     import fcntl
@@ -357,7 +412,9 @@ def main() -> int:
     fifo_path = os.path.join(tmpdir, "iq.fifo")
     os.mkfifo(fifo_path)
 
-    def producer_fifo():
+    producer = _ParallelProducer(src, n_workers)
+
+    def writer_fifo():
         try:
             fd = os.open(fifo_path, os.O_WRONLY)          # blocks until file_source opens read end
         except OSError:
@@ -366,18 +423,24 @@ def main() -> int:
             fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 1 << 20)  # ~1 MB pipe buffer (best effort)
         except (OSError, AttributeError):
             pass
+        producer.start()                                  # workers draw noise across cores
         try:
             while not stop_evt.is_set() and not state["stop"]:
-                os.write(fd, src.next_block().tobytes())  # fresh unit-power white noise
+                try:
+                    z = producer.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                os.write(fd, memoryview(z))               # zero-copy raw bytes → FIFO
         except (BrokenPipeError, OSError):
             pass
         finally:
+            producer.stop()
             try:
                 os.close(fd)
             except OSError:
                 pass
 
-    prod = threading.Thread(target=producer_fifo, daemon=True)
+    prod = threading.Thread(target=writer_fifo, daemon=True)
     prod.start()
 
     class _NoiseTx(gr.top_block):
@@ -449,31 +512,75 @@ def main() -> int:
     return 0
 
 
-def _dry_run_consumer(q, state, stop_evt, apply_live, deadline, samp_rate_hz, prod) -> int:
-    """No radio: drain the producer, measure sustained throughput vs real-time — proves the
-    generation + threading path keeps up off-hardware."""
-    print("[dry-run] no UHD; draining the producer and measuring throughput …")
-    t0 = time.perf_counter(); samples = 0; nbuf = 0; min_fill = 1 << 30
-    warmup = 3
-    while not stop_evt.is_set():
-        apply_live()
-        buf = q.get()
-        nbuf += 1
-        if nbuf > warmup:
-            samples += buf.size
-        min_fill = min(min_fill, q.qsize())
-        if deadline is not None and time.monotonic() >= deadline:
+def _dry_run(src, samp_rate_hz, n_workers, stop_evt) -> int:
+    """No radio, but HONEST: run the REAL parallel producer into a REAL pipe, drained by a
+    reader (modelling the radio consuming), and measure the rate actually delivered through
+    the pipe — generation + the zero-copy write + thread contention all included. That's why
+    its verdict predicts hardware, where a bare 'how fast can I generate' loop does not."""
+    import fcntl
+    print(f"[dry-run] no UHD; {n_workers} generator worker(s) → real pipe, measuring the "
+          f"sustained delivered rate …")
+    r, w = os.pipe()
+    try:
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 1 << 20)
+    except (OSError, AttributeError):
+        pass
+    producer = _ParallelProducer(src, n_workers)
+    done = threading.Event()
+
+    def writer():
+        producer.start()
+        try:
+            while not done.is_set():
+                try:
+                    z = producer.get(timeout=0.3)
+                except queue.Empty:
+                    continue
+                os.write(w, memoryview(z))
+        except (OSError, BrokenPipeError):
+            pass
+
+    wt = threading.Thread(target=writer, daemon=True)
+    wt.start()
+
+    # warm up (workers spin up, pipe fills), then measure the sustained drained rate.
+    t_warm = time.perf_counter() + 0.6
+    while time.perf_counter() < t_warm and not stop_evt.is_set():
+        os.read(r, 1 << 20)
+    t0 = time.perf_counter(); nbytes = 0
+    t_end = t0 + 2.5
+    while time.perf_counter() < t_end and not stop_evt.is_set():
+        b = os.read(r, 1 << 20)
+        if not b:
             break
-        if nbuf >= 300:
-            break
+        nbytes += len(b)
     dt = time.perf_counter() - t0
-    state["stop"] = True
-    prod.join(timeout=2.0)
-    if samples and dt > 0:
-        msps = samples / dt / 1e6
-        print(f"[dry-run] {nbuf} blocks, sustained ~{msps:.1f} Msps "
-              f"({msps / (samp_rate_hz / 1e6):.1f}x real-time), min prebuffer fill {min_fill}")
-    print("[dry-run] OK")
+
+    done.set()
+    try:
+        os.close(r)                                       # unblocks a blocked writer (EPIPE)
+    except OSError:
+        pass
+    producer.stop()
+    wt.join(timeout=1.0)
+    try:
+        os.close(w)
+    except OSError:
+        pass
+
+    msps = (nbytes / 8) / dt / 1e6 if dt > 0 else 0.0     # complex64 = 8 bytes/sample
+    ratio = msps / (samp_rate_hz / 1e6) if samp_rate_hz > 0 else 0.0
+    if ratio >= 2.0:
+        verdict = "comfortable headroom — should stream cleanly"
+    elif ratio >= 1.3:
+        verdict = "MARGINAL — likely to underflow on hardware; lower --samp_rate or add workers"
+    else:
+        verdict = "TOO SLOW — will underflow; lower --samp_rate (or raise SDR_NOISE_WORKERS)"
+    print(f"[dry-run] sustained ~{msps:.1f} Msps through the pipe = {ratio:.1f}x the "
+          f"{samp_rate_hz/1e6:g} MHz sample rate")
+    print(f"[dry-run] {verdict}")
+    print("[dry-run] note: UHD's USB + GNU Radio threads also need CPU on the real unit, so "
+          "keep headroom — run comfortably below this ceiling, not right at it.")
     return 0
 
 

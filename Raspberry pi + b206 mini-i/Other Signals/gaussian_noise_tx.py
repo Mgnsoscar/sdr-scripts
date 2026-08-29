@@ -39,12 +39,15 @@ DIGITAL filter on the IQ, independent of the master clock; there is no analog-fi
 Throughput — this is RUNTIME DSP, so the sample rate is CPU-bound
 ────────────────────────────────────────────────────────────────
 A non-looping stream can't be pre-filtered, so the noise draw + FFT filter run live in the
-producer, and the FFT is the limiter. A fast desktop sustains ~10–15 MS/s; a Raspberry Pi
-(slower numpy) sustains only low single-digit MS/s. Past that the FIFO starves and the
-radio underflows ("U…"). So run at a rate your unit can hold — the defaults are modest for
-that reason. Measure YOUR unit's ceiling with `--dry-run` (it reports sustained MS/s and
-the ×real-time factor); if it's under ~1.5× real-time, drop `--samp_rate`, widen
-`--transition` (fewer taps), or narrow `--bandwidth`.
+producer, and the FFT is the limiter (and, being sequential overlap-save, single-threaded —
+the white_noise_tx.py sibling has no filter and parallelises across cores for far higher
+rates). A fast desktop sustains ~10–15 MS/s; a Raspberry Pi (slower numpy) sustains only low
+single-digit MS/s. Past that the FIFO starves and the radio underflows ("U…"), so the
+defaults are modest. Measure YOUR unit's real ceiling with `--dry-run` — it runs the ACTUAL
+producer through a real pipe (not a bare generate loop), so its ×real-time verdict predicts
+hardware — and keep headroom (UHD's USB + GNU Radio threads also want CPU): if it's not
+comfortably above 1×, drop `--samp_rate`, widen `--transition` (fewer taps), or narrow
+`--bandwidth`.
 
 Level / calibration (same plumbing as the PRN scripts)
 ──────────────────────────────────────────────────────
@@ -431,19 +434,7 @@ def main() -> int:
     deadline = (time.monotonic() + duration) if duration > 0 else None
 
     if dry_run:
-        import queue
-        q: "queue.Queue" = queue.Queue(maxsize=20)
-
-        def producer_q():
-            while not state["stop"]:
-                try:
-                    q.put(src.next_block(), timeout=1.0)
-                except queue.Full:
-                    if state["stop"]:
-                        break
-        prod = threading.Thread(target=producer_q, daemon=True)
-        prod.start()
-        return _dry_run_consumer(q, state, stop_evt, apply_live, deadline, samp_rate_hz, prod)
+        return _dry_run(src, samp_rate_hz, stop_evt)
 
     # ── real hardware: usrp_sink fed by a FIFO (the gps_l2p_tx.py path) ──
     import fcntl
@@ -465,7 +456,7 @@ def main() -> int:
             pass
         try:
             while not stop_evt.is_set() and not state["stop"]:
-                os.write(fd, src.next_block().tobytes())  # fresh band-limited unit-power noise
+                os.write(fd, memoryview(src.next_block()))  # zero-copy band-limited noise
         except (BrokenPipeError, OSError):
             pass
         finally:
@@ -546,31 +537,70 @@ def main() -> int:
     return 0
 
 
-def _dry_run_consumer(q, state, stop_evt, apply_live, deadline, samp_rate_hz, prod) -> int:
-    """No radio: drain the producer, measure sustained throughput vs real-time — proves the
-    generation + filtering + threading path keeps up off-hardware."""
-    print("[dry-run] no UHD; draining the producer and measuring throughput …")
-    t0 = time.perf_counter(); samples = 0; nbuf = 0; min_fill = 1 << 30
-    warmup = 3
-    while not stop_evt.is_set():
-        apply_live()
-        buf = q.get()
-        nbuf += 1
-        if nbuf > warmup:
-            samples += buf.size
-        min_fill = min(min_fill, q.qsize())
-        if deadline is not None and time.monotonic() >= deadline:
+def _dry_run(src, samp_rate_hz, stop_evt) -> int:
+    """No radio, but HONEST: run the REAL producer (generate + overlap-save filter + the
+    zero-copy write) into a REAL pipe, drained by a reader modelling the radio, and measure
+    the rate actually delivered. The filter is sequential (overlap-save state), so this is
+    single-threaded — its ceiling is the runtime FFT. Its verdict predicts hardware, unlike a
+    bare drain loop."""
+    import queue
+    import fcntl
+    print("[dry-run] no UHD; real producer (generate + filter) → real pipe, measuring the "
+          "sustained delivered rate …")
+    r, w = os.pipe()
+    try:
+        fcntl.fcntl(w, fcntl.F_SETPIPE_SZ, 1 << 20)
+    except (OSError, AttributeError):
+        pass
+    done = threading.Event()
+
+    def writer():
+        try:
+            while not done.is_set():
+                os.write(w, memoryview(src.next_block()))
+        except (OSError, BrokenPipeError):
+            pass
+    wt = threading.Thread(target=writer, daemon=True)
+    wt.start()
+
+    t_warm = time.perf_counter() + 0.6
+    while time.perf_counter() < t_warm and not stop_evt.is_set():
+        os.read(r, 1 << 20)
+    t0 = time.perf_counter(); nbytes = 0
+    t_end = t0 + 2.5
+    while time.perf_counter() < t_end and not stop_evt.is_set():
+        b = os.read(r, 1 << 20)
+        if not b:
             break
-        if nbuf >= 200:
-            break
+        nbytes += len(b)
     dt = time.perf_counter() - t0
-    state["stop"] = True
-    prod.join(timeout=2.0)
-    if samples and dt > 0:
-        msps = samples / dt / 1e6
-        print(f"[dry-run] {nbuf} blocks, sustained ~{msps:.1f} Msps "
-              f"({msps / (samp_rate_hz / 1e6):.1f}x real-time), min prebuffer fill {min_fill}")
-    print("[dry-run] OK")
+
+    done.set()
+    try:
+        os.close(r)
+    except OSError:
+        pass
+    wt.join(timeout=1.0)
+    try:
+        os.close(w)
+    except OSError:
+        pass
+
+    msps = (nbytes / 8) / dt / 1e6 if dt > 0 else 0.0     # complex64 = 8 bytes/sample
+    ratio = msps / (samp_rate_hz / 1e6) if samp_rate_hz > 0 else 0.0
+    if ratio >= 2.0:
+        verdict = "comfortable headroom — should stream cleanly"
+    elif ratio >= 1.3:
+        verdict = ("MARGINAL — likely to underflow on hardware; lower --samp_rate, widen "
+                   "--transition, or narrow --bandwidth")
+    else:
+        verdict = ("TOO SLOW — will underflow; lower --samp_rate, widen --transition, or "
+                   "narrow --bandwidth")
+    print(f"[dry-run] sustained ~{msps:.1f} Msps through the pipe = {ratio:.1f}x the "
+          f"{samp_rate_hz/1e6:g} MHz sample rate")
+    print(f"[dry-run] {verdict}")
+    print("[dry-run] note: UHD's USB + GNU Radio threads also need CPU on the real unit, so "
+          "keep headroom — run comfortably below this ceiling, not right at it.")
     return 0
 
 
