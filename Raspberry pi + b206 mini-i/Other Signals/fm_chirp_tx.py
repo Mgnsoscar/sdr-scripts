@@ -368,9 +368,37 @@ def build_script() -> Script:
                "/ sc8, looped buffer, optional power-preserving digital passband filter. Level "
                "is set in dBm via the unit's calibration; uncalibrated it runs on a relative "
                "gain. Authorised, shielded setups only.")
+        # The sweep band is entered one of two ways; the mode reveals its own fields.
+        .choice("-Band-mode", "--band-mode",
+                options={"Centre + width": "center_bw", "Start / stop": "start_stop"},
+                default="center_bw", required=False,
+                help="How the sweep band is entered: a centre carrier + width, or absolute "
+                     "start/stop edges (carrier = their midpoint, width = their span). Fixed "
+                     "at launch.")
+        # ── center_bw mode ──────────────────────────────────────────────────────────
         .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
-                presets=FREQUENCIES, default=1575.42, required=True, live=True,
+                presets=FREQUENCIES, default=1575.42, required=False, live=True,
+                show_when={"band_mode": "center_bw"},
                 help="RF carrier in MHz. Live.")
+        # ── start_stop mode ─────────────────────────────────────────────────────────
+        .number("-Start-frequency", "--start", unit="MHz", min=70.0, max=6000.0,
+                step=0.01, default=1570.42, required=False, live=True,
+                show_when={"band_mode": "start_stop"},
+                help="Sweep start — the low RF edge, in MHz. Live.")
+        .number("-Stop-frequency", "--stop", unit="MHz", min=70.0, max=6000.0,
+                step=0.01, default=1580.42, required=False, live=True,
+                show_when={"band_mode": "start_stop"},
+                help="Sweep stop — the high RF edge, in MHz. Live.")
+        .derived("-Carrier", name="band_center", unit="MHz",
+                 formula={"center": ["start", "stop"]}, is_freq=True,
+                 show_when={"band_mode": "start_stop"},
+                 help="Carrier the LO tunes to = midpoint of start/stop. Power is calibrated "
+                      "here.")
+        .derived("-Sweep-width", name="band_span", unit="MHz",
+                 formula={"span": ["start", "stop"]}, min=0.001, max=MAX_SWEEP_BW_MHZ,
+                 show_when={"band_mode": "start_stop"},
+                 help="Resulting sweep width = stop − start. Must stay within the SDR's "
+                      "maximum sweep width.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -384,7 +412,7 @@ def build_script() -> Script:
                 required=True, live=True,
                 help="Sweep shape. Live (regenerates the loop).")
         .number("-Sweep-BW", "--bw", unit="MHz", min=0.001, max=MAX_SWEEP_BW_MHZ, default=20.0,
-                required=True, live=True,
+                required=False, live=True, show_when={"band_mode": "center_bw"},
                 help="Peak-to-peak sweep width; f sweeps ±bw/2 around the carrier. Live "
                      "(regenerates the loop).")
         .number("-Sweep-rate", "--rate", unit="kHz", min=0.1, max=5000.0,
@@ -414,6 +442,32 @@ def build_script() -> Script:
     )
 
 
+# ── Band resolution (center+width ↔ start/stop) ───────────────────────────────────
+
+def resolve_band(band_mode: str, freq, bw, start, stop):
+    """Resolve the sweep band from whichever mode is selected into a canonical
+    (center_freq_hz, sweep_bw_hz). In 'start_stop' the carrier is the midpoint and the
+    width is the span; in 'center_bw' they are given directly. Raises ValueError with a
+    clear message on an unusable band (missing edges, zero/negative or over-wide span) —
+    the same conditions the GUI flags live via the derived width field."""
+    if band_mode == "start_stop":
+        if start is None or stop is None:
+            raise ValueError("start_stop mode needs both --start and --stop (MHz).")
+        lo, hi = sorted((float(start), float(stop)))
+        span = hi - lo
+        if span <= 0:
+            raise ValueError("--start and --stop must differ (the sweep has zero width).")
+        if span > MAX_SWEEP_BW_MHZ:
+            raise ValueError(
+                f"start/stop span {span:g} MHz exceeds the maximum sweep width "
+                f"{MAX_SWEEP_BW_MHZ:g} MHz — narrow the start/stop range.")
+        return (lo + hi) / 2.0 * 1e6, span * 1e6
+    # center_bw (default)
+    if freq is None or bw is None:
+        raise ValueError("center_bw mode needs --freq and --bw (MHz).")
+    return float(freq) * 1e6, float(bw) * 1e6
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -426,7 +480,14 @@ def main() -> int:
 
     script = build_script()
     args = script.parse()
-    center_freq_hz = args.freq * 1e6
+    try:
+        center_freq_hz, sweep_bw_hz = resolve_band(
+            getattr(args, "band_mode", "center_bw"),
+            getattr(args, "freq", None), getattr(args, "bw", None),
+            getattr(args, "start", None), getattr(args, "stop", None))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
     # else it runs uncalibrated — a relative gain only (no baked behaviour).
     pmap = power_map()
@@ -460,8 +521,10 @@ def main() -> int:
         return path
 
     # Current "shape" (the regeneration-requiring params) — mutated by live changes.
+    # bw_hz comes from resolve_band (either --bw directly, or the start/stop span).
+    band_mode = getattr(args, "band_mode", "center_bw")
     shape = {"waveform": args.waveform,
-             "bw_hz": args.bw * 1e6,
+             "bw_hz": sweep_bw_hz,
              "rate_hz": args.rate * 1e3,               # --rate is in kHz
              "filter_on": getattr(args, "filter", "off") == "on",
              "width_hz": float(getattr(args, "passband", 30.0) or 30.0) * 1e6,  # total width
@@ -492,7 +555,8 @@ def main() -> int:
     # a live retune can re-map --power at the new frequency on a frequency-dependent chain.
     _target_power = args.power if (pmap.has_absolute and gain_cal is None) else None
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db,
-             "freq": center_freq_hz, "power": _target_power}
+             "freq": center_freq_hz, "power": _target_power,
+             "start": getattr(args, "start", None), "stop": getattr(args, "stop", None)}
     if not state["rf_on"]:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
@@ -517,10 +581,14 @@ def main() -> int:
                 f"{info['trans_hz']/1e6:g} MHz transition, {info['taps']} taps")
 
     print("── FM chirp TX ─────────────────────────────────────────────")
+    print(f"  band mode      : {band_mode}")
     print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz  (LO offset {args.lo_offset:g} MHz)")
+    if band_mode == "start_stop":
+        _lo, _hi = sorted((float(args.start), float(args.stop)))
+        print(f"  sweep edges    : {_lo:g} … {_hi:g} MHz (midpoint carrier)")
     print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  waveform       : {args.waveform}")
-    print(f"  sweep bw       : {args.bw:g} MHz (±{args.bw/2:g} MHz)")
+    print(f"  sweep bw       : {sweep_bw_hz/1e6:g} MHz (±{sweep_bw_hz/2e6:g} MHz)")
     print(f"  sweep rate     : requested {args.rate:g} kHz, "
           f"got {actual_rate/1e3:.3f} kHz ({n_per} samples/period × {reps} reps)")
     if pmap.has_absolute:
@@ -583,6 +651,28 @@ def main() -> int:
                 ctrl.report("gain", round(tb.actual_gain(), 2))
             else:
                 ctrl.report("gain", round(state["gain"], 2))
+        elif name in ("start", "stop"):
+            # start_stop mode: a live edge move re-derives the carrier (midpoint) and the
+            # sweep width (span), then retunes + regenerates. An invalid span (zero or
+            # over-wide) is left unapplied — the GUI already flags it via the derived width.
+            state[name] = float(value)
+            if state.get("start") is not None and state.get("stop") is not None:
+                try:
+                    c_hz, bw_hz = resolve_band(
+                        "start_stop", None, None, state["start"], state["stop"])
+                except ValueError:
+                    ctrl.report(name, value)      # keep the last good band
+                    return
+                tb.set_center_frequency(c_hz)
+                state["freq"] = c_hz
+                # re-map the held target power at the new midpoint (freq-dependent chain)
+                if state.get("power") is not None:
+                    state["gain"] = pmap.gain_for_power(state["power"], freq=c_hz)
+                    if state["rf_on"]:
+                        tb.set_gain(state["gain"])
+                shape["bw_hz"] = bw_hz
+                regenerate()
+            ctrl.report(name, value)
         elif name == "rf":
             on = str(value).strip().lower() in ("on", "1", "true", "yes")
             state["rf_on"] = on
