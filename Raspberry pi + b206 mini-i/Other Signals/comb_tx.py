@@ -15,14 +15,17 @@ no runtime IQ math (same recipe as the PRN scripts).
    / conducted setup (cable + attenuators) you are LICENSED / AUTHORISED to use — never
    radiate over the air.
 
-Specifying the comb (first / spacing / last → count)
-────────────────────────────────────────────────────
-first, spacing and last over-determine the comb (a fourth number, the count, is implied),
-so rather than ask for a count that could contradict them, SPACING is authoritative and
---last is a CEILING: the knives are first, first+spacing, first+2·spacing, … up to (and
-including) the largest one that is ≤ last. So N = ⌊(last−first)/spacing⌋ + 1 and the true
-top knife is first + (N−1)·spacing (≤ your --last). The banner reports the count and the
-actual top knife. Want an exact top knife? make (last−first) a whole multiple of spacing.
+Specifying the comb (two modes; SPACING is always authoritative)
+────────────────────────────────────────────────────────────────
+Pick how to set the comb's extent with --comb-mode:
+  • range (default): first / spacing / --last. first, spacing and last over-determine the
+    comb, so --last is a CEILING: knives are first, first+spacing, … up to the largest ≤ last.
+    N = ⌊(last−first)/spacing⌋ + 1 and the true top knife is first + (N−1)·spacing (≤ --last).
+    Want an exact top knife? make (last−first) a whole multiple of spacing.
+  • count: first / spacing / --count. Exactly --count knives; the last is first+(count−1)·spacing.
+The banner reports the count and the actual top knife. In the GUI the field you don't set is
+shown live as a derived readout (the implied count, or the resulting last knife), and the comb
+span is flagged if it won't fit the usable band.
 
 Fixed radio setup
 ─────────────────
@@ -53,8 +56,9 @@ commands the raw SDR gain (relative), overriding --power. Uncalibrated, use --ga
 
 CLI
 ───
-    comb_tx.py --first 1560 --spacing 2 --last 1590 --power -30   # 16 knives, 2 MHz apart
-    comb_tx.py --first 1575 --spacing 0.5 --last 1576 --gain 60   # 3 knives, relative gain
+    comb_tx.py --first 1560 --spacing 2 --last 1590 --power -30            # 16 knives, 2 MHz apart
+    comb_tx.py --comb-mode count --first 1560 --spacing 2 --count 16 --power -30   # same, by count
+    comb_tx.py --first 1575 --spacing 0.5 --last 1576 --gain 60            # 3 knives, relative gain
     comb_tx.py --self-test
     comb_tx.py --describe-params
 """
@@ -93,6 +97,8 @@ HW_MAX_GAIN_DB = 89.75       # B200-mini physical TX-gain ceiling
 FREQ_RES_HZ = 100.0                              # DFT bin spacing → knife-frequency quantum
 N_SAMPLES = int(round(SAMP_RATE_HZ / FREQ_RES_HZ))   # 613800 → exactly 100 Hz bins, 10 ms loop
 USABLE_HALF_BW_HZ = 25.0e6                        # each knife must sit within ±this of the LO
+MAX_SPAN_MHZ = 2 * USABLE_HALF_BW_HZ / 1e6       # widest comb (last−first) that fits the band
+MAX_KNIVES = 512                                 # a sane ceiling for --count
 SIGNAL_NAME = "Frequency comb"
 
 SPACING_PRESETS = {"0.1 MHz": 0.1, "0.5 MHz": 0.5, "1 MHz": 1.0, "2 MHz": 2.0,
@@ -146,6 +152,26 @@ def comb_plan(first_hz: float, spacing_hz: float, last_hz: float):
             "span_hz": knives[-1] - knives[0]}
 
 
+def resolve_comb(mode: str, first_hz: float, spacing_hz: float, last_hz, count):
+    """Resolve the comb from whichever mode is selected into a comb_plan(). In 'count'
+    mode the last knife is first + (count−1)·spacing; in 'range' mode --last is a
+    ceiling (spacing authoritative). Raises ValueError with a clear message on unusable
+    input — the same conditions the GUI flags live via the derived readouts."""
+    if spacing_hz is None or spacing_hz <= 0:
+        raise ValueError("spacing must be > 0")
+    if mode == "count":
+        if count is None:
+            raise ValueError("count mode needs --count (the number of knives).")
+        n = int(count)
+        if n < 1:
+            raise ValueError("--count must be ≥ 1.")
+        last_hz = first_hz + (n - 1) * spacing_hz
+    else:  # range
+        if last_hz is None:
+            raise ValueError("range mode needs --last (the last-knife ceiling).")
+    return comb_plan(first_hz, spacing_hz, last_hz)
+
+
 # ── Baseband buffer (one seamless-looping comb period) ─────────────────────────────
 
 def build_comb_buffer(bins, n: int):
@@ -182,6 +208,19 @@ def _self_test() -> int:
     s_ok = p1["n"] == 1 and abs(p1["knives_hz"][0] - 1575.42e6) < FREQ_RES_HZ
     print(f"single knife 1575.42 MHz → {p1['n']} knife [{'OK' if s_ok else 'FAIL'}]")
     ok = ok and s_ok
+
+    # count mode: N knives from first/spacing/count (last = first + (N−1)·spacing).
+    pc = resolve_comb("count", 1560e6, 2e6, None, 16)
+    c_ok = pc["n"] == 16 and abs(pc["knives_hz"][-1] - (1560e6 + 15 * 2e6)) < FREQ_RES_HZ
+    print(f"count mode 1560/2 MHz ×16 → {pc['n']} knives, top {pc['knives_hz'][-1]/1e6:.4f} MHz "
+          f"[{'OK' if c_ok else 'FAIL'}]")
+    ok = ok and c_ok
+    try:
+        resolve_comb("count", 1560e6, 2e6, None, 0); m_ok = False       # count < 1 must raise
+    except ValueError:
+        m_ok = True
+    print(f"count mode rejects count<1 [{'OK' if m_ok else 'FAIL'}]")
+    ok = ok and m_ok
 
     try:
         import numpy as np
@@ -257,20 +296,46 @@ def _build_top_block(iq_file: str, center_freq_hz: float, gain_db: float, amplit
 def build_script() -> Script:
     return (
         Script(f"{SIGNAL_NAME} transmitter — a static comb of equal-power CW tones (all "
-               "present at once), given by the first knife, the spacing, and the last knife "
-               "(the count is derived). Fixed 61.38 MHz / sc8; level set in dBm via the "
+               "present at once), given by the first knife, the spacing, and either the last "
+               "knife or the number of knives. Fixed 61.38 MHz / sc8; level set in dBm via the "
                "unit's calibration, else a relative gain. Authorised, shielded setups only.")
+        # The comb's extent is entered one of two ways; the mode reveals its own field.
+        .choice("-Comb-mode", "--comb-mode",
+                options={"First → last (ceiling)": "range", "First + count": "count"},
+                default="range", required=False,
+                help="How the comb's extent is set: up to a last-knife ceiling (spacing "
+                     "authoritative), or a fixed number of knives. Fixed at launch.")
         .number("-First-knife", "--first", unit="MHz", min=70.0, max=6000.0,
                 default=1575.42, required=True,
                 help="Frequency of the FIRST (lowest) knife, in MHz. Fixed per run.")
         .number("-Spacing", "--spacing", unit="MHz", min=0.01, max=50.0, default=1.0,
                 presets=SPACING_PRESETS, required=True,
-                help="Spacing between adjacent knives, in MHz. Authoritative — the knife "
-                     "count follows from it and --last. Fixed per run.")
+                help="Spacing between adjacent knives, in MHz. Fixed per run.")
+        # ── range mode ──────────────────────────────────────────────────────────────
         .number("-Last-knife", "--last", unit="MHz", min=70.0, max=6000.0,
-                default=1585.42, required=True,
+                default=1585.42, required=False, show_when={"comb_mode": "range"},
                 help="Ceiling for the LAST (highest) knife, in MHz: knives are placed up to "
                      "the largest one ≤ this. Fixed per run.")
+        .derived("-Knife-count", name="comb_count", unit="knives",
+                 formula={"count": ["first", "last", "spacing"]},
+                 show_when={"comb_mode": "range"},
+                 help="How many knives first/spacing/last yields.")
+        .derived("-Span", name="comb_span_range", unit="MHz", min=0.0, max=MAX_SPAN_MHZ,
+                 formula={"span_to": ["first", "last", "spacing"]},
+                 show_when={"comb_mode": "range"},
+                 help="Actual comb span (top − first). Must fit the usable band.")
+        # ── count mode ──────────────────────────────────────────────────────────────
+        .integer("-Knife-count", "--count", min=1, max=MAX_KNIVES, step=1, default=11,
+                 required=False, show_when={"comb_mode": "count"},
+                 help="Number of knives. The last knife is first + (count−1)·spacing.")
+        .derived("-Last-knife", name="comb_last", unit="MHz",
+                 formula={"term": ["first", "count", "spacing"]},
+                 show_when={"comb_mode": "count"},
+                 help="Resulting last (highest) knife = first + (count−1)·spacing.")
+        .derived("-Span", name="comb_span_count", unit="MHz", min=0.0, max=MAX_SPAN_MHZ,
+                 formula={"extent": ["count", "spacing"]},
+                 show_when={"comb_mode": "count"},
+                 help="Comb span = (count−1)·spacing. Must fit the usable band.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE TOTAL power of the comb at the delivered plane (dBm). Maps "
@@ -299,9 +364,14 @@ def main() -> int:
     script = build_script()
     args = script.parse()
 
-    # Resolve the comb geometry (spacing authoritative, --last a ceiling).
+    # Resolve the comb geometry from the selected mode (first/spacing/last, or first/
+    # spacing/count). SPACING is always authoritative.
+    comb_mode = getattr(args, "comb_mode", "range")
+    last_val = getattr(args, "last", None)
+    count_val = getattr(args, "count", None)
     try:
-        plan = comb_plan(args.first * 1e6, args.spacing * 1e6, args.last * 1e6)
+        plan = resolve_comb(comb_mode, args.first * 1e6, args.spacing * 1e6,
+                            None if last_val is None else last_val * 1e6, count_val)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -347,6 +417,7 @@ def main() -> int:
 
     per_knife = 10.0 * math.log10(plan["n"])          # total − this = per-knife power
     print(f"── {SIGNAL_NAME} TX ─────────────────────────────────────────")
+    print(f"  comb mode      : {comb_mode}")
     print(f"  knives         : {plan['n']}  ({plan['knives_hz'][0]/1e6:.4f} … "
           f"{plan['knives_hz'][-1]/1e6:.4f} MHz)")
     print(f"  spacing        : {plan['spacing_hz']/1e6:g} MHz  (span {plan['span_hz']/1e6:g} MHz)")
