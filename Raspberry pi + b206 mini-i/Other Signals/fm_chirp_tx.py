@@ -53,12 +53,13 @@ Sample rate is fixed at 61.38 MHz (the B200's ceiling; a chirp has no chip grid,
 is simply as wide as the sweep can go), over-the-wire sc8, and baseband amplitude 0.5 (the
 amplitude the calibration is measured at). None are parameters. An optional digital passband
 filter (--filter/--passband/--transition) brick-wall band-limits the sweep and strips the
-sawtooth/square reset splatter; set the passband a hair above bw/2 to keep the whole sweep.
+sawtooth/square reset splatter; --passband is the TOTAL filter width (the filter passes
+±passband/2), so set it a hair above bw to keep the whole sweep.
 
 CLI
 ───
-    fm_chirp_tx.py --freq 1575.42 --bw 20 --rate 0.2 --waveform Sawtooth --power -30
-    fm_chirp_tx.py --freq 1575.42 --bw 20 --gain 60 --filter on --passband 11   # clean band-limit
+    fm_chirp_tx.py --freq 1575.42 --bw 20 --rate 200 --waveform Sawtooth --power -30
+    fm_chirp_tx.py --freq 1575.42 --bw 20 --gain 60 --filter on --passband 22   # clean band-limit
     fm_chirp_tx.py --self-test        # verify seamless phase closure (+ filter), no hardware
     fm_chirp_tx.py --describe-params  # paramkit JSON schema for the GUI
 """
@@ -154,14 +155,15 @@ FREQUENCIES = {
     "Iridium": 1621.25,
 }
 
-# Filter presets: {label: passband half-bandwidth in MHz}. A chirp is broadband by design
-# (it sweeps ±bw/2), so the passband is a direct half-bandwidth: set it a hair above bw/2 to
-# brick-wall the sweep and strip the sawtooth/square reset splatter, or below bw/2 to gate the
-# sweep into a sub-band. Clamped to Nyquist.
-MIN_PASSBAND_MHZ = 0.5
-MAX_PASSBAND_MHZ = 30.6
+# Filter presets: {label: TOTAL passband width in MHz}. A chirp is broadband by design (it
+# sweeps ±bw/2, i.e. bw wide), so the passband is a total width centred on the carrier — the
+# filter passes ±passband/2: set it a hair above bw to brick-wall the sweep and strip the
+# sawtooth/square reset splatter, or below bw to gate the sweep into a sub-band. Clamped to
+# Nyquist (the full 61.38 MHz).
+MIN_PASSBAND_MHZ = 1.0
+MAX_PASSBAND_MHZ = 61.2
 PASSBAND_PRESETS = {
-    "±10 MHz": 10.0, "±15 MHz": 15.0, "±20 MHz": 20.0, "±28 MHz": 28.0,
+    "20 MHz": 20.0, "30 MHz": 30.0, "40 MHz": 40.0, "56 MHz": 56.0,
 }
 
 
@@ -221,14 +223,14 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
-def filter_buffer(base_iq, passband_hz: float, trans_hz: float):
-    """Circularly filter the looped chirp buffer to a ±`passband_hz` band. Circular
-    convolution keeps the result exactly periodic, so the filtered loop has no seam; unity
-    passband gain leaves the in-band sweep's power unchanged. Filtering band-limits the
-    sweep (and removes reset splatter), so the result is no longer constant-modulus. Returns
-    (filtered_iq, n_taps, passband_edge_hz)."""
+def filter_buffer(base_iq, width_hz: float, trans_hz: float):
+    """Circularly filter the looped chirp buffer to a `width_hz`-wide passband centred on the
+    carrier (the filter passes ±width_hz/2). Circular convolution keeps the result exactly
+    periodic, so the filtered loop has no seam; unity passband gain leaves the in-band sweep's
+    power unchanged. Filtering band-limits the sweep (and removes reset splatter), so the result
+    is no longer constant-modulus. Returns (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
-    fp = float(passband_hz)
+    fp = float(width_hz) / 2.0
     fc = fp + trans_hz / 2.0
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
@@ -284,7 +286,7 @@ def _self_test() -> int:
         f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
         return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
 
-    filt, taps, fp = filter_buffer(base, passband_hz=11.0e6, trans_hz=1.0e6)
+    filt, taps, fp = filter_buffer(base, width_hz=22.0e6, trans_hz=1.0e6)   # ±11 MHz edge
     inband = 10 * np.log10(band(filt, 0, 10e6) / band(base, 0, 10e6))
     cut = 10 * np.log10(band(filt, 16e6, 28e6) / max(band(base, 16e6, 28e6), 1e-30))
     peak = float(np.max(np.abs(filt)))
@@ -385,23 +387,23 @@ def build_script() -> Script:
                 required=True, live=True,
                 help="Peak-to-peak sweep width; f sweeps ±bw/2 around the carrier. Live "
                      "(regenerates the loop).")
-        .number("-Sweep-rate", "--rate", unit="MHz", min=0.0001, max=5.0,
-                default=0.2, required=True, live=True,
-                help="How fast the sweep repeats. Live (regenerates the loop).")
+        .number("-Sweep-rate", "--rate", unit="kHz", min=0.1, max=5000.0,
+                default=200.0, required=True, live=True,
+                help="How fast the sweep repeats, in kHz. Live (regenerates the loop).")
         .number("-LO-offset", "--lo_offset", unit="MHz", min=-30.0, max=30.0,
                 default=0.0, live=True,
                 help="LO offset to push LO leakage out of band. Live.")
         .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
                 help="Digital passband filter on the looped buffer (unity passband gain). Set "
-                     "the passband a hair above bw/2 to brick-wall the sweep and strip reset "
+                     "the passband a hair above bw to brick-wall the sweep and strip reset "
                      "splatter. Live.")
         .number("-Passband", "--passband", unit="MHz",
-                min=MIN_PASSBAND_MHZ, max=MAX_PASSBAND_MHZ, default=15.0,
+                min=MIN_PASSBAND_MHZ, max=MAX_PASSBAND_MHZ, default=30.0,
                 presets=PASSBAND_PRESETS, required=False, live=True,
-                help="Passband half-bandwidth kept each side of the carrier (MHz), clamped to "
-                     "Nyquist. ≥ bw/2 keeps the whole sweep; < bw/2 gates it into a sub-band. "
-                     "Live (rebuilds the filtered loop).")
+                help="Total passband width kept, centred on the carrier (MHz) — the filter passes "
+                     "±passband/2. Clamped to Nyquist. ≥ bw keeps the whole sweep; < bw gates it "
+                     "into a sub-band. Live (rebuilds the filtered loop).")
         .number("-Transition", "--transition", unit="MHz", min=0.05, max=8.0, default=1.0,
                 required=False, live=True,
                 help="Filter skirt transition width beyond the passband edge (MHz) — the "
@@ -460,9 +462,9 @@ def main() -> int:
     # Current "shape" (the regeneration-requiring params) — mutated by live changes.
     shape = {"waveform": args.waveform,
              "bw_hz": args.bw * 1e6,
-             "rate_hz": args.rate * 1e6,
+             "rate_hz": args.rate * 1e3,               # --rate is in kHz
              "filter_on": getattr(args, "filter", "off") == "on",
-             "passband_hz": float(getattr(args, "passband", 15.0) or 15.0) * 1e6,
+             "width_hz": float(getattr(args, "passband", 30.0) or 30.0) * 1e6,  # total width
              "trans_hz": float(getattr(args, "transition", 1.0) or 1.0) * 1e6}
 
     def make_current():
@@ -472,7 +474,7 @@ def main() -> int:
             shape["waveform"], shape["bw_hz"], shape["rate_hz"])
         if not shape["filter_on"]:
             return base, n_per, reps, actual, {"on": False}
-        filt, taps, fp = filter_buffer(base, shape["passband_hz"], shape["trans_hz"])
+        filt, taps, fp = filter_buffer(base, shape["width_hz"], shape["trans_hz"])
         return filt, n_per, reps, actual, {"on": True, "taps": taps, "edge_hz": fp,
                                            "trans_hz": shape["trans_hz"]}
 
@@ -519,7 +521,7 @@ def main() -> int:
     print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  waveform       : {args.waveform}")
     print(f"  sweep bw       : {args.bw:g} MHz (±{args.bw/2:g} MHz)")
-    print(f"  sweep rate     : requested {args.rate*1e3:g} kHz, "
+    print(f"  sweep rate     : requested {args.rate:g} kHz, "
           f"got {actual_rate/1e3:.3f} kHz ({n_per} samples/period × {reps} reps)")
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
@@ -595,19 +597,19 @@ def main() -> int:
             if name == "bw":
                 shape["bw_hz"] = value * 1e6
             elif name == "rate":
-                shape["rate_hz"] = value * 1e6
+                shape["rate_hz"] = value * 1e3            # --rate is in kHz
             elif name == "waveform":
                 shape["waveform"] = value
             elif name == "filter":
                 shape["filter_on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
             elif name == "passband":
-                shape["passband_hz"] = max(MIN_PASSBAND_MHZ, min(MAX_PASSBAND_MHZ,
-                                                                 float(value))) * 1e6
+                shape["width_hz"] = max(MIN_PASSBAND_MHZ, min(MAX_PASSBAND_MHZ,
+                                                              float(value))) * 1e6
             else:  # transition
                 shape["trans_hz"] = float(value) * 1e6
             actual = regenerate()
             ctrl.report("rate" if name == "rate" else name,
-                        actual / 1e6 if name == "rate" else value)
+                        actual / 1e3 if name == "rate" else value)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
