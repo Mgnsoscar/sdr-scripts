@@ -510,9 +510,8 @@ def main() -> int:
                 shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
             else:
                 shape["trans_hz"] = float(value) * 1e6
+            regenerate()
             ctrl.report(name, value)
-            return True          # the (expensive) rebuild is deferred + coalesced by the caller
-        return False
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -521,20 +520,8 @@ def main() -> int:
     tb.start()
     try:
         while not stop.is_set():
-            # Coalesce a burst of live changes (dragging a slider fires many values): keep
-            # only the last value of each param, and rebuild the filtered loop at most ONCE
-            # per drain — that rebuild is the CPU spike that briefly starves the USRP.
-            latest, order = {}, []
             for change in ctrl.drain():
-                if change.name not in latest:
-                    order.append(change.name)
-                latest[change.name] = change.value
-            need_regen = False
-            for name in order:
-                if apply_change(name, latest[name]):
-                    need_regen = True
-            if need_regen:
-                regenerate()
+                apply_change(change.name, change.value)
             time.sleep(0.1)
     finally:
         ctrl.close()
