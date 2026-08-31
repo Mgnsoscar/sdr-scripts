@@ -2,13 +2,14 @@
 """
 GPS L1C transmitter for GNU Radio + UHD (Ettus B200-mini family).
 
-Generates a spectrally-correct GPS **L1C** signal (1575.42 MHz) — the modernized
-civil L1 signal — as the in-phase sum of its pilot and data components:
+Transmit a spectrally-correct GPS **L1C** signal (1575.42 MHz) — the modernized civil
+L1 signal — as the in-phase sum of its pilot and data components:
 
     L1Cp (pilot, 75% power) : Weil code × TMBOC(6,1,4/33) subcarrier × overlay
     L1Cd (data,  25% power) : Weil code × BOC(1,1) subcarrier   (bare code here)
 
-Precomputed and replayed from a file (same recipe as gps_l5_tx.py).
+Prebuilt once and looped so a Raspberry Pi sustains the rate with no runtime IQ math
+(same recipe as gps_l1ca_tx.py).
 
 Code fidelity — real IS-GPS-800 Weil codes
 ──────────────────────────────────────────
@@ -16,41 +17,67 @@ Both 10230-chip primary codes are the real IS-GPS-800 codes: Legendre (mod 10223
 → Weil W[k]=L[k]⊕L[k+w] → 7-chip insertion [0110100] at index p. Per-PRN (w,p) for
 pilot and data were validated against the official L1C PRN Code Assignments sheet.
 The pilot **overlay** (1800-symbol secondary, 18 s period) is the single 11-bit
-LFSR of IS-GPS-800; its per-PRN polynomial/init table was cross-checked against
-the sheet's L1CO columns (matches 14/14 where the sheet enumerates them, PRN
-159–172) — note the overlay has no published *code* check-value, so unlike the
-primaries it is table-validated + community-verified (pmonta/GNSS-DSP-tools),
-not first/last-chip verified.
+LFSR of IS-GPS-800; its per-PRN polynomial/init table was cross-checked against the
+sheet's L1CO columns.
 
 Full-length overlay WITHOUT a multi-GB file
 ───────────────────────────────────────────
 The overlay is a *slow* code: one ±1 symbol per 10 ms primary period, so the 18 s
-tiered pilot is the 10 ms pilot buffer replayed 1800 times with a per-period sign
-flip. Rather than precompute 18 s (~7 GB), the flow applies it at runtime:
+tiered pilot is the 10 ms pilot buffer replayed 1800 times with a per-period sign flip.
+Rather than precompute 18 s, the flow applies it at runtime:
 
-    pilot_file ─► × ─────────┐
+    pilot loop ─► × ─────────┐
     overlay(1800)─►repeat(N)─┘ ├─► + ─► (amp) ─► USRP
-    data_file  ──────────────┘
+    data loop  ──────────────┘
 
-so the full 18 s signal streams from ~8 MB. `--secondary off` drops it (10 ms
-primary loop only; spectrally identical, no secondary sync).
+so the full 18 s signal streams from ~10 MB. `--secondary off` drops it (10 ms primary
+loop only; spectrally identical, no secondary sync).
 
-⚠  RF SAFETY / LEGAL: L1 is a live GNSS band. Transmit ONLY into a shielded /
-   conducted setup you are LICENSED / AUTHORISED to use — never over the air.
+⚠  RF SAFETY / LEGAL: L1 (1575.42 MHz) is a live GNSS band. Transmit ONLY into a
+   shielded / conducted setup you are LICENSED / AUTHORISED to use — never over the air.
 
-Sample rate default 49.104 MHz (=48×1.023 → BOC(6,1) half-chips land on samples).
-1:1 master clock; sc8. Level set in dBm (--power) with a live RF on/off (--rf);
-see the USER CALIBRATION block. No navigation data (bare code).
+Fixed radio setup
+─────────────────
+  • sample rate 61.38 MHz (= 60 samples/chip; the BOC(6,1) subcarrier lands 10 samples/
+    cycle, exact), master clock pinned 1:1;
+  • over-the-wire sc8 (halves USB load; the small peak factor survives 8-bit here);
+  • baseband amplitude 0.5 (the amplitude the calibration is measured at — not a knob).
+None of these are parameters; they are fixed so the loop length and calibration stay exact.
+
+Level, from calibration (power / gain / achievable step)
+────────────────────────────────────────────────────────
+--power sets the ABSOLUTE delivered power (dBm). A task that sets SDR_CAL_SIGNAL_ID to
+CAL_SIGNAL_ID gets this unit's MEASURED calibration injected; --power then maps through it
+(gain_for_power), the SDR gain is snapped to the calibration's achievable grid, and the
+banner reports the power actually achieved. --gain instead commands the raw SDR gain
+(relative), overriding --power. Uncalibrated, there is no dBm scale — use --gain.
+
+Digital passband filter (on the looped buffers — no runtime DSP)
+────────────────────────────────────────────────────────────────
+An optional steep FIR passband, applied to the PRECOMPUTED loops by CIRCULAR convolution, so
+the filtered buffers still loop with no seam and there is no per-sample runtime cost. It has
+UNITY passband gain, so whatever it passes is unchanged in power. The same filter is applied
+to the pilot and data component buffers (filtering is linear, and the overlay is a ±1 per-
+period sign that commutes with it), so the summed signal is filtered identically. L1C is a
+split (BOC) signal — BOC(1,1) lobes at ±1.023 MHz, TMBOC BOC(6,1) lobes at ±6.138 MHz — so a
+plain "sidelobe count" is awkward; instead the passband edge SNAPS TO THE SPECTRAL NULLS. The
+underlying code is 1.023 Mcps, so the nulls sit at every 1.023 MHz: --nulls n puts the edge at
+±n·1.023 MHz, i.e. exactly on the null between lobes. n=2 cuts just outside the BOC(1,1) core;
+n=7 keeps the full TMBOC (just outside the BOC(6,1) lobes).
+  • --filter on/off             enable/disable (live);
+  • --nulls <n>                 passband edge at the nth null, ±n·1.023 MHz (live, presets);
+  • --transition <MHz>          skirt steepness — the transition width beyond the edge (live).
 
 CLI
 ───
-    gps_l1c_tx.py --prn 5 --power -30
-    gps_l1c_tx.py --component pilot --secondary full
+    gps_l1c_tx.py --prn 5 --power -30                          # calibrated dBm, no filter
+    gps_l1c_tx.py --component pilot --secondary full --gain 60 # pilot only, full overlay
+    gps_l1c_tx.py --prn 5 --gain 60 --filter on --nulls 7      # keep full TMBOC (±7.16 MHz)
     gps_l1c_tx.py --self-test
+    gps_l1c_tx.py --describe-params
 """
 from __future__ import annotations
 
-import math
 import os
 import signal
 import sys
@@ -64,52 +91,24 @@ os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paramkit import Script, PowerMap
 
-# Stable calibration signal id. When a task sets SDR_CAL_SIGNAL_ID to this value the
-# agent injects this unit's resolved calibration (SDR_CALIBRATION_FILE); calkit reads
-# it and --power maps through the unit's MEASURED curve at its real operating plane
-# (e.g. EIRP). Absent it, the script runs uncalibrated (relative gain only)
-# (unchanged behaviour). See the agent's docs/calibration.md.
+import math
+
+# Stable calibration signal id. A task setting SDR_CAL_SIGNAL_ID to this value gets this
+# unit's resolved calibration injected at $SDR_CALIBRATION_FILE; calkit maps --power through
+# it at the unit's real operating plane (e.g. EIRP). Absent it, the script runs uncalibrated
+# (relative gain only). See the agent's docs/calibration.md.
 CAL_SIGNAL_ID = "gps_l1c"
 
+# ── Fixed radio setup (NOT parameters — see the module docstring) ───────────────────
+SAMP_RATE_HZ = 61.38e6        # 60 samples/chip; BOC(6,1) subcarrier at 10 samples/cycle (exact)
+OTW_FORMAT = "sc8"            # over-the-wire; halves USB load
+AMPLITUDE = 0.5              # FIXED baseband amplitude the calibration is measured at
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
-# only from the unit's injected calibration; uncalibrated, the script runs on a
-# relative gain (never invented power levels). GAIN_AT_MAX_DB is the safety ceiling.
-# ═══════════════════════════════════════════════════════════════════════════════
-GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling the script commands
+# ── RF chain limits (mirrors the other PRN scripts) ─────────────────────────────────
+GAIN_AT_MAX_DB = 89.75       # operating gain ceiling (also the hard cap the script commands)
+HW_MAX_GAIN_DB = 89.75       # B200-mini physical TX-gain ceiling
 
-# Fixed baseband digital amplitude (0..1). NOT a user control and never a task
-# parameter: the calibration is measured at THIS amplitude, so a unit calibrated at a
-# different amplitude no longer matches. calkit detects that at load and runs
-# UNCALIBRATED with a loud warning until it is re-calibrated here.
-AMPLITUDE = 0.5
-
-# Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
-# from GAIN_AT_MAX_DB. The (normally-commented) calibration gain knob uses it.
-HW_MAX_GAIN_DB = 89.75
-
-
-
-# ── Power map: the unit's injected calibration curve if present, else the baked
-#    constants above (identical to the old single-anchor slope-1 behaviour) ────────
-
-_PMAP = None
-
-
-def power_map() -> PowerMap:
-    """The active power map: the unit's injected calibration curve if present
-    (SDR_CALIBRATION_FILE), else uncalibrated (relative gain only). Cached, so build_script and
-    main share one — and so --power's schema bounds match the real operating range
-    (calibrated → e.g. EIRP; else the baked SDR-port range)."""
-    global _PMAP
-    if _PMAP is None:
-        _PMAP = PowerMap.load(PowerMap.uncalibrated(0.0, GAIN_AT_MAX_DB, AMPLITUDE))
-    return _PMAP
-
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
+# ── Signal constants (fixed — this IS GPS L1C) ──────────────────────────────────────
 L1_HZ = 1575.42e6
 CHIP_RATE_HZ = 1_023_000
 CODE_LEN = 10230
@@ -120,8 +119,22 @@ TMBOC = (1,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0)
 SEC_LEN = 1800
 A_PILOT = math.sqrt(0.75)
 A_DATA = math.sqrt(0.25)
+SIGNAL_NAME = "GPS L1C"
 
-FREQUENCIES = {"GPS L1 (1575.42 MHz)": L1_HZ}
+FREQUENCIES = {"GPS L1 (1575.42 MHz)": L1_HZ / 1e6}   # presets are in MHz now
+
+# The L1C code is 1.023 Mcps, so its spectral nulls sit at every 1.023 MHz. The filter's
+# passband edge snaps to these nulls: --nulls n → edge at ±n·1.023 MHz (right on the null
+# between lobes). BOC(1,1) core is bounded by the n=2 null; the BOC(6,1) lobes by the n=7
+# null. Max keeps the edge inside ±Fs/2.
+L1C_NULL_HZ = 1.023e6
+MAX_NULLS = 30
+NULL_PRESETS = {
+    "BOC(1,1) core (±2.05 MHz)": 2,
+    "Between the lobes (±4.09 MHz)": 4,
+    "Include BOC(6,1) lobes (±7.16 MHz)": 7,
+    "Wide (±14.32 MHz)": 14,
+}
 
 # Per-PRN (Weil index w, insertion index p), IS-GPS-800 (validated vs the sheet).
 L1CP_WP = (
@@ -165,6 +178,18 @@ L1CO_PARAMS = (
     (0o7041,0o1766), (0o6637,0o3270), (0o4577,0o0341),
 )
 
+_PMAP = None
+
+
+def power_map() -> PowerMap:
+    """Active power map: the unit's injected calibration if present (SDR_CALIBRATION_FILE),
+    else uncalibrated (relative gain only). Cached so build_script and main agree — and so
+    --power's schema bounds match the real operating range."""
+    global _PMAP
+    if _PMAP is None:
+        _PMAP = PowerMap.load(PowerMap.uncalibrated(0.0, GAIN_AT_MAX_DB, AMPLITUDE))
+    return _PMAP
+
 
 # ── L1C codes (bit-exact primaries + overlay, IS-GPS-800) ──────────────────────
 
@@ -203,6 +228,81 @@ def _overlay(prn: int) -> list[int]:
     return c
 
 
+# ── Baseband buffers (data + pilot components, one 10 ms primary period) ───────
+
+def build_l1c_components(prn: int):
+    """Return (data_buf, pilot_buf, n_samples): the two in-phase component buffers
+    (complex64, one 10 ms primary period at SAMP_RATE_HZ), commonly peak-normalised. The
+    pilot overlay is applied downstream."""
+    import numpy as np
+
+    sr = int(round(SAMP_RATE_HZ))
+    n_samples = int(round(PRIMARY_MS * 1e-3 * sr))
+
+    pilot = 1 - 2 * np.asarray(_primary(prn, "pilot"), dtype=np.int8)
+    data = 1 - 2 * np.asarray(_primary(prn, "data"), dtype=np.int8)
+    tmboc = np.asarray(TMBOC, dtype=np.int8)
+
+    n = np.arange(n_samples, dtype=np.int64)
+    num = n * CHIP_RATE_HZ
+    chip = num // sr
+    rem = num - chip * sr
+    boc11 = np.where(rem * 2 < sr, 1.0, -1.0)
+    boc61 = np.where(((rem * 12) // sr) % 2 == 0, 1.0, -1.0)
+    cidx = chip % CODE_LEN
+    use61 = tmboc[chip % 33] == 1
+
+    data_s = (A_DATA * data[cidx] * boc11).astype(np.complex128)
+    pilot_s = (A_PILOT * pilot[cidx] * np.where(use61, boc61, boc11)).astype(np.complex128)
+    norm = max(np.max(np.abs(data_s + pilot_s)), np.max(np.abs(data_s - pilot_s)))
+    return (data_s / norm).astype(np.complex64), (pilot_s / norm).astype(np.complex64), n_samples
+
+
+def overlay_signs(prn: int):
+    """The pilot overlay as ±1 complex values (1800), for the runtime multiply."""
+    import numpy as np
+    return (1.0 - 2.0 * np.asarray(_overlay(prn), dtype=np.float32)).astype(np.complex64)
+
+
+# ── Digital passband filter (unity gain, circular → loop-preserving) ────────────────
+
+def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
+    """Blackman-Harris windowed-sinc lowpass, UNITY passband gain. `fc_hz` is the −6 dB
+    cutoff; `trans_hz` sets the tap count (steeper skirt → more taps). Returns (h, n_taps)."""
+    import numpy as np
+    m = int(np.ceil(5.5 * SAMP_RATE_HZ / max(trans_hz, 1.0))) | 1     # odd
+    m = min(m, (max_taps | 1))
+    k = np.arange(m)
+    c = (m - 1) / 2.0
+    fcn = min(fc_hz / SAMP_RATE_HZ, 0.499)          # never above Nyquist
+    h = 2 * fcn * np.sinc(2 * fcn * (k - c))
+    n1 = m - 1
+    win = (0.35875 - 0.48829 * np.cos(2 * np.pi * k / n1)
+           + 0.14128 * np.cos(4 * np.pi * k / n1) - 0.01168 * np.cos(6 * np.pi * k / n1))
+    h = h * win
+    h = h / h.sum()                                 # unity DC (→ passband) gain
+    return h.astype(np.float64), m
+
+
+def filter_buffer(base_iq, nulls: int, trans_hz: float, base_fft=None):
+    """Circularly filter a looped L1C component buffer, passband edge snapped to the nth null
+    (±`nulls`·1.023 MHz). Circular convolution keeps the result exactly periodic, so the
+    filtered loop has no seam; unity passband gain leaves the kept lobes' power unchanged.
+    Pass `base_fft` (= np.fft.fft(base_iq)) to reuse it across live filter changes — each
+    component loop is fixed per run, so its DFT need only be computed once, which cuts the
+    per-change CPU spike (and the underflows it can cause). Returns
+    (filtered_iq, n_taps, passband_edge_hz)."""
+    import numpy as np
+    fp = int(nulls) * L1C_NULL_HZ                     # flat passband edge, on the nth null
+    fc = fp + trans_hz / 2.0                          # −6 dB cutoff = edge + half the transition
+    n = len(base_iq)
+    h, m = _design_lowpass(fc, trans_hz, n // 2)
+    if base_fft is None:
+        base_fft = np.fft.fft(base_iq)
+    filtered = np.fft.ifft(base_fft * np.fft.fft(h, n)).astype(np.complex64)
+    return filtered, m, fp
+
+
 # ── Self-test ──────────────────────────────────────────────────────────────────
 
 def _self_test() -> int:
@@ -239,82 +339,90 @@ def _self_test() -> int:
         print(f"overlay PRN{prn:2d}: first24={oct(o24(c))} expect={oct(want)} "
               f"len={len(c)} ones={sum(c)} [{'OK' if good else 'FAIL'}]")
 
-    print("SELF-TEST PASSED" if ok else "SELF-TEST FAILED")
+    try:
+        import numpy as np
+    except ImportError:
+        print("(numpy absent — skipping the filter check)")
+        return 0 if ok else 1
+
+    data_buf, pilot_buf, n = build_l1c_components(1)
+    base = data_buf + pilot_buf                       # composite (overlay sign +1 for period 0)
+
+    def band(x, lo, hi):
+        X = np.fft.fftshift(np.fft.fft(x))
+        f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
+        return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
+
+    # Filter each component (as the flow does) then sum — must equal filtering the sum.
+    df, taps, fp = filter_buffer(data_buf, nulls=7, trans_hz=1.0e6)      # full TMBOC (±7.16 MHz)
+    pf, _, _ = filter_buffer(pilot_buf, nulls=7, trans_hz=1.0e6)
+    filt = df + pf
+    kept = 10 * np.log10(band(filt, 0, fp) / band(base, 0, fp))
+    cut = 10 * np.log10(band(filt, 12e6, 20e6) / max(band(base, 12e6, 20e6), 1e-30))
+    peak = float(np.max(np.abs(filt)))
+    f_ok = abs(kept) < 0.1 and cut < -40 and peak * AMPLITUDE < 1.0
+    print(f"filter (nulls=7 → ±{fp/1e6:.2f} MHz, {taps} taps): kept band {kept:+.3f} dB, "
+          f"out-of-band {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} [{'OK' if f_ok else 'FAIL'}]")
+    ok = ok and f_ok
+    print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
 
-# ── Baseband buffers (data + pilot components, one 10 ms primary period) ───────
+# ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def build_l1c_components(prn: int, samp_rate_hz: float):
-    """Return (data_buf, pilot_buf, n_samples): the two in-phase component buffers
-    (complex64, one 10 ms primary period), commonly peak-normalised. The pilot
-    overlay is applied downstream."""
+def _build_top_block(data_iq, pilot_iq, sec_signs, period_samples,
+                     center_freq_hz, gain_db, amplitude):
+    """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
+
+    Each component loop is streamed from RAM by a C++ blocks.vector_source_c (repeat=True) —
+    NOT a file_source, and NOT a Python source:
+      • file_source streams GIL-free and holds the rate, but swapping it live (open()) races
+        GNU Radio internally and THROWS "fread error", which kills the source and silences the
+        radio. With no file that is impossible.
+      • a Python gr.sync_block has no file either, but its work() runs under the GIL and can't
+        sustain 61.38 Msps on a Pi — it underflows even in steady state.
+    vector_source_c is C++ (GIL-free) with no file, so it streams as smoothly as file_source
+    did, with none of the fread risk. set_data() has no internal lock against work(), so the
+    live filter swap replaces BOTH component buffers under one top-block lock()/unlock() — the
+    buffers are never freed under a running read, the summed signal never streams a new
+    component against an old one, and the pause is only for the swap, only on a filter
+    change."""
     import numpy as np
-
-    sr = int(round(samp_rate_hz))
-    n_samples = int(round(PRIMARY_MS * 1e-3 * sr))
-
-    pilot = 1 - 2 * np.asarray(_primary(prn, "pilot"), dtype=np.int8)
-    data = 1 - 2 * np.asarray(_primary(prn, "data"), dtype=np.int8)
-    tmboc = np.asarray(TMBOC, dtype=np.int8)
-
-    n = np.arange(n_samples, dtype=np.int64)
-    num = n * CHIP_RATE_HZ
-    chip = num // sr
-    rem = num - chip * sr
-    boc11 = np.where(rem * 2 < sr, 1.0, -1.0)
-    boc61 = np.where(((rem * 12) // sr) % 2 == 0, 1.0, -1.0)
-    cidx = chip % CODE_LEN
-    use61 = tmboc[chip % 33] == 1
-
-    data_s = (A_DATA * data[cidx] * boc11).astype(np.complex128)
-    pilot_s = (A_PILOT * pilot[cidx] * np.where(use61, boc61, boc11)).astype(np.complex128)
-    norm = max(np.max(np.abs(data_s + pilot_s)), np.max(np.abs(data_s - pilot_s)))
-    return (data_s / norm).astype(np.complex64), (pilot_s / norm).astype(np.complex64), n_samples
-
-
-def overlay_signs(prn: int):
-    """The pilot overlay as ±1 complex values (1800), for the runtime multiply."""
-    import numpy as np
-    return (1.0 - 2.0 * np.asarray(_overlay(prn), dtype=np.float32)).astype(np.complex64)
-
-
-# ── Flowgraph ──────────────────────────────────────────────────────────────────
-
-def _build_top_block(data_file, pilot_file, sec_signs, period_samples,
-                     center_freq_hz, samp_rate_hz, gain_db, amplitude,
-                     otw_format, extra_args):
     from gnuradio import gr, blocks, uhd
+
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer; the filtered loop may not be.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class L1CTx(gr.top_block):
         def __init__(self):
-            super().__init__("GPS L1C TX")
-            args = (f"master_clock_rate={samp_rate_hz:.0f},"
+            super().__init__(f"{SIGNAL_NAME} TX")
+            args = (f"master_clock_rate={SAMP_RATE_HZ:.0f},"
                     "num_send_frames=512,send_frame_size=16000")
-            if extra_args:
-                args += "," + extra_args
             self.usrp = uhd.usrp_sink(
-                args,
-                uhd.stream_args(cpu_format="fc32", otw_format=otw_format, channels=[0]),
-            )
-            self.usrp.set_samp_rate(samp_rate_hz)
+                args, uhd.stream_args(cpu_format="fc32", otw_format=OTW_FORMAT, channels=[0]))
+            self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
 
+            self.pilot_src = None
+            self.data_src = None
             branches = []
-            if pilot_file:
-                pilot_src = blocks.file_source(gr.sizeof_gr_complex, pilot_file, repeat=True)
+            if pilot_iq is not None:
+                # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+                self.pilot_src = blocks.vector_source_c(_vec(pilot_iq), True, 1, [])
                 if sec_signs is not None:
                     sec_src = blocks.vector_source_c(list(sec_signs), repeat=True)
                     sec_rep = blocks.repeat(gr.sizeof_gr_complex, int(period_samples))
                     mult = blocks.multiply_cc()
                     self.connect(sec_src, sec_rep, (mult, 1))
-                    self.connect(pilot_src, (mult, 0))
+                    self.connect(self.pilot_src, (mult, 0))
                     branches.append(mult)
                 else:
-                    branches.append(pilot_src)
-            if data_file:
-                branches.append(blocks.file_source(gr.sizeof_gr_complex, data_file, repeat=True))
+                    branches.append(self.pilot_src)
+            if data_iq is not None:
+                self.data_src = blocks.vector_source_c(_vec(data_iq), True, 1, [])
+                branches.append(self.data_src)
 
             self.amp = blocks.multiply_const_cc(amplitude)
             if len(branches) == 1:
@@ -326,92 +434,102 @@ def _build_top_block(data_file, pilot_file, sec_signs, period_samples,
                 self.connect(adder, self.amp)
             self.connect(self.amp, self.usrp)
 
-        def set_gain(self, g): self.usrp.set_gain(g, 0)
-        def set_amplitude(self, a): self.amp.set_k(a)
-        def actual_gain(self): return self.usrp.get_gain(0)
-        def actual_samp_rate(self): return self.usrp.get_samp_rate()
+        def set_gain(self, g):
+            self.usrp.set_gain(g, 0)
+
+        def set_amplitude(self, a):
+            self.amp.set_k(a)
+
+        def swap(self, data_iq, pilot_iq):
+            # Replace both component buffers under ONE lock, so the summed signal never streams
+            # a new component against an old one. set_data() has no internal lock vs work(), so
+            # lock()/unlock() quiesces the flowgraph for the swap — the only moment it pauses,
+            # and only on a filter change.
+            self.lock()
+            try:
+                if self.data_src is not None and data_iq is not None:
+                    self.data_src.set_data(_vec(data_iq), [])
+                if self.pilot_src is not None and pilot_iq is not None:
+                    self.pilot_src.set_data(_vec(pilot_iq), [])
+            finally:
+                self.unlock()
+
+        def actual_gain(self):
+            return self.usrp.get_gain(0)
+
+        def actual_samp_rate(self):
+            return self.usrp.get_samp_rate()
 
     return L1CTx()
 
 
-# ── Parameter schema ────────────────────────────────────────────────────────────
+# ── Parameter schema ────────────────────────────────────────────────────────────────
 
 def build_script() -> Script:
-    s = (
-        Script("GPS L1C transmitter (real IS-GPS-800 Weil codes, TMBOC(6,1,4/33) "
-               "pilot + BOC(1,1) data, full 18 s overlay), file-replay. Authorised, "
+    return (
+        Script(f"{SIGNAL_NAME} transmitter (real IS-GPS-800 Weil codes, TMBOC(6,1,4/33) pilot "
+               "+ BOC(1,1) data, full 18 s overlay) — fixed 61.38 MHz / sc8, looped buffers, "
+               "optional power-preserving digital passband filter. Level is set in dBm via the "
+               "unit's calibration; uncalibrated it runs on a relative gain. Authorised, "
                "shielded setups only.")
+        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=L1_HZ / 1e6,
+                help="RF carrier in MHz (default L1 = 1575.42). Fixed per run.")
+        .number("-Power", "--power", unit="dBm",
+                **power_map().power_field_kwargs(), required=False, live=True,
+                help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
+                     "calibration and snaps to its achievable grid; ignored if --gain is "
+                     "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
         .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
                  help="GPS satellite PRN (1..63). Fixed per run.")
-        .choice("-Component", "--component", options=["both", "pilot", "data"],
-                default="both",
+        .choice("-Component", "--component", options=["both", "pilot", "data"], default="both",
                 help="both = full L1C (25/75); pilot = L1Cp TMBOC only; data = L1Cd.")
         .choice("-Secondary", "--secondary", options=["full", "off"], default="full",
-                help="full = apply the 1800-symbol pilot overlay (18 s, runtime "
-                     "multiply); off = 10 ms primary loop only.")
-        .number("-Center-frequency", "--freq", unit="Hz", min=70e6, max=6e9,
-                presets=FREQUENCIES, default=L1_HZ,
-                help="RF carrier (default L1). Fixed per run.")
-        .number("-Power", "--power", unit="dBm",
-                **power_map().power_field_kwargs(), required=True, live=True,
-                help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
-                     "unit's calibration when present (e.g. EIRP), else the baked "
-                     "SDR-port scale. Ignored if --gain is given (relative wins). Live.")
-        .number("-Sample-rate", "--sample_rate", unit="MHz", min=15.0, max=61.44,
-                default=49.104,
-                help="Host/DAC sample rate; master clock pinned equal (1:1). "
-                     "49.104 (=48×1.023) aligns the BOC(6,1) subcarrier. Fixed per run.")
-        .choice("-OTW-format", "--otw", options=["sc8", "sc16"], default="sc8",
-                help="Over-the-wire format. sc8 halves USB load; sc16 more range.")
-        .choice("-RF", "--rf", options=["on", "off"], default="on",
+                help="full = apply the 1800-symbol pilot overlay (18 s, runtime multiply); "
+                     "off = 10 ms primary loop only.")
+        .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
-                help="RF output on/off. OFF mutes the signal (gain AND baseband "
-                     "amplitude to 0); ON restores them. Change the power (or the "
-                     "calibration gain) while OFF and it takes effect when you turn ON.")
-        # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
-        # No default, so its PRESENCE selects relative mode (it overrides --power).
-        # This is also the calibration knob — set it while measuring output vs gain on
-        # a spectrum analyser to fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB above.
-        .number("-Analog-bandwidth", "--bandwidth", unit="MHz", min=0.0, max=56.0,
-                default=0.0, required=False,
-                help="AD9361 analog TX filter bandwidth (MHz) — the real baseband LPF, set "
-                     "independently of the sample rate. 0 = auto (UHD picks it from the "
-                     "sample rate, the old behaviour); a positive value band-limits the "
-                     "signal WITHOUT changing the master clock. Coerced to the radio's "
-                     "range; the banner reports the actual.")
-        .number("-Gain", "--gain", unit="dB",
-                min=0, max=HW_MAX_GAIN_DB, required=False, live=True,
-                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
-                     "bypassing the dBm calibration. When given, overrides --power. Live.")
+                help="Digital passband filter on the looped buffers (unity passband gain, so "
+                     "it preserves what it passes). Live.")
+        .integer("-Nulls", "--nulls", min=1, max=MAX_NULLS, default=7,
+                 presets=NULL_PRESETS, required=False, live=True,
+                 help="Passband edge, as the null it snaps to: ±n·1.023 MHz, right on the "
+                      "null between lobes. n=2 keeps the BOC(1,1) core, n=7 the full TMBOC "
+                      "(incl. the BOC(6,1) lobes). Live (rebuilds the filtered loops).")
+        .number("-Transition", "--transition", unit="MHz", min=0.1, max=8.0, default=1.0,
+                required=False, live=True,
+                help="Filter skirt transition width beyond the passband edge (MHz) — the "
+                     "steepness knob. Live (rebuilds the filtered loops).")
+        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
+                     "restores them. Live.")
     )
-    return s
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import atexit
-    import shutil
-    import tempfile
-
     script = build_script()
     args = script.parse()
-    samp_rate_hz = args.sample_rate * 1e6
-    # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
-    # else it runs uncalibrated — a relative gain only (no baked behaviour).
+    center_freq_hz = args.freq * 1e6
+
     pmap = power_map()
     amplitude = pmap.amplitude
-    # A raw --gain (relative / calibration knob) overrides the dBm mapping when present,
-    # so you can command a gain directly or measure output power at it.
-    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+
+    # Gain precedence: explicit --gain (raw) > calibrated --power > refuse (uncalibrated).
+    gain_cal = getattr(args, "gain", None)
     if gain_cal is not None:
         gain_db = float(gain_cal)
-    elif power_map().has_absolute:                  # calibrated: the authored absolute --power
-        gain_db = power_map().gain_for_power(args.power)
-    else:                                           # uncalibrated: a persisted fallback gain, or refuse
+    elif pmap.has_absolute:
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
+    else:
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
             print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
@@ -420,78 +538,108 @@ def main() -> int:
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="gps_l1c_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    # Prebuild the unfiltered component loops once (PRN/component fixed per run).
+    data_base, pilot_base, nsamp = build_l1c_components(args.prn)
+    want_data = args.component in ("both", "data")
+    want_pilot = args.component in ("both", "pilot")
+    # DFT of each fixed component loop — computed once, reused across live filter changes.
+    data_fft = {"v": None}
+    pilot_fft = {"v": None}
 
-    data_buf, pilot_buf, nsamp = build_l1c_components(args.prn, samp_rate_hz)
+    # Filter "shape" (the regeneration-requiring params) — mutated by live changes.
+    shape = {"on": getattr(args, "filter", "off") == "on",
+             "nulls": int(getattr(args, "nulls", 7) or 7),
+             "trans_hz": float(getattr(args, "transition", 1.0) or 1.0) * 1e6}
 
-    data_file = pilot_file = None
-    if args.component in ("both", "data"):
-        data_file = os.path.join(tmpdir, "data.fc32")
-        data_buf.tofile(data_file)
-    if args.component in ("both", "pilot"):
-        pilot_file = os.path.join(tmpdir, "pilot.fc32")
-        pilot_buf.tofile(pilot_file)
+    def make_component(base, cache):
+        """Filtered (or bare) copy of one component buffer for the current shape, reusing the
+        component's cached base DFT across changes."""
+        if not shape["on"]:
+            return base, {"on": False}
+        if cache["v"] is None:
+            import numpy as np
+            cache["v"] = np.fft.fft(base)
+        filtered, taps, fp = filter_buffer(base, shape["nulls"], shape["trans_hz"],
+                                           base_fft=cache["v"])
+        return filtered, {"on": True, "taps": taps, "edge_hz": fp, "trans_hz": shape["trans_hz"]}
 
-    sec_signs = None
-    if pilot_file and args.secondary == "full":
-        sec_signs = overlay_signs(args.prn)
+    finfo = {"on": shape["on"], "edge_hz": shape["nulls"] * L1C_NULL_HZ,
+             "trans_hz": shape["trans_hz"]}
+    data_iq0 = pilot_iq0 = None
+    if want_data:
+        data_iq0, finfo = make_component(data_base, data_fft)
+    if want_pilot:
+        pilot_iq0, finfo = make_component(pilot_base, pilot_fft)
 
-    tb = _build_top_block(data_file, pilot_file, sec_signs, nsamp,
-                          args.freq, samp_rate_hz, gain_db, amplitude,
-                          args.otw, "")
+    sec_signs = overlay_signs(args.prn) if (pilot_iq0 is not None and args.secondary == "full") else None
 
-    # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
-    # flow muted; power/gain edits made while OFF are staged and reach the radio
-    # only when RF is switched ON.
+    tb = _build_top_block(data_iq0, pilot_iq0, sec_signs, nsamp,
+                          center_freq_hz, gain_db, amplitude)
+
+    def regenerate():
+        """Rebuild the filtered component loops for the current shape and swap them in
+        atomically (one seam, then they loop clean). Runs on the control thread; the flow keeps
+        streaming the old buffers until the swap. In-RAM — no file, so a source can never be
+        left dead by a read error."""
+        info = {"on": shape["on"], "edge_hz": shape["nulls"] * L1C_NULL_HZ,
+                "trans_hz": shape["trans_hz"]}
+        data_iq = pilot_iq = None
+        if want_data:
+            data_iq, info = make_component(data_base, data_fft)
+        if want_pilot:
+            pilot_iq, info = make_component(pilot_base, pilot_fft)
+        tb.swap(data_iq, pilot_iq)
+        return info
+
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
     if not state["rf_on"]:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
 
+    def _fmt_band(info):
+        if not info.get("on"):
+            return "off (full signal)"
+        return (f"on — passband ±{info['edge_hz']/1e6:.2f} MHz, "
+                f"{info['trans_hz']/1e6:g} MHz transition"
+                + (f", {info['taps']} taps" if 'taps' in info else ""))
+
     sec_desc = "18 s (full overlay)" if sec_signs is not None else "10 ms (primary only)"
-    print("── GPS L1C TX ──────────────────────────────────────────────")
+    print(f"── {SIGNAL_NAME} TX ─────────────────────────────────────────")
     print(f"  satellite PRN  : {args.prn}  (real L1C Weil codes, {args.component})")
-    print(f"  carrier        : {args.freq/1e6:.3f} MHz")
-    print(f"  sample rate    : requested {args.sample_rate:g} MHz, "
-          f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
+    print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz")
+    print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  modulation     : L1Cp TMBOC(6,1,4/33) + L1Cd BOC(1,1), 75/25 power")
     print(f"  period         : {sec_desc}")
-    print(f"  primary buffer : {nsamp} samples ({nsamp*8/1e6:.1f} MB/file)")
-    if power_map().has_absolute:
-        print(f"  power (target) : {args.power:g} dBm  ({power_map().label})")
-    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
-          f"amplitude {amplitude:g}")
-    print(f"  calibration    : {pmap.source}")
-    if pmap.warning:                       # e.g. calibration amplitude != this
-        print(f"  ⚠ CALIBRATION  : {pmap.warning}")   # script's fixed amplitude
-    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
+    print(f"  primary buffer : {nsamp} samples ({nsamp*8/1e6:.1f} MB/component file)")
+    if pmap.has_absolute:
+        print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+        print(f"  power (achieved on grid): "
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
+    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), amplitude {amplitude:g}")
+    print(f"  calibration    : {pmap.describe()}")
+    if pmap.warning:
+        print(f"  ⚠ CALIBRATION  : {pmap.warning}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    print(f"  otw            : {args.otw}")
+    print(f"  filter         : {_fmt_band(finfo)}")
+    print(f"  otw            : {OTW_FORMAT}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
     ctrl = script.live_control(args)
 
     def apply_change(name, value):
-        # power/gain edits are staged into state["gain"] and only reach the radio
-        # when RF is on; the --rf toggle mutes/restores gain AND amplitude.
-        if name == "power":
-            state["gain"] = pmap.gain_for_power(float(value))
+        if name == "power" and pmap.has_absolute:
+            state["gain"] = pmap.gain_for_power(float(value), freq=center_freq_hz)
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
-            else:
-                ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
+            ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=center_freq_hz), 2))
         elif name == "gain":
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("gain", round(tb.actual_gain(), 2))
-            else:
-                ctrl.report("gain", round(state["gain"], 2))
+            ctrl.report("gain", round(state["gain"], 2))
         elif name == "rf":
             on = str(value).strip().lower() in ("on", "1", "true", "yes")
             state["rf_on"] = on
@@ -502,19 +650,20 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
+        elif name in ("filter", "nulls", "transition"):
+            if name == "filter":
+                shape["on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
+            elif name == "nulls":
+                shape["nulls"] = max(1, min(MAX_NULLS, int(value)))
+            else:
+                shape["trans_hz"] = float(value) * 1e6
+            regenerate()
+            ctrl.report(name, value)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    _bw = float(getattr(args, "bandwidth", 0.0) or 0.0)
-    if _bw > 0:                                   # AD9361 analog LPF, independent of master clock
-        tb.usrp.set_bandwidth(_bw * 1e6, 0)
-    try:
-        print(f"  analog TX BW   : {tb.usrp.get_bandwidth(0)/1e6:.3f} MHz (AD9361 filter"
-              f"{'' if _bw > 0 else ' — auto from Fs'})")
-    except Exception:      # noqa: BLE001
-        pass
     tb.start()
     try:
         while not stop.is_set():

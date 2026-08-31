@@ -2,47 +2,67 @@
 """
 GPS L2C transmitter for GNU Radio + UHD (Ettus B200-mini family).
 
-Generates a **bit-exact** GPS **L2C** signal (1227.60 MHz): the civil signal on
-L2, which is the chip-by-chip time-multiplex of two codes at 511.5 kcps each,
-interleaved to 1.023 Mcps (BPSK-R(1), ~2 MHz wide) —
+Transmit a **bit-exact** GPS **L2C** signal (1227.60 MHz): the civil signal on L2,
+the chip-by-chip time-multiplex of two 511.5 kcps codes interleaved to 1.023 Mcps
+(BPSK-R(1), ~2 MHz wide) — L2 CM (10230 chips, 20 ms) and L2 CL (767250 chips,
+1.5 s, dataless pilot). Prebuilt once and looped so a Raspberry Pi sustains the
+rate with no runtime IQ math (same recipe as gps_l1ca_tx.py).
 
-    L2 CM (Civil Moderate) : 10230 chips, 20 ms period   (carries CNAV; here bare)
-    L2 CL (Civil Long)     : 767250 chips, 1.5 s period  (dataless pilot)
+⚠  RF SAFETY / LEGAL: L2 (1227.60 MHz) is a live GNSS band. Transmit ONLY into a
+   shielded / conducted setup (cable + attenuators) you are LICENSED / AUTHORISED
+   to use — never over the air.
 
-Precomputed and replayed from a file (same recipe as gps_l5_tx.py).
+Fixed radio setup
+─────────────────
+  • sample rate 61.38 MHz (= 60 samples/combined-chip, exact), master clock 1:1;
+  • over-the-wire sc8 (constant-modulus BPSK loses nothing at 8-bit; halves USB load);
+  • baseband amplitude 0.5 (the amplitude the calibration is measured at — not a knob).
+None of these are parameters; they are fixed so the loop length and calibration stay exact.
+L2C is only ~2 MHz wide, but the rate is pinned high (like C/A) so the full sinc²
+sidelobe skirt is present for the digital filter below to shape.
 
-Code fidelity — real IS-GPS-200 codes
-─────────────────────────────────────
-Both codes come from the IS-GPS-200 27-stage Galois shift register (feedback mask
-0o445112474, output = LSB), each started from its per-PRN initial state. The
-generator was validated against the OFFICIAL "L2C PRN Code Assignments" sheet:
-running the register from the sheet's Initial State for a full code period lands
-exactly on the sheet's End State — confirmed for all 52 listed PRNs (CM) and
-spot-checked for CL. Per-PRN initial states (PRN 1..63) are the IS-GPS-200 values
-(cross-checked against pmonta/GNSS-DSP-tools); --self-test re-verifies them.
-
-⚠  RF SAFETY / LEGAL: L2 is a live GNSS band. Transmit ONLY into a shielded /
-   conducted setup you are LICENSED / AUTHORISED to use — never over the air.
+Level, from calibration (power / gain / achievable step)
+────────────────────────────────────────────────────────
+--power sets the ABSOLUTE delivered power (dBm). A task that sets SDR_CAL_SIGNAL_ID to
+CAL_SIGNAL_ID gets this unit's MEASURED calibration injected; --power then maps through it
+(gain_for_power), the SDR gain is snapped to the calibration's achievable grid (the SDR
+gain step and any active-component steps), and the banner reports the power actually
+achieved. --gain instead commands the raw SDR gain (relative), overriding --power.
+Uncalibrated, there is no dBm scale — use --gain. (See docs/calibration-v2.md.)
 
 Loop length (--loop)
 ────────────────────
-  full (default) : one whole CL period = 1.5 s (CM repeats 75×). Bit-exact,
-                   complete spectrum. Large file (scales with sample rate).
-  cm             : one CM period = 20 ms (CL truncated to its first 10230 chips).
-                   Small/fast; the BPSK-R(1) envelope is identical, but the CL
-                   line structure appears at 50 Hz instead of its true 0.667 Hz
-                   (both unresolvable at practical RBW). Good for envelope checks.
+  full (default) : one whole CL period = 1.5 s (CM repeats 75×). Bit-exact CL phase and
+                 complete spectrum. ~736 MB held in RAM at 61.38 MHz (the loop must live in
+                 memory to stream at rate), so the host needs the headroom. The live filter
+                 stays responsive because it uses a memory-bounded overlap-add convolution (no
+                 92-Msample monolithic FFT) and the flowgraph keeps looping the old buffer
+                 until the new one is ready.
+  cm             : one CM period = 20 ms (CL truncated to its first 10230 chips), ~9.8 MB.
+                 The BPSK-R(1) envelope is identical; the CL line structure appears at 50 Hz
+                 rather than its true 0.667 Hz (both unresolvable at practical RBW). Pick it
+                 when RAM is tight or the true CL phase does not matter.
 
-Sample rate: L2C is ~2 MHz wide, so the default is 10.23 MHz (= 10 × 1.023, an
-exact 10 samples/chip). At full-loop that's ~123 MB in /dev/shm; raising the rate
-raises the file size proportionally (1.5 s × fs × 8 bytes). Master clock is pinned
-equal to the sample rate (1:1). Level set in dBm (--power) with a live RF on/off
-(--rf); see the USER CALIBRATION block.
+Digital passband filter (on the looped buffer — no runtime DSP)
+──────────────────────────────────────────────────────────────
+An optional steep FIR passband, applied to the PRECOMPUTED loop by CIRCULAR convolution, so
+the filtered buffer still loops with no seam and there is no per-sample runtime cost. It has
+UNITY passband gain, so whatever it passes is unchanged in power: if the main lobe measures
+−2.5 dBm unfiltered it still reads −2.5 dBm filtered — the filter only removes what's outside
+the passband (it lowers the main lobe only if the passband is narrow enough to cut into it).
+L2C's spectrum is the same sinc² as C/A (nulls every 1.023 MHz), so the passband is set by
+how many sidelobes to keep.
+  • --filter on/off             enable/disable (live);
+  • --sidelobes <n>             passband keeps the main lobe + n sidelobes, i.e. a
+                                ±(n+1)·1.023 MHz band (live, presets by sidelobe count);
+  • --transition <MHz>          skirt steepness — the transition width beyond the passband
+                                edge (live).
 
 CLI
 ───
-    gps_l2c_tx.py --prn 5 --power -30
-    gps_l2c_tx.py --prn 5 --loop cm --sample_rate 40.92   # small envelope version
+    gps_l2c_tx.py --prn 5 --power -30                          # calibrated dBm, no filter
+    gps_l2c_tx.py --prn 5 --gain 60 --filter on --sidelobes 2  # relative gain, main+2 sidelobes
+    gps_l2c_tx.py --loop full --prn 5 --power -30              # bit-exact 1.5 s CL (big/slow)
     gps_l2c_tx.py --self-test
     gps_l2c_tx.py --describe-params
 """
@@ -61,60 +81,57 @@ os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paramkit import Script, PowerMap
 
-# Stable calibration signal id. When a task sets SDR_CAL_SIGNAL_ID to this value the
-# agent injects this unit's resolved calibration (SDR_CALIBRATION_FILE); calkit reads
-# it and --power maps through the unit's MEASURED curve at its real operating plane
-# (e.g. EIRP). Absent it, the script runs uncalibrated (relative gain only)
-# (unchanged behaviour). See the agent's docs/calibration.md.
+# Stable calibration signal id. A task setting SDR_CAL_SIGNAL_ID to this value gets this
+# unit's resolved calibration injected at $SDR_CALIBRATION_FILE; calkit maps --power through
+# it at the unit's real operating plane (e.g. EIRP). Absent it, the script runs uncalibrated
+# (relative gain only). See the agent's docs/calibration.md.
 CAL_SIGNAL_ID = "gps_l2c"
 
+# ── Fixed radio setup (NOT parameters — see the module docstring) ───────────────────
+SAMP_RATE_HZ = 61.38e6        # 60 samples/combined-chip at 1.023 Mcps (exact); master clock 1:1
+OTW_FORMAT = "sc8"            # over-the-wire; BPSK is constant-modulus, 8-bit is lossless here
+AMPLITUDE = 0.5              # FIXED baseband amplitude the calibration is measured at
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
-# only from the unit's injected calibration; uncalibrated, the script runs on a
-# relative gain (never invented power levels). GAIN_AT_MAX_DB is the safety ceiling.
-# ═══════════════════════════════════════════════════════════════════════════════
-GAIN_AT_MAX_DB = 89.75      # the gain that produced it; also the HARD ceiling the script commands
+# ── RF chain limits (mirrors the other PRN scripts) ─────────────────────────────────
+GAIN_AT_MAX_DB = 89.75       # operating gain ceiling (also the hard cap the script commands)
+HW_MAX_GAIN_DB = 89.75       # B200-mini physical TX-gain ceiling
 
-# Fixed baseband digital amplitude (0..1). NOT a user control and never a task
-# parameter: the calibration is measured at THIS amplitude, so a unit calibrated at a
-# different amplitude no longer matches. calkit detects that at load and runs
-# UNCALIBRATED with a loud warning until it is re-calibrated here.
-AMPLITUDE = 0.5
+# ── Signal constants (fixed — this IS GPS L2C) ──────────────────────────────────────
+L2_HZ = 1227.60e6                # GPS L2
+CM_LEN = 10230                   # L2 CM code length (20 ms at 511.5 kcps)
+CL_LEN = 767250                  # L2 CL code length (1.5 s at 511.5 kcps)
+CHANNEL_CHIP_RATE = 511_500      # each of CM / CL
+COMBINED_CHIP_RATE = 1_023_000   # after chip-by-chip multiplexing (== sinc² null spacing)
+SIGNAL_NAME = "GPS L2C"
+L2C_NULL_HZ = 1.023e6            # main-lobe null spacing == the chip rate; sidelobes step by this
+LFSR_MASK = 0o445112474          # IS-GPS-200 L2C feedback polynomial (Galois)
 
-# Hardware TX-gain ceiling of the B200-mini (dB) — the physical maximum, distinct
-# from GAIN_AT_MAX_DB. The (normally-commented) calibration gain knob uses it.
-HW_MAX_GAIN_DB = 89.75
+FREQUENCIES = {"GPS L2 (1227.60 MHz)": L2_HZ / 1e6}   # presets are in MHz now
 
-
-
-# ── Power map: the unit's injected calibration curve if present, else the baked
-#    constants above (identical to the old single-anchor slope-1 behaviour) ────────
+# Filter presets: {label: number of sidelobes to KEEP}. The passband is the main lobe
+# plus that many sidelobes, i.e. a ±(n+1)·1.023 MHz band. Max keeps the band inside ±Fs/2.
+MAX_SIDELOBES = 28
+SIDELOBE_PRESETS = {
+    "Main lobe only (±1.02 MHz)": 0,
+    "Main + 1 sidelobe (±2.05 MHz)": 1,
+    "Main + 2 sidelobes (±3.07 MHz)": 2,
+    "Main + 3 sidelobes (±4.09 MHz)": 3,
+    "Main + 5 sidelobes (±6.14 MHz)": 5,
+    "Main + 10 sidelobes (±11.25 MHz)": 10,
+}
 
 _PMAP = None
 
 
 def power_map() -> PowerMap:
-    """The active power map: the unit's injected calibration curve if present
-    (SDR_CALIBRATION_FILE), else uncalibrated (relative gain only). Cached, so build_script and
-    main share one — and so --power's schema bounds match the real operating range
-    (calibrated → e.g. EIRP; else the baked SDR-port range)."""
+    """Active power map: the unit's injected calibration if present (SDR_CALIBRATION_FILE),
+    else uncalibrated (relative gain only). Cached so build_script and main agree — and so
+    --power's schema bounds match the real operating range."""
     global _PMAP
     if _PMAP is None:
         _PMAP = PowerMap.load(PowerMap.uncalibrated(0.0, GAIN_AT_MAX_DB, AMPLITUDE))
     return _PMAP
 
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-
-L2_HZ = 1227.60e6
-CM_LEN = 10230                   # L2 CM code length (20 ms at 511.5 kcps)
-CL_LEN = 767250                  # L2 CL code length (1.5 s at 511.5 kcps)
-CHANNEL_CHIP_RATE = 511_500      # each of CM / CL
-COMBINED_CHIP_RATE = 1_023_000   # after chip-by-chip multiplexing
-LFSR_MASK = 0o445112474          # IS-GPS-200 L2C feedback polynomial (Galois)
-
-FREQUENCIES = {"GPS L2 (1227.60 MHz)": L2_HZ}
 
 # Per-PRN initial shift-register states (octal), IS-GPS-200, PRN 1..63.
 L2CM_INIT = (
@@ -171,7 +188,102 @@ def cl_code(prn: int, n: int = CL_LEN) -> list[int]:
     return _lfsr_bits(L2CL_INIT[prn - 1], n)
 
 
-# ── Self-test (generator vs official sheet + check values; no hardware) ────────
+# ── Baseband buffer (CM/CL time-multiplexed, seamless loop) ────────────────────
+
+def build_l2c_buffer(prn: int, loop: str):
+    """The complex64 L2C baseband buffer at SAMP_RATE_HZ (real BPSK, Q=0). loop='cm' →
+    one 20 ms CM period (CL truncated); loop='full' → one 1.5 s CL period. Each is a whole
+    number of combined chips that is an exact integer sample count, so it loops with no
+    seam. Filled in chunks so the full 92-Msample loop needs only its own storage plus a
+    small working set (not several int64 copies of it). Returns (iq, n_samples)."""
+    import numpy as np
+
+    n_cl = CL_LEN if loop == "full" else CM_LEN
+    cm = np.asarray(cm_code(prn), dtype=np.int8)
+    cl = np.asarray(cl_code(prn, n_cl), dtype=np.int8)
+
+    period_s = n_cl / CHANNEL_CHIP_RATE          # 1.5 s (full) or 20 ms (cm)
+    sr = int(round(SAMP_RATE_HZ))
+    n_samples = int(round(period_s * sr))
+
+    out = np.empty(n_samples, dtype=np.complex64)
+    chunk = 1 << 22                              # ~4 M samples/pass → bounded working set
+    for s in range(0, n_samples, chunk):
+        e = min(s + chunk, n_samples)
+        n = np.arange(s, e, dtype=np.int64)
+        gchip = n * COMBINED_CHIP_RATE // sr     # 0 .. 2*n_cl-1
+        half = gchip >> 1
+        is_cl = (gchip & 1) == 1
+        bit = np.where(is_cl, cl[half % n_cl], cm[half % CM_LEN])
+        out[s:e] = (1.0 - 2.0 * bit).astype(np.complex64)
+    return out, n_samples
+
+
+# ── Digital passband filter (unity gain, circular → loop-preserving) ────────────────
+
+def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
+    """Blackman-Harris windowed-sinc lowpass, UNITY passband gain. `fc_hz` is the −6 dB
+    cutoff; `trans_hz` sets the tap count (steeper skirt → more taps). Returns (h, n_taps)."""
+    import numpy as np
+    m = int(np.ceil(5.5 * SAMP_RATE_HZ / max(trans_hz, 1.0))) | 1     # odd
+    m = min(m, (max_taps | 1))
+    k = np.arange(m)
+    c = (m - 1) / 2.0
+    fcn = fc_hz / SAMP_RATE_HZ
+    h = 2 * fcn * np.sinc(2 * fcn * (k - c))
+    n1 = m - 1
+    win = (0.35875 - 0.48829 * np.cos(2 * np.pi * k / n1)
+           + 0.14128 * np.cos(4 * np.pi * k / n1) - 0.01168 * np.cos(6 * np.pi * k / n1))
+    h = h * win
+    h = h / h.sum()                                 # unity DC (→ passband) gain
+    return h.astype(np.float64), m
+
+
+def _circular_convolve(x, h):
+    """Circular convolution of period len(x) between complex `x` and real FIR `h` (len ≤ len(x)).
+    For a short filter on a huge loop (the 1.5 s CL buffer is ~92 M samples at 61.38 MHz) a single
+    monolithic DFT would need several GB, so this uses OVERLAP-ADD with a small block FFT and then
+    aliases the (M−1)-sample linear-convolution tail back to the head — which is exactly what makes
+    the result circular, so the filtered loop still repeats with no seam. Peak memory is one
+    complex64 copy of the loop plus O(block), not O(len·16 bytes)."""
+    import numpy as np
+    n = len(x)
+    m = len(h)
+    if m >= n:                                        # tiny loop — a direct DFT is fine
+        return np.fft.ifft(np.fft.fft(x) * np.fft.fft(h, n)).astype(np.complex64)
+    nfft = 1
+    while nfft < 4 * m:                               # comfortably larger than the filter
+        nfft <<= 1
+    step = nfft - (m - 1)                             # samples consumed per block
+    hf = np.fft.fft(h, nfft)
+    y = np.zeros(n, dtype=np.complex64)               # accumulator (bounded memory)
+    for start in range(0, n, step):
+        blk = x[start:start + step]
+        yb = np.fft.ifft(np.fft.fft(blk, nfft) * hf)  # linear conv of this block (len blk + m − 1)
+        yb = yb[:len(blk) + m - 1]
+        end = start + len(yb)
+        if end <= n:
+            y[start:end] += yb
+        else:                                         # wrap the tail → circular aliasing
+            first = n - start
+            y[start:n] += yb[:first]
+            y[0:len(yb) - first] += yb[first:]
+    return y
+
+
+def filter_buffer(base_iq, sidelobes: int, trans_hz: float):
+    """Circularly filter the looped L2C buffer to keep the main lobe + `sidelobes` sidelobes.
+    Circular convolution keeps the result exactly periodic, so the filtered loop has no seam;
+    unity passband gain leaves the kept lobes' power unchanged. Returns (filtered_iq, n_taps,
+    passband_edge_hz)."""
+    fp = (int(sidelobes) + 1) * L2C_NULL_HZ          # flat passband edge (kept up to here)
+    fc = fp + trans_hz / 2.0                          # −6 dB cutoff = edge + half the transition
+    n = len(base_iq)
+    h, m = _design_lowpass(fc, trans_hz, n // 2)
+    return _circular_convolve(base_iq, h), m, fp
+
+
+# ── Self-test (generator vs official sheet + check values; filter when numpy present) ──
 
 def _self_test() -> int:
     ok = True
@@ -210,147 +322,172 @@ def _self_test() -> int:
         ok = ok and good
         print(f"{kind} PRN{prn}: first24={oct(got)} expect={oct(want)} [{'OK' if good else 'FAIL'}]")
 
-    # Structural: lengths and rough balance.
     cm1 = cm_code(1)
-    print(f"CM len={len(cm1)} ones={sum(cm1)} (≈5115) [{'OK' if len(cm1)==CM_LEN else 'FAIL'}]")
-    ok = ok and len(cm1) == CM_LEN
+    len_ok = len(cm1) == CM_LEN
+    print(f"CM len={len(cm1)} ones={sum(cm1)} (≈5115) [{'OK' if len_ok else 'FAIL'}]")
+    ok = ok and len_ok
 
-    print("SELF-TEST PASSED" if ok else "SELF-TEST FAILED")
+    try:
+        import numpy as np
+    except ImportError:
+        print("(numpy absent — skipping the filter check)")
+        return 0 if ok else 1
+
+    base, n = build_l2c_buffer(1, "cm")
+
+    def band(x, lo, hi):
+        X = np.fft.fftshift(np.fft.fft(x))
+        f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
+        return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
+
+    filt, taps, fp = filter_buffer(base, sidelobes=2, trans_hz=0.5e6)
+    main = 10 * np.log10(band(filt, 0, L2C_NULL_HZ) / band(base, 0, L2C_NULL_HZ))
+    kept = 10 * np.log10(band(filt, 2 * L2C_NULL_HZ, 3 * L2C_NULL_HZ)
+                         / band(base, 2 * L2C_NULL_HZ, 3 * L2C_NULL_HZ))
+    cut = 10 * np.log10(band(filt, 10e6, 12e6) / band(base, 10e6, 12e6))
+    peak = float(np.max(np.abs(filt)))
+    f_ok = abs(main) < 0.1 and abs(kept) < 0.1 and cut < -40 and peak * AMPLITUDE < 1.0
+    print(f"filter (main+2 sidelobes, {taps} taps): main lobe {main:+.3f} dB, kept sidelobe "
+          f"{kept:+.3f} dB, far sidelobe {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} "
+          f"[{'OK' if f_ok else 'FAIL'}]")
+    ok = ok and f_ok
+    print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
 
-# ── Baseband buffer (CM/CL time-multiplexed, seamless loop) ────────────────────
+# ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def build_l2c_buffer(prn: int, loop: str, samp_rate_hz: float):
-    """Build a complex64 L2C baseband buffer (real BPSK, Q=0). loop='full' → one
-    1.5 s CL period; loop='cm' → one 20 ms CM period (CL truncated). Returns
-    (iq, n_samples)."""
+def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float,
+                     amplitude: float):
+    """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
+
+    The looped baseband buffer is streamed from RAM by a C++ blocks.vector_source_c
+    (repeat=True) — NOT a file_source, and NOT a Python source:
+      • file_source streams GIL-free and holds the rate, but swapping it live (open()) races
+        GNU Radio internally and THROWS "fread error", which kills the source and silences the
+        radio. With no file that is impossible.
+      • a Python gr.sync_block has no file either, but its work() runs through the Python
+        gateway under the GIL and can't sustain 61.38 Msps on a Pi — it underflows even in
+        steady state (no tuning).
+    vector_source_c is C++ (GIL-free, no per-sample Python) AND has no file, so it streams as
+    smoothly as file_source did, with none of the fread risk. Its one caveat: set_data() is not
+    itself locked against work(), so the live filter swap runs it under top-block lock()/
+    unlock(), which quiesces the flowgraph for the (brief) duration of the swap — the buffer is
+    never freed under a running read. That pause happens only on a filter change; the steady
+    stream is untouched."""
     import numpy as np
-
-    n_cl = CL_LEN if loop == "full" else CM_LEN
-    cm = np.asarray(cm_code(prn), dtype=np.int8)
-    cl = np.asarray(cl_code(prn, n_cl), dtype=np.int8)
-
-    period_s = n_cl / CHANNEL_CHIP_RATE          # 1.5 s (full) or 20 ms (cm)
-    sr = int(round(samp_rate_hz))
-    n_samples = int(round(period_s * sr))
-
-    n = np.arange(n_samples, dtype=np.int64)
-    gchip = n * COMBINED_CHIP_RATE // sr         # 0 .. 2*n_cl-1
-    half = (gchip >> 1)
-    is_cl = (gchip & 1) == 1
-    bit = np.where(is_cl, cl[half % n_cl], cm[half % CM_LEN])
-    iq = (1.0 - 2.0 * bit).astype(np.complex64)
-    return iq, n_samples
-
-
-# ── Flowgraph ──────────────────────────────────────────────────────────────────
-
-def _build_top_block(iq_file, center_freq_hz, samp_rate_hz, gain_db, amplitude,
-                     otw_format, extra_args):
     from gnuradio import gr, blocks, uhd
+
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer; the filtered loop may not be.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class L2CTx(gr.top_block):
         def __init__(self):
-            super().__init__("GPS L2C TX")
-            args = (f"master_clock_rate={samp_rate_hz:.0f},"
+            super().__init__(f"{SIGNAL_NAME} TX")
+            args = (f"master_clock_rate={SAMP_RATE_HZ:.0f},"
                     "num_send_frames=512,send_frame_size=16000")
-            if extra_args:
-                args += "," + extra_args
             self.usrp = uhd.usrp_sink(
-                args,
-                uhd.stream_args(cpu_format="fc32", otw_format=otw_format, channels=[0]),
-            )
-            self.usrp.set_samp_rate(samp_rate_hz)
+                args, uhd.stream_args(cpu_format="fc32", otw_format=OTW_FORMAT, channels=[0]))
+            self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
-            self.src = blocks.file_source(gr.sizeof_gr_complex, iq_file, repeat=True)
+            # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+            self.src = blocks.vector_source_c(_vec(initial_iq), True, 1, [])
             self.amp = blocks.multiply_const_cc(amplitude)
             self.connect(self.src, self.amp, self.usrp)
 
-        def set_gain(self, g): self.usrp.set_gain(g, 0)
-        def set_amplitude(self, a): self.amp.set_k(a)
-        def actual_gain(self): return self.usrp.get_gain(0)
-        def actual_samp_rate(self): return self.usrp.get_samp_rate()
+        def set_gain(self, g):
+            self.usrp.set_gain(g, 0)
+
+        def set_amplitude(self, a):
+            self.amp.set_k(a)
+
+        def swap(self, iq):
+            # set_data() reassigns (and frees) the source's buffer with no internal lock, so it
+            # must not run while work() is reading. lock()/unlock() quiesces the flowgraph
+            # around the swap — the only moment the stream pauses, and only on a filter change.
+            data = _vec(iq)
+            self.lock()
+            try:
+                self.src.set_data(data, [])
+            finally:
+                self.unlock()
+
+        def actual_gain(self):
+            return self.usrp.get_gain(0)
+
+        def actual_samp_rate(self):
+            return self.usrp.get_samp_rate()
 
     return L2CTx()
 
 
-# ── Parameter schema ────────────────────────────────────────────────────────────
+# ── Parameter schema ────────────────────────────────────────────────────────────────
 
 def build_script() -> Script:
-    s = (
-        Script("GPS L2C transmitter (CM/CL time-multiplexed, real IS-GPS-200 "
-               "codes, 1.023 Mcps BPSK), file-replay. Authorised, shielded "
+    return (
+        Script(f"{SIGNAL_NAME} transmitter (CM/CL time-multiplexed, real IS-GPS-200 codes, "
+               "1.023 Mcps BPSK) — fixed 61.38 MHz / sc8, looped buffer, optional "
+               "power-preserving digital passband filter. Level is set in dBm via the unit's "
+               "calibration; uncalibrated it runs on a relative gain. Authorised, shielded "
                "setups only.")
+        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=L2_HZ / 1e6,
+                help="RF carrier in MHz (default L2 = 1227.60). Fixed per run.")
+        .number("-Power", "--power", unit="dBm",
+                **power_map().power_field_kwargs(), required=False, live=True,
+                help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
+                     "calibration and snaps to its achievable grid; ignored if --gain is "
+                     "given. Live.")
+        .number("-Gain", "--gain", unit="dB", min=0, max=HW_MAX_GAIN_DB,
+                required=False, live=True,
+                help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
+                     "calibration. When given, overrides --power. Live.")
         .integer("-PRN", "--prn", min=1, max=63, default=1, required=True,
                  help="GPS satellite PRN (1..63) — the real L2C code. Fixed per run.")
         .choice("-Loop", "--loop", options=["full", "cm"], default="full",
-                help="full = whole 1.5 s CL period (bit-exact, big file); "
-                     "cm = 20 ms CM period (CL truncated; small, envelope-correct).")
-        .number("-Center-frequency", "--freq", unit="Hz", min=70e6, max=6e9,
-                presets=FREQUENCIES, default=L2_HZ,
-                help="RF carrier (default L2). Fixed per run.")
-        .number("-Power", "--power", unit="dBm",
-                **power_map().power_field_kwargs(), required=True, live=True,
-                help="ABSOLUTE power at the delivered plane (dBm). Bounds track the "
-                     "unit's calibration when present (e.g. EIRP), else the baked "
-                     "SDR-port scale. Ignored if --gain is given (relative wins). Live.")
-        .number("-Sample-rate", "--sample_rate", unit="MHz", min=5.0, max=61.44,
-                default=10.23,
-                help="Host/DAC sample rate; master clock pinned equal (1:1). "
-                     "L2C is ~2 MHz wide; 10.23 → 10 samples/chip. Fixed per run.")
-        .choice("-OTW-format", "--otw", options=["sc8", "sc16"], default="sc8",
-                help="Over-the-wire format. sc8 halves USB load; sc16 more range.")
-        .choice("-RF", "--rf", options=["on", "off"], default="on",
+                help="full = whole 1.5 s CL period (bit-exact CL phase, complete spectrum; "
+                     "~736 MB in RAM at 61.38 MHz); cm = 20 ms CM period (CL truncated; "
+                     "~9.8 MB, envelope-correct) for tight RAM.")
+        .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
-                help="RF output on/off. OFF mutes the signal (gain AND baseband "
-                     "amplitude to 0); ON restores them. Change the power (or the "
-                     "calibration gain) while OFF and it takes effect when you turn ON.")
-        # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
-        # No default, so its PRESENCE selects relative mode (it overrides --power).
-        # This is also the calibration knob — set it while measuring output vs gain on
-        # a spectrum analyser to fill in OUTPUT_POWER_DBM / GAIN_AT_MAX_DB above.
-        .number("-Analog-bandwidth", "--bandwidth", unit="MHz", min=0.0, max=56.0,
-                default=0.0, required=False,
-                help="AD9361 analog TX filter bandwidth (MHz) — the real baseband LPF, set "
-                     "independently of the sample rate. 0 = auto (UHD picks it from the "
-                     "sample rate, the old behaviour); a positive value band-limits the "
-                     "signal WITHOUT changing the master clock. Coerced to the radio's "
-                     "range; the banner reports the actual.")
-        .number("-Gain", "--gain", unit="dB",
-                min=0, max=HW_MAX_GAIN_DB, required=False, live=True,
-                help="RELATIVE power: set the SDR's raw TX gain (dB) directly, "
-                     "bypassing the dBm calibration. When given, overrides --power. Live.")
+                help="Digital passband filter on the looped buffer (unity passband gain, so "
+                     "it preserves what it passes). Live.")
+        .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, default=2,
+                 presets=SIDELOBE_PRESETS, required=False, live=True,
+                 help="Passband width, as the number of sidelobes KEPT beside the main lobe: "
+                      "a ±(n+1)·1.023 MHz band. Live (rebuilds the filtered loop).")
+        .number("-Transition", "--transition", unit="MHz", min=0.05, max=5.0, default=0.5,
+                required=False, live=True,
+                help="Filter skirt transition width beyond the passband edge (MHz) — the "
+                     "steepness knob. Live (rebuilds the filtered loop).")
+        .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
+                     "restores them. Live.")
     )
-    return s
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────────
+# ── Entry point ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import atexit
-    import shutil
-    import tempfile
-
     script = build_script()
     args = script.parse()
-    samp_rate_hz = args.sample_rate * 1e6
-    # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
-    # else it runs uncalibrated — a relative gain only (no baked behaviour).
+    center_freq_hz = args.freq * 1e6
+
     pmap = power_map()
     amplitude = pmap.amplitude
-    # A raw --gain (relative / calibration knob) overrides the dBm mapping when present,
-    # so you can command a gain directly or measure output power at it.
-    gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+
+    # Gain precedence: explicit --gain (raw) > calibrated --power > refuse (uncalibrated).
+    gain_cal = getattr(args, "gain", None)
     if gain_cal is not None:
         gain_db = float(gain_cal)
-    elif power_map().has_absolute:                  # calibrated: the authored absolute --power
-        gain_db = power_map().gain_for_power(args.power)
-    else:                                           # uncalibrated: a persisted fallback gain, or refuse
+    elif pmap.has_absolute:
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
+    else:
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
             print("error: this signal is not calibrated on this unit — absolute --power (dBm) "
@@ -359,67 +496,86 @@ def main() -> int:
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="gps_l2c_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    # Prebuild the unfiltered loop once (PRN/loop are fixed per run); the filter derives from it.
+    base_iq, nsamp = build_l2c_buffer(args.prn, args.loop)
 
-    iq, nsamp = build_l2c_buffer(args.prn, args.loop, samp_rate_hz)
-    iq_file = os.path.join(tmpdir, f"l2c_prn{args.prn}_{args.loop}.fc32")
-    iq.tofile(iq_file)
+    # Filter "shape" (the regeneration-requiring params) — mutated by live changes.
+    shape = {"on": getattr(args, "filter", "off") == "on",
+             "sidelobes": int(getattr(args, "sidelobes", 2) or 0),
+             "trans_hz": float(getattr(args, "transition", 0.5) or 0.5) * 1e6}
 
-    tb = _build_top_block(iq_file, args.freq, samp_rate_hz, gain_db,
-                          amplitude, args.otw, "")
+    def make_current():
+        """The buffer for the current shape: the base loop, or the circularly-filtered loop.
+        Returns (iq, info) where info describes the filter for the banner/report."""
+        if not shape["on"]:
+            return base_iq, {"on": False}
+        filtered, taps, fp = filter_buffer(base_iq, shape["sidelobes"], shape["trans_hz"])
+        return filtered, {"on": True, "taps": taps, "edge_hz": fp,
+                          "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
 
-    # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
-    # flow muted; power/gain edits made while OFF are staged and reach the radio
-    # only when RF is switched ON.
+    iq0, finfo = make_current()
+
+    tb = _build_top_block(initial_iq=iq0, center_freq_hz=center_freq_hz,
+                          gain_db=gain_db, amplitude=amplitude)
+
+    def regenerate():
+        """Rebuild the loop for the current filter shape and swap it in atomically (one seam,
+        then it loops clean). Runs on the control thread; the flowgraph keeps streaming the old
+        buffer until the swap. In-RAM — no file, so the source can never be left dead by a
+        read error."""
+        iq, info = make_current()
+        tb.swap(iq)
+        return info
+
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
     if not state["rf_on"]:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
 
-    print("── GPS L2C TX ──────────────────────────────────────────────")
+    def _fmt_band(info):
+        if not info.get("on"):
+            return "off (full signal)"
+        return (f"on — main + {info['sidelobes']} sidelobe(s) "
+                f"(±{info['edge_hz']/1e6:.2f} MHz), {info['trans_hz']/1e6:g} MHz transition, "
+                f"{info['taps']} taps")
+
+    print(f"── {SIGNAL_NAME} TX ─────────────────────────────────────────")
     print(f"  satellite PRN  : {args.prn}  (real L2C code, CM+CL)")
-    print(f"  carrier        : {args.freq/1e6:.3f} MHz")
-    print(f"  sample rate    : requested {args.sample_rate:g} MHz, "
-          f"got {tb.actual_samp_rate()/1e6:.6f} MHz (1:1 master clock)")
+    print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz")
+    print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
     print(f"  modulation     : BPSK-R(1) — 1.023 Mcps (CM/CL @ 511.5 kcps each)")
     print(f"  loop           : {args.loop} "
-          f"({'1.5 s (bit-exact)' if args.loop=='full' else '20 ms (CL truncated)'})")
-    print(f"  buffer         : {nsamp} samples ({nsamp*8/1e6:.1f} MB)")
-    if power_map().has_absolute:
-        print(f"  power (target) : {args.power:g} dBm  ({power_map().label})")
-    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
-          f"amplitude {amplitude:g}")
-    print(f"  calibration    : {pmap.source}")
-    if pmap.warning:                       # e.g. calibration amplitude != this
-        print(f"  ⚠ CALIBRATION  : {pmap.warning}")   # script's fixed amplitude
-    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
+          f"({'1.5 s (bit-exact CL)' if args.loop=='full' else '20 ms (CL truncated)'}), "
+          f"{nsamp} samples ({nsamp*8/1e6:.1f} MB)")
+    if pmap.has_absolute:
+        print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
+        print(f"  power (achieved on grid): "
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
+    print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), amplitude {amplitude:g}")
+    print(f"  calibration    : {pmap.describe()}")
+    if pmap.warning:
+        print(f"  ⚠ CALIBRATION  : {pmap.warning}")
     if gain_cal is not None:
         print("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    print(f"  otw            : {args.otw}")
+    print(f"  filter         : {_fmt_band(finfo)}")
+    print(f"  otw            : {OTW_FORMAT}")
+    print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     print("────────────────────────────────────────────────────────────")
     sys.stdout.flush()
 
     ctrl = script.live_control(args)
 
     def apply_change(name, value):
-        # power/gain edits are staged into state["gain"] and only reach the radio
-        # when RF is on; the --rf toggle mutes/restores gain AND amplitude.
-        if name == "power":
-            state["gain"] = pmap.gain_for_power(float(value))
+        if name == "power" and pmap.has_absolute:
+            state["gain"] = pmap.gain_for_power(float(value), freq=center_freq_hz)
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain()), 2))
-            else:
-                ctrl.report("power", round(pmap.power_for_gain(state["gain"]), 2))
+            ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=center_freq_hz), 2))
         elif name == "gain":
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("gain", round(tb.actual_gain(), 2))
-            else:
-                ctrl.report("gain", round(state["gain"], 2))
+            ctrl.report("gain", round(state["gain"], 2))
         elif name == "rf":
             on = str(value).strip().lower() in ("on", "1", "true", "yes")
             state["rf_on"] = on
@@ -430,19 +586,20 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
+        elif name in ("filter", "sidelobes", "transition"):
+            if name == "filter":
+                shape["on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
+            elif name == "sidelobes":
+                shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
+            else:
+                shape["trans_hz"] = float(value) * 1e6
+            regenerate()
+            ctrl.report(name, value)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    _bw = float(getattr(args, "bandwidth", 0.0) or 0.0)
-    if _bw > 0:                                   # AD9361 analog LPF, independent of master clock
-        tb.usrp.set_bandwidth(_bw * 1e6, 0)
-    try:
-        print(f"  analog TX BW   : {tb.usrp.get_bandwidth(0)/1e6:.3f} MHz (AD9361 filter"
-              f"{'' if _bw > 0 else ' — auto from Fs'})")
-    except Exception:      # noqa: BLE001
-        pass
     tb.start()
     try:
         while not stop.is_set():
