@@ -15,8 +15,8 @@ sweeps ±sweep_bw/2 around the carrier, and the modulating waveform repeats at
 
 Why this reaches 40–60 MS/s on a Pi (see gps_l1ca_tx.py for the full write-up)
 ────────────────────────────────────────────────────────────────────────────
-  1. PRECOMPUTE + LOOP — one whole sweep is built once and replayed with
-     blocks.file_source(repeat=True); no per-sample NumPy in a work() block
+  1. PRECOMPUTE + LOOP — one whole sweep is built once and replayed with a C++
+     blocks.vector_source_c(repeat=True); no per-sample NumPy in a work() block
      (that per-sample synthesis is exactly what capped the old TriangleChirp).
   2. sc8 over the wire — halves USB payload.
   3. Quiet — UHD fastpath/console logging off, and the task runs with
@@ -41,9 +41,9 @@ Live tuning (retune while transmitting, via paramkit.live)
     power      → dBm → set_gain          (instant — see the USER CALIBRATION block)
     rf         → on/off mute/unmute      (instant — gain AND amplitude to 0 / back)
     bw         → rebuild buffer + swap    ┐ shape changes: regenerate one sweep
-    sweep_rate → rebuild buffer + swap    │ into a new /dev/shm file and
-    waveform   → rebuild buffer + swap    ┘ file_source.open() it (one brief seam
-                                            at the swap, then it loops clean)
+    sweep_rate → rebuild buffer + swap    │ in RAM and set_data() it under the
+    waveform   → rebuild buffer + swap    ┘ top-block lock (one brief seam at the
+                                            swap, then it loops clean)
 Regeneration runs on the control thread; the flowgraph keeps streaming the old
 buffer on GNU Radio's scheduler threads until the swap, so RF never stops.
 
@@ -140,7 +140,7 @@ MAX_SWEEP_BW_MHZ = 55.0      # sweep is ±bw/2; keep it inside ±Nyquist (±30.6
 
 WAVEFORMS = ["Sine", "Triangle", "Sawtooth", "Square"]
 
-# Tile the single sweep period up to at least this many samples so file_source
+# Tile the single sweep period up to at least this many samples so the looping source
 # wraps infrequently at high rate (whole periods only → still seamless).
 MIN_BUFFER_SAMPS = 1 << 18   # 262144 samples ≈ 2 MB as fc32
 
@@ -301,9 +301,22 @@ def _self_test() -> int:
 
 # ── Flowgraph ──────────────────────────────────────────────────────────────────
 
-def _build_top_block(initial_file: str, center_freq_hz: float, lo_offset_hz: float,
+def _build_top_block(initial_iq, center_freq_hz: float, lo_offset_hz: float,
                      gain_db: float, amplitude: float):
+    """The looped sweep is streamed from RAM by a C++ blocks.vector_source_c (repeat=True),
+    NOT a file_source, and NOT a Python source: swapping a file_source live (open()) races GNU
+    Radio and THROWS "fread error" (the source dies, radio silent); a Python source has no file
+    but its work() runs under the GIL and can't hold 61.38 Msps on a Pi. vector_source_c is C++
+    (GIL-free) with no file, so it streams smoothly with no fread risk. A live waveform/filter
+    change swaps the buffer with set_data() under top-block lock()/unlock() (set_data has no
+    internal lock), so it's never freed under a running read — the stream pauses only for the
+    swap, only on a change."""
+    import numpy as np
     from gnuradio import gr, blocks, uhd
+
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer; the filtered loop may not be.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class ChirpTx(gr.top_block):
         def __init__(self):
@@ -321,8 +334,8 @@ def _build_top_block(initial_file: str, center_freq_hz: float, lo_offset_hz: flo
             self._retune()
             self.usrp.set_gain(gain_db, 0)
 
-            self.src = blocks.file_source(gr.sizeof_gr_complex, initial_file,
-                                          repeat=True)
+            # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+            self.src = blocks.vector_source_c(_vec(initial_iq), True, 1, [])
             self.amp = blocks.multiply_const_cc(amplitude)
             self.connect(self.src, self.amp, self.usrp)
 
@@ -345,8 +358,16 @@ def _build_top_block(initial_file: str, center_freq_hz: float, lo_offset_hz: flo
         def set_amplitude(self, a: float) -> None:
             self.amp.set_k(a)
 
-        def swap_file(self, path: str) -> None:
-            self.src.open(path, True)          # switch at next work boundary
+        def swap(self, iq) -> None:
+            # set_data() reassigns (and frees) the source's buffer with no internal lock, so it
+            # must not run while work() is reading. lock()/unlock() quiesces the flowgraph
+            # around the swap — the only moment the stream pauses, and only on a change.
+            data = _vec(iq)
+            self.lock()
+            try:
+                self.src.set_data(data, [])
+            finally:
+                self.unlock()
 
         def actual_freq(self) -> float:
             return self.usrp.get_center_freq(0)
@@ -474,10 +495,6 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import atexit
-    import shutil
-    import tempfile
-
     script = build_script()
     args = script.parse()
     try:
@@ -510,16 +527,6 @@ def main() -> int:
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="fm_chirp_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
-
-    def write_buffer(iq) -> str:
-        fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
-        os.close(fd)
-        iq.tofile(path)
-        return path
-
     # Current "shape" (the regeneration-requiring params) — mutated by live changes.
     # bw_hz comes from resolve_band (either --bw directly, or the start/stop span).
     band_mode = getattr(args, "band_mode", "center_bw")
@@ -542,10 +549,9 @@ def main() -> int:
                                            "trans_hz": shape["trans_hz"]}
 
     iq, n_per, reps, actual_rate, finfo = make_current()
-    box = {"file": write_buffer(iq)}   # mutable holder so the closure can swap/clean up
 
     tb = _build_top_block(
-        initial_file=box["file"], center_freq_hz=center_freq_hz,
+        initial_iq=iq, center_freq_hz=center_freq_hz,
         lo_offset_hz=args.lo_offset * 1e6, gain_db=gain_db, amplitude=amplitude)
 
     # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
@@ -563,15 +569,7 @@ def main() -> int:
 
     def regenerate() -> float:
         iq, _n, _r, actual, _fi = make_current()
-        new_file = write_buffer(iq)
-        tb.swap_file(new_file)
-        old, box["file"] = box["file"], new_file
-        # Safe to unlink now: file_source keeps the old inode until it closes it
-        # at the swap; the space frees then (Linux unlink-while-open semantics).
-        try:
-            os.unlink(old)
-        except OSError:
-            pass
+        tb.swap(iq)                            # atomic in-RAM buffer swap under top-block lock
         return actual
 
     def _fmt_band(info):

@@ -8,8 +8,8 @@ its edges and pitch: the frequency of the FIRST knife, the SPACING between knive
 the frequency of the LAST knife. The knife count is derived from those (see below), so
 the three numbers can never disagree.
 
-Prebuilt once and looped from a /dev/shm file so a Raspberry Pi sustains the rate with
-no runtime IQ math (same recipe as the PRN scripts).
+Prebuilt once and looped from RAM by a C++ vector_source_c so a Raspberry Pi sustains the
+rate with no runtime IQ math (same recipe as the PRN scripts).
 
 ⚠  RF SAFETY / LEGAL: many GNSS bands live in this range. Transmit ONLY into a shielded
    / conducted setup (cable + attenuators) you are LICENSED / AUTHORISED to use — never
@@ -258,9 +258,20 @@ def _self_test() -> int:
 
 # ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def _build_top_block(iq_file: str, center_freq_hz: float, gain_db: float, amplitude: float):
-    """The GNU Radio top_block, imported lazily so the module loads without a radio stack."""
+def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitude: float):
+    """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
+
+    The comb loop is streamed from RAM by a C++ blocks.vector_source_c (repeat=True), NOT a
+    file_source: a file_source returns -1 ("done") on any read hiccup, which the scheduler
+    treats as end-of-stream — the source dies and the radio goes silent while the task still
+    reports RUNNING. vector_source_c is C++ (GIL-free, holds 61.38 Msps) with no file, so that
+    can't happen. The comb is static (no live rebuild), so there is no buffer swap."""
+    import numpy as np
     from gnuradio import gr, blocks, uhd
+
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class CombTx(gr.top_block):
         def __init__(self):
@@ -272,7 +283,8 @@ def _build_top_block(iq_file: str, center_freq_hz: float, gain_db: float, amplit
             self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
-            self.src = blocks.file_source(gr.sizeof_gr_complex, iq_file, repeat=True)
+            # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+            self.src = blocks.vector_source_c(_vec(initial_iq), True, 1, [])
             self.amp = blocks.multiply_const_cc(amplitude)
             self.connect(self.src, self.amp, self.usrp)
 
@@ -357,10 +369,6 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import atexit
-    import shutil
-    import tempfile
-
     script = build_script()
     args = script.parse()
 
@@ -402,13 +410,7 @@ def main() -> int:
 
     iq = build_comb_buffer(plan["bins"], plan["n"])
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="comb_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
-    iq_file = os.path.join(tmpdir, "comb.fc32")
-    iq.tofile(iq_file)
-
-    tb = _build_top_block(iq_file, lo_hz, gain_db, amplitude)
+    tb = _build_top_block(iq, lo_hz, gain_db, amplitude)
 
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
     if not state["rf_on"]:
