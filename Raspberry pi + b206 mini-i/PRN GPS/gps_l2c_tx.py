@@ -33,9 +33,9 @@ Uncalibrated, there is no dBm scale — use --gain. (See docs/calibration-v2.md.
 Loop length (--loop)
 ────────────────────
   full (default) : one whole CL period = 1.5 s (CM repeats 75×). Bit-exact CL phase and
-                 complete spectrum. ~736 MB in /dev/shm at 61.38 MHz (it must live in RAM
-                 to stream at rate), so the host needs the headroom. The live filter stays
-                 responsive because it uses a memory-bounded overlap-add convolution (no
+                 complete spectrum. ~736 MB held in RAM at 61.38 MHz (the loop must live in
+                 memory to stream at rate), so the host needs the headroom. The live filter
+                 stays responsive because it uses a memory-bounded overlap-add convolution (no
                  92-Msample monolithic FFT) and the flowgraph keeps looping the old buffer
                  until the new one is ready.
   cm             : one CM period = 20 ms (CL truncated to its first 10230 chips), ~9.8 MB.
@@ -357,10 +357,30 @@ def _self_test() -> int:
 
 # ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float,
+def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float,
                      amplitude: float):
-    """The GNU Radio top_block, imported lazily so the module loads without a radio stack."""
+    """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
+
+    The looped baseband buffer is streamed from RAM by a C++ blocks.vector_source_c
+    (repeat=True) — NOT a file_source, and NOT a Python source:
+      • file_source streams GIL-free and holds the rate, but swapping it live (open()) races
+        GNU Radio internally and THROWS "fread error", which kills the source and silences the
+        radio. With no file that is impossible.
+      • a Python gr.sync_block has no file either, but its work() runs through the Python
+        gateway under the GIL and can't sustain 61.38 Msps on a Pi — it underflows even in
+        steady state (no tuning).
+    vector_source_c is C++ (GIL-free, no per-sample Python) AND has no file, so it streams as
+    smoothly as file_source did, with none of the fread risk. Its one caveat: set_data() is not
+    itself locked against work(), so the live filter swap runs it under top-block lock()/
+    unlock(), which quiesces the flowgraph for the (brief) duration of the swap — the buffer is
+    never freed under a running read. That pause happens only on a filter change; the steady
+    stream is untouched."""
+    import numpy as np
     from gnuradio import gr, blocks, uhd
+
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer; the filtered loop may not be.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class L2CTx(gr.top_block):
         def __init__(self):
@@ -372,7 +392,8 @@ def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float,
             self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
-            self.src = blocks.file_source(gr.sizeof_gr_complex, initial_file, repeat=True)
+            # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+            self.src = blocks.vector_source_c(_vec(initial_iq), True, 1, [])
             self.amp = blocks.multiply_const_cc(amplitude)
             self.connect(self.src, self.amp, self.usrp)
 
@@ -382,8 +403,16 @@ def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float,
         def set_amplitude(self, a):
             self.amp.set_k(a)
 
-        def swap_file(self, path):
-            self.src.open(path, True)                # switch at the next work boundary
+        def swap(self, iq):
+            # set_data() reassigns (and frees) the source's buffer with no internal lock, so it
+            # must not run while work() is reading. lock()/unlock() quiesces the flowgraph
+            # around the swap — the only moment the stream pauses, and only on a filter change.
+            data = _vec(iq)
+            self.lock()
+            try:
+                self.src.set_data(data, [])
+            finally:
+                self.unlock()
 
         def actual_gain(self):
             return self.usrp.get_gain(0)
@@ -445,10 +474,6 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import atexit
-    import shutil
-    import tempfile
-
     script = build_script()
     args = script.parse()
     center_freq_hz = args.freq * 1e6
@@ -474,16 +499,6 @@ def main() -> int:
     # Prebuild the unfiltered loop once (PRN/loop are fixed per run); the filter derives from it.
     base_iq, nsamp = build_l2c_buffer(args.prn, args.loop)
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="gps_l2c_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
-
-    def write_buffer(iq) -> str:
-        fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
-        os.close(fd)
-        iq.tofile(path)
-        return path
-
     # Filter "shape" (the regeneration-requiring params) — mutated by live changes.
     shape = {"on": getattr(args, "filter", "off") == "on",
              "sidelobes": int(getattr(args, "sidelobes", 2) or 0),
@@ -499,22 +514,17 @@ def main() -> int:
                           "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
 
     iq0, finfo = make_current()
-    box = {"file": write_buffer(iq0)}
 
-    tb = _build_top_block(initial_file=box["file"], center_freq_hz=center_freq_hz,
+    tb = _build_top_block(initial_iq=iq0, center_freq_hz=center_freq_hz,
                           gain_db=gain_db, amplitude=amplitude)
 
     def regenerate():
-        """Rebuild the loop for the current filter shape and swap it in (one seam, then it
-        loops clean). Runs on the control thread; the flowgraph keeps streaming until swap."""
+        """Rebuild the loop for the current filter shape and swap it in atomically (one seam,
+        then it loops clean). Runs on the control thread; the flowgraph keeps streaming the old
+        buffer until the swap. In-RAM — no file, so the source can never be left dead by a
+        read error."""
         iq, info = make_current()
-        new_file = write_buffer(iq)
-        tb.swap_file(new_file)
-        old, box["file"] = box["file"], new_file
-        try:
-            os.unlink(old)            # safe: file_source holds the old inode until it swaps
-        except OSError:
-            pass
+        tb.swap(iq)
         return info
 
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}

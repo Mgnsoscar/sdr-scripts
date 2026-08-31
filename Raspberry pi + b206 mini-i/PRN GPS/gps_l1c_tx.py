@@ -26,9 +26,9 @@ The overlay is a *slow* code: one ±1 symbol per 10 ms primary period, so the 18
 tiered pilot is the 10 ms pilot buffer replayed 1800 times with a per-period sign flip.
 Rather than precompute 18 s, the flow applies it at runtime:
 
-    pilot_file ─► × ─────────┐
+    pilot loop ─► × ─────────┐
     overlay(1800)─►repeat(N)─┘ ├─► + ─► (amp) ─► USRP
-    data_file  ──────────────┘
+    data loop  ──────────────┘
 
 so the full 18 s signal streams from ~10 MB. `--secondary off` drops it (10 ms primary
 loop only; spectrally identical, no secondary sync).
@@ -284,17 +284,22 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
-def filter_buffer(base_iq, nulls: int, trans_hz: float):
+def filter_buffer(base_iq, nulls: int, trans_hz: float, base_fft=None):
     """Circularly filter a looped L1C component buffer, passband edge snapped to the nth null
     (±`nulls`·1.023 MHz). Circular convolution keeps the result exactly periodic, so the
     filtered loop has no seam; unity passband gain leaves the kept lobes' power unchanged.
-    Returns (filtered_iq, n_taps, passband_edge_hz)."""
+    Pass `base_fft` (= np.fft.fft(base_iq)) to reuse it across live filter changes — each
+    component loop is fixed per run, so its DFT need only be computed once, which cuts the
+    per-change CPU spike (and the underflows it can cause). Returns
+    (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
     fp = int(nulls) * L1C_NULL_HZ                     # flat passband edge, on the nth null
     fc = fp + trans_hz / 2.0                          # −6 dB cutoff = edge + half the transition
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
-    filtered = np.fft.ifft(np.fft.fft(base_iq) * np.fft.fft(h, n)).astype(np.complex64)
+    if base_fft is None:
+        base_fft = np.fft.fft(base_iq)
+    filtered = np.fft.ifft(base_fft * np.fft.fft(h, n)).astype(np.complex64)
     return filtered, m, fp
 
 
@@ -365,11 +370,29 @@ def _self_test() -> int:
 
 # ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def _build_top_block(data_file, pilot_file, sec_signs, period_samples,
+def _build_top_block(data_iq, pilot_iq, sec_signs, period_samples,
                      center_freq_hz, gain_db, amplitude):
     """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
-    Holds references to the pilot/data file sources so their buffers can be swapped live."""
+
+    Each component loop is streamed from RAM by a C++ blocks.vector_source_c (repeat=True) —
+    NOT a file_source, and NOT a Python source:
+      • file_source streams GIL-free and holds the rate, but swapping it live (open()) races
+        GNU Radio internally and THROWS "fread error", which kills the source and silences the
+        radio. With no file that is impossible.
+      • a Python gr.sync_block has no file either, but its work() runs under the GIL and can't
+        sustain 61.38 Msps on a Pi — it underflows even in steady state.
+    vector_source_c is C++ (GIL-free) with no file, so it streams as smoothly as file_source
+    did, with none of the fread risk. set_data() has no internal lock against work(), so the
+    live filter swap replaces BOTH component buffers under one top-block lock()/unlock() — the
+    buffers are never freed under a running read, the summed signal never streams a new
+    component against an old one, and the pause is only for the swap, only on a filter
+    change."""
+    import numpy as np
     from gnuradio import gr, blocks, uhd
+
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer; the filtered loop may not be.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class L1CTx(gr.top_block):
         def __init__(self):
@@ -385,8 +408,9 @@ def _build_top_block(data_file, pilot_file, sec_signs, period_samples,
             self.pilot_src = None
             self.data_src = None
             branches = []
-            if pilot_file:
-                self.pilot_src = blocks.file_source(gr.sizeof_gr_complex, pilot_file, repeat=True)
+            if pilot_iq is not None:
+                # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+                self.pilot_src = blocks.vector_source_c(_vec(pilot_iq), True, 1, [])
                 if sec_signs is not None:
                     sec_src = blocks.vector_source_c(list(sec_signs), repeat=True)
                     sec_rep = blocks.repeat(gr.sizeof_gr_complex, int(period_samples))
@@ -396,8 +420,8 @@ def _build_top_block(data_file, pilot_file, sec_signs, period_samples,
                     branches.append(mult)
                 else:
                     branches.append(self.pilot_src)
-            if data_file:
-                self.data_src = blocks.file_source(gr.sizeof_gr_complex, data_file, repeat=True)
+            if data_iq is not None:
+                self.data_src = blocks.vector_source_c(_vec(data_iq), True, 1, [])
                 branches.append(self.data_src)
 
             self.amp = blocks.multiply_const_cc(amplitude)
@@ -416,13 +440,19 @@ def _build_top_block(data_file, pilot_file, sec_signs, period_samples,
         def set_amplitude(self, a):
             self.amp.set_k(a)
 
-        def swap_pilot(self, path):
-            if self.pilot_src is not None:
-                self.pilot_src.open(path, True)      # switch at the next work boundary
-
-        def swap_data(self, path):
-            if self.data_src is not None:
-                self.data_src.open(path, True)
+        def swap(self, data_iq, pilot_iq):
+            # Replace both component buffers under ONE lock, so the summed signal never streams
+            # a new component against an old one. set_data() has no internal lock vs work(), so
+            # lock()/unlock() quiesces the flowgraph for the swap — the only moment it pauses,
+            # and only on a filter change.
+            self.lock()
+            try:
+                if self.data_src is not None and data_iq is not None:
+                    self.data_src.set_data(_vec(data_iq), [])
+                if self.pilot_src is not None and pilot_iq is not None:
+                    self.pilot_src.set_data(_vec(pilot_iq), [])
+            finally:
+                self.unlock()
 
         def actual_gain(self):
             return self.usrp.get_gain(0)
@@ -486,10 +516,6 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
-    import atexit
-    import shutil
-    import tempfile
-
     script = build_script()
     args = script.parse()
     center_freq_hz = args.freq * 1e6
@@ -516,69 +542,53 @@ def main() -> int:
     data_base, pilot_base, nsamp = build_l1c_components(args.prn)
     want_data = args.component in ("both", "data")
     want_pilot = args.component in ("both", "pilot")
-
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="gps_l1c_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
-
-    def write_buffer(iq) -> str:
-        fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
-        os.close(fd)
-        iq.tofile(path)
-        return path
+    # DFT of each fixed component loop — computed once, reused across live filter changes.
+    data_fft = {"v": None}
+    pilot_fft = {"v": None}
 
     # Filter "shape" (the regeneration-requiring params) — mutated by live changes.
     shape = {"on": getattr(args, "filter", "off") == "on",
              "nulls": int(getattr(args, "nulls", 7) or 7),
              "trans_hz": float(getattr(args, "transition", 1.0) or 1.0) * 1e6}
 
-    def make_component(base):
-        """Filtered (or bare) copy of one component buffer for the current shape."""
+    def make_component(base, cache):
+        """Filtered (or bare) copy of one component buffer for the current shape, reusing the
+        component's cached base DFT across changes."""
         if not shape["on"]:
             return base, {"on": False}
-        filtered, taps, fp = filter_buffer(base, shape["nulls"], shape["trans_hz"])
+        if cache["v"] is None:
+            import numpy as np
+            cache["v"] = np.fft.fft(base)
+        filtered, taps, fp = filter_buffer(base, shape["nulls"], shape["trans_hz"],
+                                           base_fft=cache["v"])
         return filtered, {"on": True, "taps": taps, "edge_hz": fp, "trans_hz": shape["trans_hz"]}
 
     finfo = {"on": shape["on"], "edge_hz": shape["nulls"] * L1C_NULL_HZ,
              "trans_hz": shape["trans_hz"]}
-    data_file = pilot_file = None
+    data_iq0 = pilot_iq0 = None
     if want_data:
-        iq, finfo = make_component(data_base)
-        data_file = write_buffer(iq)
+        data_iq0, finfo = make_component(data_base, data_fft)
     if want_pilot:
-        iq, finfo = make_component(pilot_base)
-        pilot_file = write_buffer(iq)
+        pilot_iq0, finfo = make_component(pilot_base, pilot_fft)
 
-    sec_signs = overlay_signs(args.prn) if (pilot_file and args.secondary == "full") else None
+    sec_signs = overlay_signs(args.prn) if (pilot_iq0 is not None and args.secondary == "full") else None
 
-    box = {"data": data_file, "pilot": pilot_file}
-
-    tb = _build_top_block(data_file, pilot_file, sec_signs, nsamp,
+    tb = _build_top_block(data_iq0, pilot_iq0, sec_signs, nsamp,
                           center_freq_hz, gain_db, amplitude)
 
     def regenerate():
-        """Rebuild the filtered component loops for the current shape and swap them in (one
-        seam, then they loop clean). Runs on the control thread; the flow keeps streaming."""
+        """Rebuild the filtered component loops for the current shape and swap them in
+        atomically (one seam, then they loop clean). Runs on the control thread; the flow keeps
+        streaming the old buffers until the swap. In-RAM — no file, so a source can never be
+        left dead by a read error."""
         info = {"on": shape["on"], "edge_hz": shape["nulls"] * L1C_NULL_HZ,
                 "trans_hz": shape["trans_hz"]}
+        data_iq = pilot_iq = None
         if want_data:
-            iq, info = make_component(data_base)
-            new = write_buffer(iq)
-            tb.swap_data(new)
-            old, box["data"] = box["data"], new
-            try:
-                os.unlink(old)
-            except OSError:
-                pass
+            data_iq, info = make_component(data_base, data_fft)
         if want_pilot:
-            iq, info = make_component(pilot_base)
-            new = write_buffer(iq)
-            tb.swap_pilot(new)
-            old, box["pilot"] = box["pilot"], new
-            try:
-                os.unlink(old)
-            except OSError:
-                pass
+            pilot_iq, info = make_component(pilot_base, pilot_fft)
+        tb.swap(data_iq, pilot_iq)
         return info
 
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
