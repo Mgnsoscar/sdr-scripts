@@ -41,10 +41,12 @@ All three are LIVE: changing one rebuilds the (circularly-)filtered loop, writes
 RAM file (/dev/shm) and hot-swaps the file_source to it — one brief seam at the swap, then it
 loops clean; the flowgraph never stops. Disabling swaps back to the unfiltered loop. The loop
 is streamed by a C++ file_source (repeat=True) — the smooth, GIL-free path that holds the rate
-with no underflows. Its one failure mode is that on a read hiccup it returns -1 ("done"), which
-stops the whole flowgraph and leaves the radio silent until the task is restarted; a watchdog
-makes that non-fatal: it notices the flowgraph has stopped and restarts it in place in well
-under a second, so the signal self-heals instead of needing a manual restart.
+with no underflows. Its one failure mode is that on a read hiccup it THROWS ("fread error"),
+which kills only that block's thread: the flowgraph limps on, the sink starves (→ underflows)
+and the radio goes silent, but it never actually stops. A watchdog makes that non-fatal — a
+probe on the source lets the main loop see the throughput collapse to ~0 and restart the
+flowgraph in place in about a second, so the signal self-heals instead of needing a manual
+task restart.
 
 CLI
 ───
@@ -268,12 +270,15 @@ def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float, a
 
     The looped buffer is streamed by a C++ blocks.file_source(repeat=True) — the smooth,
     GIL-free path that holds the sample rate with no underflows, and whose open() hot-swaps
-    the file live (used for filter changes: one brief seam, no stop). Its one failure mode is
-    that on a read hiccup it returns -1 ("done"), which stops the whole flowgraph and leaves
-    the radio silent. main() makes that non-fatal by watching for the flowgraph to stop
-    (tb.wait() returns) and restarting it in place — so the old "signal gone until you restart
-    the task" behaviour becomes an automatic, sub-second self-heal. No probe/tap is used, so
-    nothing extra touches the sample stream."""
+    the file live (used for filter changes: one brief seam, no stop).
+
+    file_source has one nasty failure mode: on a read hiccup it THROWS ("fread error"), which
+    kills only its own thread — the rest of the flowgraph keeps running, so the sink just
+    starves (reporting underflows) and the radio goes silent, while top_block.wait() never
+    returns. To catch that, a blocks.probe_rate taps the source output; main() watches the
+    measured rate and, when it collapses to ~0, restarts the flowgraph in place. The tap is a
+    second reader on the source's existing output buffer (GNU Radio shares one buffer across
+    readers — no extra copy), so it costs a counter, not bandwidth."""
     from gnuradio import gr, blocks, uhd
 
     class PrnTx(gr.top_block):
@@ -288,7 +293,9 @@ def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float, a
             self.usrp.set_gain(gain_db, 0)
             self.src = blocks.file_source(gr.sizeof_gr_complex, initial_file, repeat=True)
             self.amp = blocks.multiply_const_cc(amplitude)
+            self.probe = blocks.probe_rate(gr.sizeof_gr_complex, 100.0, 0.5)
             self.connect(self.src, self.amp, self.usrp)
+            self.connect(self.src, self.probe)       # cheap tap: is the source still feeding?
 
         def set_gain(self, g):
             self.usrp.set_gain(g, 0)
@@ -298,6 +305,9 @@ def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float, a
 
         def swap_file(self, path):
             self.src.open(path, True)                # switch at the next work boundary
+
+        def stream_rate(self):
+            return self.probe.rate()                 # measured items/s (~0 once the source dies)
 
         def actual_gain(self):
             return self.usrp.get_gain(0)
@@ -502,36 +512,63 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    # Watchdog: a C++ file_source returns -1 ("done") on a read hiccup, which stops the whole
-    # flowgraph and leaves the radio silent while our process keeps running. tb.wait() returns
-    # exactly when the flowgraph stops, so a daemon thread blocked on it flags that stall; the
-    # main loop then re-opens the current loop file and restarts the flowgraph in place, so the
-    # signal self-heals in well under a second instead of staying dead until a manual restart.
-    dead = threading.Event()
+    # Watchdog. file_source's read hiccup THROWS ("fread error"), which kills only its own
+    # thread: the flowgraph keeps running, the sink starves (→ underflows) and the radio goes
+    # silent, but top_block.wait() never returns — so watching wait() alone (as before) misses
+    # it. Watch throughput instead: probe_rate on the source reads ~0 once it has died. Two
+    # signals feed one recovery — a daemon thread on tb.wait() (covers the rare case the graph
+    # does stop cleanly) and the probe collapsing to ~0 (covers the common limp-on case). On
+    # either, restart the flowgraph in place: re-open the current loop and start again, so the
+    # signal self-heals in about a second instead of staying dead until a manual task restart.
+    STALL_RATE = SAMP_RATE_HZ * 0.25     # < a quarter of nominal ⇒ the source isn't feeding
+    STALL_HOLD_S = 0.4                    # ...held this long (so a transient dip isn't a restart)
+    GRACE_S = 1.5                         # ignore the probe while a fresh run spins up
 
-    def _watch_completion():
+    gen = {"dead": threading.Event()}    # per-run completion flag (fresh each (re)start)
+
+    def _start_run() -> float:
+        """(Re)start the flowgraph and arm a fresh completion watcher; return the start time."""
+        ev = threading.Event()
+        gen["dead"] = ev
+
         def _wait():
-            tb.wait()          # returns when the flowgraph stops (read error, or our shutdown)
-            dead.set()
-        threading.Thread(target=_wait, daemon=True).start()
+            tb.wait()                     # returns only if/when the whole graph stops
+            ev.set()
+        tb.start()
+        threading.Thread(target=_wait, daemon=True, name="gr-wait").start()
+        return time.monotonic()
 
-    tb.start()
-    _watch_completion()
+    run_started = _start_run()
+    stall_since = None
+
+    def _recover():
+        nonlocal run_started, stall_since
+        print("watchdog: source stalled (fread error?) — restarting flowgraph",
+              file=sys.stderr, flush=True)
+        tb.stop()
+        tb.wait()                         # join the survivors; the old watcher's wait() returns
+        time.sleep(0.2)                   # brief settle so a persistent fault can't hot-loop
+        tb.swap_file(box["file"])         # re-open the current loop from the top
+        run_started = _start_run()        # fresh generation ⇒ the old watcher's flag is orphaned
+        stall_since = None
 
     try:
         while not stop.is_set():
             for change in ctrl.drain():
                 apply_change(change.name, change.value)
-            if dead.is_set() and not stop.is_set():
-                print("watchdog: flowgraph stopped (file read error?) — restarting",
-                      file=sys.stderr, flush=True)
-                tb.stop()
-                tb.wait()                    # ensure a clean, fully-stopped graph
-                time.sleep(0.2)              # brief settle so a persistent fault can't hot-loop
-                tb.swap_file(box["file"])    # re-open the current loop from the top
-                dead.clear()
-                tb.start()
-                _watch_completion()
+
+            now = time.monotonic()
+            stalled = False
+            if now - run_started > GRACE_S:
+                if tb.stream_rate() < STALL_RATE:
+                    stall_since = stall_since or now
+                    stalled = (now - stall_since) >= STALL_HOLD_S
+                else:
+                    stall_since = None
+
+            if (gen["dead"].is_set() or stalled) and not stop.is_set():
+                _recover()
+
             time.sleep(0.1)
     finally:
         stop.set()
