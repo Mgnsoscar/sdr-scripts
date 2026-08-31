@@ -38,15 +38,16 @@ the passband (it lowers the main lobe only if the passband is narrow enough to c
   • --transition <MHz>          skirt steepness — the transition width beyond the passband
                                 edge (live).
 All three are LIVE: changing one rebuilds the (circularly-)filtered loop and swaps it into the
-running source atomically — one brief seam at the swap, then it loops clean; the flowgraph never
-stops. Disabling swaps back to the unfiltered loop. The loop is streamed from RAM by an in-process
-LoopSource (a gr.sync_block), NOT a file: swapping a file_source live races GNU Radio internally
-(a concurrent open() resets the source's length while its old file pointer is still mid-loop, so
-the next read overshoots and THROWS "fread error", killing the source thread and silencing the
-radio). With no file there is no fread, so that failure is impossible. The single 6138-sample code
-period is tiled into a ~1e6-sample loop so the Python work() crosses the wrap seam only ~60×/s —
-copying one contiguous slice per call at C speed — which holds 61.38 Msps without the per-wrap
-underflow a short loop caused.
+running source; the flowgraph never stops. Disabling swaps back to the unfiltered loop. The loop
+is streamed from RAM by a C++ blocks.vector_source_c (repeat=True), NOT a file and NOT a Python
+source: a file_source streams smoothly but a live swap of it races GNU Radio and THROWS "fread
+error" (a concurrent open() resets its length while the old file pointer is mid-loop → a short
+read → the source thread dies, radio silent); a Python source has no file but its work() runs
+under the GIL and can't hold 61.38 Msps on a Pi, underflowing even untouched. vector_source_c is
+C++ (GIL-free) with no file, so it streams as smoothly as file_source with no fread. The filter
+swap calls set_data() under top-block lock()/unlock() (set_data isn't internally locked), so the
+buffer is never freed under a running read; that pauses the stream only for the swap itself, only
+on a filter change.
 
 CLI
 ───
@@ -268,69 +269,26 @@ def _self_test() -> int:
 def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitude: float):
     """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
 
-    The looped baseband buffer is streamed from RAM by LoopSource, NOT a file_source: swapping
-    a file_source live races GNU Radio internally (a concurrent open() resets its length while
-    the old file pointer is still mid-loop, so the next read overshoots and THROWS "fread
-    error", killing the source thread and silencing the radio). An in-RAM loop has no file, so
-    that can never happen, and a live filter change swaps the buffer atomically under a lock."""
+    The looped baseband buffer is streamed from RAM by a C++ blocks.vector_source_c
+    (repeat=True) — NOT a file_source, and NOT a Python source:
+      • file_source streams GIL-free and holds the rate, but swapping it live (open()) races
+        GNU Radio internally and THROWS "fread error", which kills the source and silences the
+        radio. With no file that is impossible.
+      • a Python gr.sync_block has no file either, but its work() runs through the Python
+        gateway under the GIL and can't sustain 61.38 Msps on a Pi — it underflows even in
+        steady state (no tuning).
+    vector_source_c is C++ (GIL-free, no per-sample Python) AND has no file, so it streams as
+    smoothly as file_source did, with none of the fread risk. Its one caveat: set_data() is not
+    itself locked against work(), so the live filter swap runs it under top-block lock()/
+    unlock(), which quiesces the flowgraph for the (brief) duration of the swap — the buffer is
+    never freed under a running read. That pause happens only on a filter change; the steady
+    stream is untouched."""
     import numpy as np
     from gnuradio import gr, blocks, uhd
 
-    class LoopSource(gr.sync_block):
-        """Seamlessly repeats a complex64 buffer forever; supports an atomic swap to a new
-        buffer (used by the live filter). No file → no fread → the source can never silently
-        die.
-
-        The single code period is TILED into a large loop (≥ ~1e6 samples, a whole number of
-        periods so the loop stays seamless). At 10.23 Mcps the period is only 6138 samples
-        (~100 µs), which on its own wraps ~10⁴×/s; the per-wrap Python work then burns enough
-        GIL to starve the real-time stream during a filter rebuild — the underflow that pushed
-        this script onto file_source in the first place. Tiled, it wraps ~60×/s and each work()
-        is a single contiguous NumPy slice copy (C-speed memcpy, GIL released), allocating
-        nothing in steady state — so it holds 61.38 Msps cleanly, GIL-free where it counts."""
-
-        MIN_LOOP = 1 << 20         # ≥ ~1.05e6 samples/loop ⇒ the wrap seam is crossed rarely
-
-        def __init__(self, iq):
-            gr.sync_block.__init__(self, name="loop_source", in_sig=[],
-                                   out_sig=[np.complex64])
-            self._lock = threading.Lock()
-            self._buf = self._tiled(iq)
-            self._pos = 0
-
-        @classmethod
-        def _tiled(cls, iq):
-            buf = np.ascontiguousarray(iq, dtype=np.complex64)
-            n = len(buf)
-            if 0 < n < cls.MIN_LOOP:
-                reps = -(-cls.MIN_LOOP // n)          # ceil ⇒ whole periods, still seamless
-                buf = np.ascontiguousarray(np.tile(buf, reps), dtype=np.complex64)
-            return buf
-
-        def swap(self, iq):
-            buf = self._tiled(iq)                      # build + copy off the lock
-            with self._lock:
-                self._buf = buf
-                if self._pos >= len(buf):
-                    self._pos = 0
-
-        def work(self, input_items, output_items):
-            out = output_items[0]
-            n = len(out)
-            with self._lock:
-                buf = self._buf
-                length = len(buf)
-                pos = self._pos
-                filled = 0
-                while filled < n:
-                    take = min(n - filled, length - pos)
-                    out[filled:filled + take] = buf[pos:pos + take]
-                    filled += take
-                    pos += take
-                    if pos == length:
-                        pos = 0
-                self._pos = pos
-            return n
+    def _vec(iq):
+        # vector_source_c wants a contiguous complex64 buffer; the filtered loop may not be.
+        return np.ascontiguousarray(iq, dtype=np.complex64)
 
     class PrnTx(gr.top_block):
         def __init__(self):
@@ -342,7 +300,8 @@ def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitud
             self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
-            self.src = LoopSource(initial_iq)
+            # repeat=True loops the buffer in C++ (no per-wrap Python), vlen=1, no tags.
+            self.src = blocks.vector_source_c(_vec(initial_iq), True, 1, [])
             self.amp = blocks.multiply_const_cc(amplitude)
             self.connect(self.src, self.amp, self.usrp)
 
@@ -353,7 +312,15 @@ def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitud
             self.amp.set_k(a)
 
         def swap(self, iq):
-            self.src.swap(iq)                          # atomic in-RAM buffer swap
+            # set_data() reassigns (and frees) the source's buffer with no internal lock, so it
+            # must not run while work() is reading. lock()/unlock() quiesces the flowgraph
+            # around the swap — the only moment the stream pauses, and only on a filter change.
+            data = _vec(iq)
+            self.lock()
+            try:
+                self.src.set_data(data, [])
+            finally:
+                self.unlock()
 
         def actual_gain(self):
             return self.usrp.get_gain(0)
@@ -538,9 +505,9 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    # No watchdog: the in-RAM LoopSource has no file to short-read, so the "fread error" that
-    # silently killed the source (and needed a self-heal restart) can't happen. The graph runs
-    # until stopped; live changes just retune or swap the loop buffer in place.
+    # No watchdog: the in-RAM vector_source_c has no file to short-read, so the "fread error"
+    # that silently killed the source (and needed a self-heal restart) can't happen. The graph
+    # runs until stopped; live changes retune or swap the loop buffer in place.
     tb.start()
     try:
         while not stop.is_set():
