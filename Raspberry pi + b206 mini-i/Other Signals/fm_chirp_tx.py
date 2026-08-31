@@ -2,12 +2,12 @@
 """
 FM-chirp transmitter for GNU Radio + UHD (Ettus B200-mini family).
 
-A sine / triangle / sawtooth / square frequency sweep, precomputed and replayed
-from a file so a Raspberry Pi can sustain a high sample rate (40–60 MS/s) — the
-same recipe as gps_l1ca_tx.py, applied to the swept-tone chirp from TriangleChirp.
+A sawtooth frequency sweep, precomputed and replayed from RAM so a Raspberry Pi can
+sustain a high sample rate (40–60 MS/s) — the same recipe as gps_l1ca_tx.py, applied
+to the swept-tone chirp from TriangleChirp.
 
-The instantaneous frequency is  f(t) = waveform(t) · (sweep_bw / 2), i.e. it
-sweeps ±sweep_bw/2 around the carrier, and the modulating waveform repeats at
+The instantaneous frequency is  f(t) = sawtooth(t) · (sweep_bw / 2), i.e. it
+sweeps ±sweep_bw/2 around the carrier, and the modulating sawtooth repeats at
 `sweep_rate`.
 
 ⚠  RF SAFETY / LEGAL: transmit ONLY into a shielded / conducted setup (cable +
@@ -37,12 +37,11 @@ the carrier is unaffected.
 Live tuning (retune while transmitting, via paramkit.live)
 ──────────────────────────────────────────────────────────
     freq       → UHD tune_request        (instant)
-    lo_offset  → UHD tune_request        (instant)
     power      → dBm → set_gain          (instant — see the USER CALIBRATION block)
     rf         → on/off mute/unmute      (instant — gain AND amplitude to 0 / back)
     bw         → rebuild buffer + swap    ┐ shape changes: regenerate one sweep
-    sweep_rate → rebuild buffer + swap    │ in RAM and set_data() it under the
-    waveform   → rebuild buffer + swap    ┘ top-block lock (one brief seam at the
+    sweep_rate → rebuild buffer + swap    ┘ in RAM and set_data() it under the
+                                            top-block lock (one brief seam at the
                                             swap, then it loops clean)
 Regeneration runs on the control thread; the flowgraph keeps streaming the old
 buffer on GNU Radio's scheduler threads until the swap, so RF never stops.
@@ -58,7 +57,7 @@ sawtooth/square reset splatter; --passband is the TOTAL filter width (the filter
 
 CLI
 ───
-    fm_chirp_tx.py --freq 1575.42 --bw 20 --rate 200 --waveform Sawtooth --power -30
+    fm_chirp_tx.py --freq 1575.42 --bw 20 --rate 200 --power -30
     fm_chirp_tx.py --freq 1575.42 --bw 20 --gain 60 --filter on --passband 22   # clean band-limit
     fm_chirp_tx.py --self-test        # verify seamless phase closure (+ filter), no hardware
     fm_chirp_tx.py --describe-params  # paramkit JSON schema for the GUI
@@ -146,13 +145,18 @@ MIN_BUFFER_SAMPS = 1 << 18   # 262144 samples ≈ 2 MB as fc32
 
 # Named GNSS carriers (same list as the original TriangleChirp), in MHz.
 FREQUENCIES = {
-    "GPS L1": 1575.42, "GPS L2": 1227.60, "GPS L5": 1176.45,
-    "Galileo E1": 1575.42, "Galileo E5a": 1176.45, "Galileo E5b": 1207.14,
-    "Galileo E5": 1191.795, "Galileo E6": 1278.75,
-    "BeiDou B1I": 1561.098, "BeiDou B1C": 1575.42, "BeiDou B2a": 1176.45,
-    "BeiDou B2b": 1207.14, "BeiDou B2": 1191.795, "BeiDou B3": 1268.52,
-    "GLONASS L1": 1602.0, "GLONASS L2": 1246.0, "GLONASS L3": 1202.025,
-    "Iridium": 1621.25,
+    "GPS L1 (1575.42 MHz)": 1575.42, "GPS L2 (1227.60 MHz)": 1227.60,
+    "GPS L5 (1176.45 MHz)": 1176.45,
+    "Galileo E1 (1575.42 MHz)": 1575.42, "Galileo E5a (1176.45 MHz)": 1176.45,
+    "Galileo E5b (1207.14 MHz)": 1207.14,
+    "Galileo E5 (1191.795 MHz)": 1191.795, "Galileo E6 (1278.75 MHz)": 1278.75,
+    "BeiDou B1I (1561.098 MHz)": 1561.098, "BeiDou B1C (1575.42 MHz)": 1575.42,
+    "BeiDou B2a (1176.45 MHz)": 1176.45,
+    "BeiDou B2b (1207.14 MHz)": 1207.14, "BeiDou B2 (1191.795 MHz)": 1191.795,
+    "BeiDou B3 (1268.52 MHz)": 1268.52,
+    "GLONASS L1 (1602.0 MHz)": 1602.0, "GLONASS L2 (1246.0 MHz)": 1246.0,
+    "GLONASS L3 (1202.025 MHz)": 1202.025,
+    "Iridium (1621.25 MHz)": 1621.25,
 }
 
 # Filter presets: {label: TOTAL passband width in MHz}. A chirp is broadband by design (it
@@ -348,10 +352,6 @@ def _build_top_block(initial_iq, center_freq_hz: float, lo_offset_hz: float,
             self._freq_hz = hz
             self._retune()
 
-        def set_lo_offset(self, hz: float) -> None:
-            self._lo_hz = hz
-            self._retune()
-
         def set_gain(self, g: float) -> None:
             self.usrp.set_gain(g, 0)
 
@@ -385,7 +385,7 @@ def _build_top_block(initial_iq, center_freq_hz: float, lo_offset_hz: float,
 
 def build_script() -> Script:
     return (
-        Script("FM-chirp transmitter (sine/triangle/sawtooth/square sweep) — fixed 61.38 MHz "
+        Script("FM-chirp transmitter (sawtooth sweep) — fixed 61.38 MHz "
                "/ sc8, looped buffer, optional power-preserving digital passband filter. Level "
                "is set in dBm via the unit's calibration; uncalibrated it runs on a relative "
                "gain. Authorised, shielded setups only.")
@@ -429,9 +429,6 @@ def build_script() -> Script:
                 required=False, live=True,
                 help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
                      "calibration. When given, overrides --power. Live.")
-        .choice("-Waveform", "--waveform", options=WAVEFORMS, default="Sawtooth",
-                required=True, live=True,
-                help="Sweep shape. Live (regenerates the loop).")
         .number("-Sweep-BW", "--bw", unit="MHz", min=0.001, max=MAX_SWEEP_BW_MHZ, default=20.0,
                 required=False, live=True, show_when={"band_mode": "center_bw"},
                 help="Peak-to-peak sweep width; f sweeps ±bw/2 around the carrier. Live "
@@ -439,9 +436,6 @@ def build_script() -> Script:
         .number("-Sweep-rate", "--rate", unit="kHz", min=0.1, max=5000.0,
                 default=200.0, required=True, live=True,
                 help="How fast the sweep repeats, in kHz. Live (regenerates the loop).")
-        .number("-LO-offset", "--lo_offset", unit="MHz", min=-30.0, max=30.0,
-                default=0.0, live=True,
-                help="LO offset to push LO leakage out of band. Live.")
         .choice("-Filter", "--filter", options=["off", "on"], default="off",
                 required=False, live=True,
                 help="Digital passband filter on the looped buffer (unity passband gain). Set "
@@ -530,7 +524,7 @@ def main() -> int:
     # Current "shape" (the regeneration-requiring params) — mutated by live changes.
     # bw_hz comes from resolve_band (either --bw directly, or the start/stop span).
     band_mode = getattr(args, "band_mode", "center_bw")
-    shape = {"waveform": args.waveform,
+    shape = {"waveform": "Sawtooth",              # fixed — the only sweep shape this script emits
              "bw_hz": sweep_bw_hz,
              "rate_hz": args.rate * 1e3,               # --rate is in kHz
              "filter_on": getattr(args, "filter", "off") == "on",
@@ -552,7 +546,7 @@ def main() -> int:
 
     tb = _build_top_block(
         initial_iq=iq, center_freq_hz=center_freq_hz,
-        lo_offset_hz=args.lo_offset * 1e6, gain_db=gain_db, amplitude=amplitude)
+        lo_offset_hz=0.0, gain_db=gain_db, amplitude=amplitude)
 
     # RF on/off state + the gain RF-on applies. Starting with --rf off builds the
     # flow muted; power/gain edits made while OFF are staged and reach the radio
@@ -580,12 +574,12 @@ def main() -> int:
 
     print("── FM chirp TX ─────────────────────────────────────────────")
     print(f"  band mode      : {band_mode}")
-    print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz  (LO offset {args.lo_offset:g} MHz)")
+    print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz")
     if band_mode == "start_stop":
         _lo, _hi = sorted((float(args.start), float(args.stop)))
         print(f"  sweep edges    : {_lo:g} … {_hi:g} MHz (midpoint carrier)")
     print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
-    print(f"  waveform       : {args.waveform}")
+    print(f"  waveform       : Sawtooth")
     print(f"  sweep bw       : {sweep_bw_hz/1e6:g} MHz (±{sweep_bw_hz/2e6:g} MHz)")
     print(f"  sweep rate     : requested {args.rate:g} kHz, "
           f"got {actual_rate/1e3:.3f} kHz ({n_per} samples/period × {reps} reps)")
@@ -625,9 +619,6 @@ def main() -> int:
                 else:
                     ctrl.report("power",
                                 round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
-        elif name == "lo_offset":
-            tb.set_lo_offset(value * 1e6)
-            ctrl.report("lo_offset", value)
         elif name == "power":
             # power/gain edits are staged into state["gain"] and only reach the radio
             # when RF is on; the --rf toggle mutes/restores gain AND amplitude. Folded at
@@ -681,13 +672,11 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
-        elif name in ("bw", "rate", "waveform", "filter", "passband", "transition"):
+        elif name in ("bw", "rate", "filter", "passband", "transition"):
             if name == "bw":
                 shape["bw_hz"] = value * 1e6
             elif name == "rate":
                 shape["rate_hz"] = value * 1e3            # --rate is in kHz
-            elif name == "waveform":
-                shape["waveform"] = value
             elif name == "filter":
                 shape["filter_on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
             elif name == "passband":
