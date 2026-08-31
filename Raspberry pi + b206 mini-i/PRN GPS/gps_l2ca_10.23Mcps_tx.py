@@ -37,12 +37,14 @@ the passband (it lowers the main lobe only if the passband is narrow enough to c
                                 ±(n+1)·1.023 MHz band (live, presets by sidelobe count);
   • --transition <MHz>          skirt steepness — the transition width beyond the passband
                                 edge (live).
-All three are LIVE: changing one rebuilds the (circularly-)filtered loop in RAM and swaps it
-in atomically — one brief seam at the swap, then it loops clean; the flowgraph never stops.
-Disabling swaps back to the unfiltered loop. The loop is streamed from memory by an in-process
-source block, NOT a file: a file_source returns -1 ("done") on any read hiccup, which silently
-kills the source (the flowgraph keeps running but transmits nothing until the task is
-restarted); an in-RAM loop can't hit a file/read error, so that failure mode is gone.
+All three are LIVE: changing one rebuilds the (circularly-)filtered loop, writes it to a small
+RAM file (/dev/shm) and hot-swaps the file_source to it — one brief seam at the swap, then it
+loops clean; the flowgraph never stops. Disabling swaps back to the unfiltered loop. The loop
+is streamed by a C++ file_source (repeat=True) — the smooth, GIL-free path that holds the rate
+with no underflows. Its one failure mode is that on a read hiccup it returns -1 ("done"), which
+stops the whole flowgraph and leaves the radio silent until the task is restarted; a watchdog
+makes that non-fatal: it notices the flowgraph has stopped and restarts it in place in well
+under a second, so the signal self-heals instead of needing a manual restart.
 
 CLI
 ───
@@ -261,55 +263,18 @@ def _self_test() -> int:
 
 # ── Flowgraph ───────────────────────────────────────────────────────────────────────
 
-def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitude: float):
+def _build_top_block(initial_file: str, center_freq_hz: float, gain_db: float, amplitude: float):
     """The GNU Radio top_block, imported lazily so the module loads without a radio stack.
 
-    The looped baseband buffer is streamed from RAM by LoopSource, NOT a file_source:
-    a file_source returns -1 ("done") on any read hiccup, which permanently kills the
-    source (the flowgraph keeps running but transmits nothing until a restart). An
-    in-RAM loop can't hit that, and a live filter change swaps the buffer atomically
-    with no file I/O. At 10.23 Mcps the loop is short (~100 us) and wraps ~10^4×/s, so
-    avoiding per-wrap file I/O matters even more here."""
-    import numpy as np
+    The looped buffer is streamed by a C++ blocks.file_source(repeat=True) — the smooth,
+    GIL-free path that holds the sample rate with no underflows, and whose open() hot-swaps
+    the file live (used for filter changes: one brief seam, no stop). Its one failure mode is
+    that on a read hiccup it returns -1 ("done"), which stops the whole flowgraph and leaves
+    the radio silent. main() makes that non-fatal by watching for the flowgraph to stop
+    (tb.wait() returns) and restarting it in place — so the old "signal gone until you restart
+    the task" behaviour becomes an automatic, sub-second self-heal. No probe/tap is used, so
+    nothing extra touches the sample stream."""
     from gnuradio import gr, blocks, uhd
-
-    class LoopSource(gr.sync_block):
-        """Seamlessly repeats a complex64 buffer forever; supports an atomic swap to a
-        new buffer (used by the live filter). No files → no fread error → the source
-        can never silently die. work() copies with NumPy slices (C-speed memcpy) and
-        allocates nothing in steady state, so it sustains the sample rate cleanly."""
-
-        def __init__(self, iq):
-            gr.sync_block.__init__(self, name="loop_source", in_sig=[],
-                                   out_sig=[np.complex64])
-            self._lock = threading.Lock()
-            self._buf = np.ascontiguousarray(iq, dtype=np.complex64)
-            self._pos = 0
-
-        def swap(self, iq):
-            buf = np.ascontiguousarray(iq, dtype=np.complex64)
-            with self._lock:
-                self._buf = buf
-                if self._pos >= len(buf):
-                    self._pos = 0
-
-        def work(self, input_items, output_items):
-            out = output_items[0]
-            n = len(out)
-            with self._lock:
-                buf = self._buf
-                length = len(buf)
-                pos = self._pos
-                filled = 0
-                while filled < n:
-                    take = min(n - filled, length - pos)
-                    out[filled:filled + take] = buf[pos:pos + take]
-                    filled += take
-                    pos += take
-                    if pos == length:
-                        pos = 0
-                self._pos = pos
-            return n
 
     class PrnTx(gr.top_block):
         def __init__(self):
@@ -321,7 +286,7 @@ def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitud
             self.usrp.set_samp_rate(SAMP_RATE_HZ)
             self.usrp.set_center_freq(uhd.tune_request(center_freq_hz), 0)
             self.usrp.set_gain(gain_db, 0)
-            self.src = LoopSource(initial_iq)
+            self.src = blocks.file_source(gr.sizeof_gr_complex, initial_file, repeat=True)
             self.amp = blocks.multiply_const_cc(amplitude)
             self.connect(self.src, self.amp, self.usrp)
 
@@ -331,8 +296,8 @@ def _build_top_block(initial_iq, center_freq_hz: float, gain_db: float, amplitud
         def set_amplitude(self, a):
             self.amp.set_k(a)
 
-        def swap(self, iq):
-            self.src.swap(iq)                        # atomic in-RAM buffer swap
+        def swap_file(self, path):
+            self.src.open(path, True)                # switch at the next work boundary
 
         def actual_gain(self):
             return self.usrp.get_gain(0)
@@ -388,6 +353,10 @@ def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
 
+    import atexit
+    import shutil
+    import tempfile
+
     script = build_script()
     args = script.parse()
     center_freq_hz = args.freq * 1e6
@@ -413,6 +382,16 @@ def main() -> int:
     # Prebuild the unfiltered loop once (PRN is fixed per run); the filter derives from it.
     base_iq, nsamp, nper = build_iq_buffer(args.prn)
 
+    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
+    tmpdir = tempfile.mkdtemp(prefix="gps_l2ca_", dir=shm)
+    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+
+    def write_buffer(iq) -> str:
+        fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
+        os.close(fd)
+        iq.tofile(path)
+        return path
+
     # Filter "shape" (the regeneration-requiring params) — mutated by live changes.
     shape = {"on": getattr(args, "filter", "off") == "on",
              "sidelobes": int(getattr(args, "sidelobes", 2) or 0),
@@ -434,17 +413,23 @@ def main() -> int:
                           "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
 
     iq0, finfo = make_current()
+    box = {"file": write_buffer(iq0)}
 
-    tb = _build_top_block(initial_iq=iq0, center_freq_hz=center_freq_hz,
+    tb = _build_top_block(initial_file=box["file"], center_freq_hz=center_freq_hz,
                           gain_db=gain_db, amplitude=amplitude)
 
     def regenerate():
-        """Rebuild the loop for the current filter shape and swap it in atomically (one
-        seam, then it loops clean). Runs on the control thread; the flowgraph keeps
-        streaming the old buffer until the swap. In-RAM — no file, so the source can
-        never be left dead by a read error."""
+        """Rebuild the loop for the current filter shape and swap it in (one seam, then it
+        loops clean). Runs on the control thread; the flowgraph keeps streaming the old
+        buffer until the swap."""
         iq, info = make_current()
-        tb.swap(iq)
+        new_file = write_buffer(iq)
+        tb.swap_file(new_file)
+        old, box["file"] = box["file"], new_file
+        try:
+            os.unlink(old)            # safe: file_source holds the old inode until it swaps
+        except OSError:
+            pass
         return info
 
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db}
@@ -517,13 +502,39 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
+    # Watchdog: a C++ file_source returns -1 ("done") on a read hiccup, which stops the whole
+    # flowgraph and leaves the radio silent while our process keeps running. tb.wait() returns
+    # exactly when the flowgraph stops, so a daemon thread blocked on it flags that stall; the
+    # main loop then re-opens the current loop file and restarts the flowgraph in place, so the
+    # signal self-heals in well under a second instead of staying dead until a manual restart.
+    dead = threading.Event()
+
+    def _watch_completion():
+        def _wait():
+            tb.wait()          # returns when the flowgraph stops (read error, or our shutdown)
+            dead.set()
+        threading.Thread(target=_wait, daemon=True).start()
+
     tb.start()
+    _watch_completion()
+
     try:
         while not stop.is_set():
             for change in ctrl.drain():
                 apply_change(change.name, change.value)
+            if dead.is_set() and not stop.is_set():
+                print("watchdog: flowgraph stopped (file read error?) — restarting",
+                      file=sys.stderr, flush=True)
+                tb.stop()
+                tb.wait()                    # ensure a clean, fully-stopped graph
+                time.sleep(0.2)              # brief settle so a persistent fault can't hot-loop
+                tb.swap_file(box["file"])    # re-open the current loop from the top
+                dead.clear()
+                tb.start()
+                _watch_completion()
             time.sleep(0.1)
     finally:
+        stop.set()
         ctrl.close()
         tb.stop()
         tb.wait()
