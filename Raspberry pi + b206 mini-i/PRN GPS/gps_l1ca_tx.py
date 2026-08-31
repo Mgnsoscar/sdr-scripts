@@ -200,17 +200,22 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
-def filter_buffer(base_iq, sidelobes: int, trans_hz: float):
+def filter_buffer(base_iq, sidelobes: int, trans_hz: float, base_fft=None):
     """Circularly filter the looped C/A buffer to keep the main lobe + `sidelobes` sidelobes.
     Circular convolution (multiply the buffer's DFT by the filter's) keeps the result exactly
     periodic, so the filtered loop has no seam; unity passband gain leaves the kept lobes'
-    power unchanged. Returns (filtered_iq, n_taps, passband_edge_hz)."""
+    power unchanged. Pass `base_fft` (= np.fft.fft(base_iq)) to reuse it across live filter
+    changes — the base loop is fixed per run, so its DFT need only be computed once, which
+    cuts the per-change CPU spike (and the underflows it can cause). Returns
+    (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
     fp = (int(sidelobes) + 1) * CA_NULL_HZ          # flat passband edge (kept up to here)
     fc = fp + trans_hz / 2.0                         # −6 dB cutoff = edge + half the transition
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
-    filtered = np.fft.ifft(np.fft.fft(base_iq) * np.fft.fft(h, n)).astype(np.complex64)
+    if base_fft is None:
+        base_fft = np.fft.fft(base_iq)
+    filtered = np.fft.ifft(base_fft * np.fft.fft(h, n)).astype(np.complex64)
     return filtered, m, fp
 
 
@@ -415,12 +420,18 @@ def main() -> int:
              "sidelobes": int(getattr(args, "sidelobes", 2) or 0),
              "trans_hz": float(getattr(args, "transition", 0.5) or 0.5) * 1e6}
 
+    base_fft = {"v": None}      # DFT of the fixed base loop — computed once, reused per change
+
     def make_current(report=False):
         """The buffer for the current shape: the base loop, or the circularly-filtered loop.
         Returns (iq, info) where info describes the filter for the banner/report."""
         if not shape["on"]:
             return base_iq, {"on": False}
-        filtered, taps, fp = filter_buffer(base_iq, shape["sidelobes"], shape["trans_hz"])
+        if base_fft["v"] is None:
+            import numpy as np
+            base_fft["v"] = np.fft.fft(base_iq)
+        filtered, taps, fp = filter_buffer(base_iq, shape["sidelobes"], shape["trans_hz"],
+                                           base_fft=base_fft["v"])
         return filtered, {"on": True, "taps": taps, "edge_hz": fp,
                           "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
 
@@ -501,9 +512,9 @@ def main() -> int:
                 shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
             else:
                 shape["trans_hz"] = float(value) * 1e6
-            info = regenerate()
             ctrl.report(name, value)
-            _ = info
+            return True          # the (expensive) rebuild is deferred + coalesced by the caller
+        return False
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -512,8 +523,20 @@ def main() -> int:
     tb.start()
     try:
         while not stop.is_set():
+            # Coalesce a burst of live changes (dragging a slider fires many values): keep
+            # only the last value of each param, and rebuild the filtered loop at most ONCE
+            # per drain — that rebuild is the CPU spike that briefly starves the USRP.
+            latest, order = {}, []
             for change in ctrl.drain():
-                apply_change(change.name, change.value)
+                if change.name not in latest:
+                    order.append(change.name)
+                latest[change.name] = change.value
+            need_regen = False
+            for name in order:
+                if apply_change(name, latest[name]):
+                    need_regen = True
+            if need_regen:
+                regenerate()
             time.sleep(0.1)
     finally:
         ctrl.close()
