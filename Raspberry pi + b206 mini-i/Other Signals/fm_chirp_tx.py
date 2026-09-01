@@ -654,7 +654,8 @@ def main() -> int:
                                                 params=pwr_params())
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
-                ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"]), 2))
+                ctrl.report("power", round(pmap.power_for_gain(
+                    tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
             else:
                 ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=state["freq"], params=pwr_params()), 2))
         elif name == "gain":
