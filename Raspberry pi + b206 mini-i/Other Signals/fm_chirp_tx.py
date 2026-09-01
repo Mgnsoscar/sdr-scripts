@@ -92,6 +92,22 @@ CAL_SIGNAL_ID = "fm_chirp"
 # the Run / sequence form at the same frequency. See calkit / calibration-v2.
 CAL_FREQ_PARAM = "freq"
 
+# Power-quantity conversion laws this signal offers the calibration editor (see
+# docs/calibration-v2.md §13 in sdr-agent). A chirp is naturally measured as a spectral
+# DENSITY (dBm per MHz of occupied bandwidth); its FULL-BANDWIDTH (total) power is that
+# density plus 10·log10(sweep_bw / 1 MHz). Declaring it lets an operator calibrate the
+# node in dBm/MHz yet report — and safety-limit — total power, with the conversion tracking
+# --bw as it is tuned. The law is only OFFERED here; whether a unit's calibration uses it
+# (as its reported and/or limiting reading) is chosen per unit in the editor, and the chosen
+# law is embedded in that unit's calibration doc. `param` names this script's --bw (MHz),
+# `ref` its 1 MHz reference, `rep` a representative value (the default sweep BW) for the
+# range read-outs shown before a live --bw is known.
+CAL_POWER_LAWS = [
+    {"id": "fbw_power", "name": "Full-bandwidth power",
+     "in": "density", "out": "abs",
+     "param": "bw", "coeff": 10.0, "ref": 1.0, "rep": 20.0},
+]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RF chain limits — there is NO baked dBm power scale. Absolute --power (dBm) comes
@@ -511,7 +527,8 @@ def main() -> int:
     elif pmap.has_absolute:                         # calibrated: the authored absolute --power
         # Fold the calibration at the transmit frequency so a frequency-dependent chain maps
         # --power on the right scale (the chirp can retune live — see apply_change).
-        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz,
+                                      params={"bw": sweep_bw_hz / 1e6})
     else:                                           # uncalibrated: a persisted fallback gain, or refuse
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -530,6 +547,13 @@ def main() -> int:
              "filter_on": getattr(args, "filter", "off") == "on",
              "width_hz": float(getattr(args, "passband", 30.0) or 30.0) * 1e6,  # total width
              "trans_hz": float(getattr(args, "transition", 1.0) or 1.0) * 1e6}
+
+    def pwr_params():
+        """Live parameter values a power-quantity bridge may key on (docs/calibration-v2.md
+        §13). The full-bandwidth-power law reads the current sweep bandwidth in MHz, so a
+        bridged --power tracks --bw as it is tuned. Harmless when the calibration uses no
+        bridge (the map ignores it)."""
+        return {"bw": shape["bw_hz"] / 1e6}
 
     def make_current():
         """The buffer for the current shape (the base sweep, optionally band-limited).
@@ -586,7 +610,7 @@ def main() -> int:
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
         print(f"  power (achieved on grid): "
-              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params()):.2f} dBm")
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.describe()}")
@@ -611,25 +635,28 @@ def main() -> int:
             # A frequency-dependent calibration re-scales --power with frequency, so re-map
             # the held target power at the new frequency — delivered power stays as requested.
             if state.get("power") is not None:
-                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"])
+                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"],
+                                                params=pwr_params())
                 if state["rf_on"]:
                     tb.set_gain(state["gain"])
                     ctrl.report("power",
-                                round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"]), 2))
+                                round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"],
+                                                          params=pwr_params()), 2))
                 else:
                     ctrl.report("power",
-                                round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
+                                round(pmap.power_for_gain(state["gain"], freq=state["freq"], params=pwr_params()), 2))
         elif name == "power":
             # power/gain edits are staged into state["gain"] and only reach the radio
             # when RF is on; the --rf toggle mutes/restores gain AND amplitude. Folded at
             # the current transmit frequency (frequency-dependent chains).
             state["power"] = float(value)
-            state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"])
+            state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"],
+                                                params=pwr_params())
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
                 ctrl.report("power", round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"]), 2))
             else:
-                ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
+                ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=state["freq"], params=pwr_params()), 2))
         elif name == "gain":
             # A raw gain overrides the dBm mapping — drop any held target power so a later
             # frequency change doesn't re-map back to it.
@@ -656,7 +683,8 @@ def main() -> int:
                 state["freq"] = c_hz
                 # re-map the held target power at the new midpoint (freq-dependent chain)
                 if state.get("power") is not None:
-                    state["gain"] = pmap.gain_for_power(state["power"], freq=c_hz)
+                    state["gain"] = pmap.gain_for_power(state["power"], freq=c_hz,
+                                                        params=pwr_params())
                     if state["rf_on"]:
                         tb.set_gain(state["gain"])
                 shape["bw_hz"] = bw_hz
@@ -687,6 +715,20 @@ def main() -> int:
             actual = regenerate()
             ctrl.report("rate" if name == "rate" else name,
                         actual / 1e3 if name == "rate" else value)
+            # A --bw change re-scales --power when the calibration's reported reading is the
+            # full-bandwidth-power law (which keys on --bw): re-map the held target so the
+            # delivered reported power stays as requested. No-op when --power isn't held or the
+            # calibration uses no bw-keyed bridge (pwr_params is then ignored).
+            if name == "bw" and state.get("power") is not None:
+                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"],
+                                                    params=pwr_params())
+                if state["rf_on"]:
+                    tb.set_gain(state["gain"])
+                    ctrl.report("power", round(pmap.power_for_gain(
+                        tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
+                else:
+                    ctrl.report("power", round(pmap.power_for_gain(
+                        state["gain"], freq=state["freq"], params=pwr_params()), 2))
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
