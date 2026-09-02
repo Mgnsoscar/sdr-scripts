@@ -34,11 +34,11 @@ UNITY passband gain, so whatever it passes is unchanged in power: if the main lo
 passband is ALWAYS an integer number of C/A sidelobes, which is what makes the emitted power a
 well-defined function of the sidelobe count (see the calibration note below).
   • --sidelobes <n>             passband keeps the main lobe + n C/A sidelobes, i.e. a
-                                ±(n+1)·1.023 MHz band (live, presets by sidelobe count);
-  • --transition <MHz>          skirt steepness — the transition width beyond the passband
-                                edge (live).
-Both are LIVE: changing one rebuilds the (circularly-)filtered loop and swaps it into the
-running source; the flowgraph never stops. The loop is streamed from RAM by a C++
+                                ±(n+1)·1.023 MHz band (live, a 0..28 slider).
+The skirt transition width is FIXED at 0.05 MHz (not a knob), so the emitted power stays a
+well-defined function of the sidelobe count alone. --sidelobes is LIVE: changing it rebuilds
+the (circularly-)filtered loop and swaps it into the running source; the flowgraph never
+stops. The loop is streamed from RAM by a C++
 blocks.vector_source_c (repeat=True), NOT a file and NOT a Python source: a file_source streams
 smoothly but a live swap of it races GNU Radio and THROWS "fread error" (a concurrent open()
 resets its length while the old file pointer is mid-loop → a short read → the source thread
@@ -112,18 +112,19 @@ CA_NULL_HZ = 1.023e6          # main-lobe null spacing == the chip rate; sidelob
 
 FREQUENCIES = {"GPS L1 (1575.42 MHz)": CARRIER_HZ / 1e6}   # presets are in MHz
 
-# Filter presets: {label: number of C/A sidelobes to KEEP}. The passband is the main lobe
-# plus that many sidelobes, i.e. a ±(n+1)·1.023 MHz band. Max keeps the band inside ±Fs/2.
+# Filter passband width, in C/A sidelobes KEPT beside the main lobe: the passband is the main
+# lobe plus that many sidelobes, i.e. a ±(n+1)·1.023 MHz band. The maximum keeps the whole
+# passband (edge + skirt) inside ±Fs/2: with the fixed 0.05 MHz transition, n = 28 is the
+# largest that fits ((28+1)·1.023 + 0.025 = 29.7 MHz < 30.69 = Fs/2).
 MAX_SIDELOBES = 28
 DEFAULT_SIDELOBES = 2
-SIDELOBE_PRESETS = {
-    "Main lobe only (±1.02 MHz)": 0,
-    "Main + 1 sidelobe (±2.05 MHz)": 1,
-    "Main + 2 sidelobes (±3.07 MHz)": 2,
-    "Main + 3 sidelobes (±4.09 MHz)": 3,
-    "Main + 5 sidelobes (±6.14 MHz)": 5,
-    "Main + 10 sidelobes (±11.25 MHz)": 10,
-}
+CA_NULL_MHZ = 1.023          # sidelobe/main-lobe null spacing (MHz) == the chip rate
+
+# Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband is always
+# an integer number of sidelobes; the skirt is a constant so the emitted power stays a
+# well-defined function of the sidelobe count alone (not the operator's discretion).
+TRANSITION_MHZ = 0.05
+TRANS_HZ = TRANSITION_MHZ * 1e6
 
 
 # ── Spectral-density calibration (docs/calibration-v2.md §13, sdr-agent) ─────────────
@@ -175,6 +176,21 @@ def enbw_mhz(sidelobes: int) -> float:
     both track the sidelobe count as it is tuned."""
     n = max(0, min(MAX_SIDELOBES, int(sidelobes)))
     return (CODE_RATE_HZ / 1e6) * _POWER_FRACTION[n]
+
+
+# Static enbw_mhz(n) lookup for the GUI. The client's schema extractor is a static AST reader
+# (it can't run the sinc² integration above), and the full-power law keys on enbw_mhz — a value
+# with no input field — so the schema exposes it as a HIDDEN derived field whose formula is a
+# nearest-integer table lookup on --sidelobes. The first element names the source field; the
+# rest are enbw_mhz(0..MAX_SIDELOBES). Kept a literal so the extractor can read it; --self-test
+# asserts it matches enbw_mhz() so the two can never silently drift.
+_ENBW_TABLE_ARGS = [
+    "sidelobes",
+    0.923588, 0.971788, 0.988638, 0.997168, 1.002311, 1.005749, 1.008208, 1.010054,
+    1.011490, 1.012640, 1.013581, 1.014365, 1.015029, 1.015598, 1.016091, 1.016523,
+    1.016904, 1.017242, 1.017545, 1.017818, 1.018065, 1.018289, 1.018494, 1.018682,
+    1.018854, 1.019014, 1.019161, 1.019298, 1.019426,
+]
 
 
 # The power-quantity conversion laws this signal OFFERS the calibration editor. Both convert the
@@ -335,7 +351,7 @@ def _self_test() -> int:
         f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
         return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
 
-    filt, taps, fp = filter_buffer(base, sidelobes=2, trans_hz=0.5e6)
+    filt, taps, fp = filter_buffer(base, sidelobes=2, trans_hz=TRANS_HZ)
     main = 10 * np.log10(band(filt, 0, CA_NULL_HZ) / band(base, 0, CA_NULL_HZ))
     kept = 10 * np.log10(band(filt, 2 * CA_NULL_HZ, 3 * CA_NULL_HZ)
                          / band(base, 2 * CA_NULL_HZ, 3 * CA_NULL_HZ))
@@ -354,9 +370,16 @@ def _self_test() -> int:
     # full_power(0) must equal the main-lobe k: with 0 sidelobes the passband IS the main lobe,
     # so the full power passed by the filter is exactly the main-lobe integrated power.
     full0 = 60.0 + 10 * math.log10(enbw_mhz(0))
-    laws_ok = mono and bounded and abs(full0 - 59.654784) < 0.01
+    # The GUI's hidden enbw_mhz derived field is a STATIC literal table (_ENBW_TABLE_ARGS); the
+    # runtime computes the same values via enbw_mhz(). Assert they can't have drifted.
+    table_ok = (len(_ENBW_TABLE_ARGS) == MAX_SIDELOBES + 2
+                and _ENBW_TABLE_ARGS[0] == "sidelobes"
+                and all(abs(_ENBW_TABLE_ARGS[1 + n] - enbw_mhz(n)) < 5e-6
+                        for n in range(MAX_SIDELOBES + 1)))
+    laws_ok = mono and bounded and abs(full0 - 59.654784) < 0.01 and table_ok
     print(f"calibration: I_ML={fr[0]:.6f}, frac(max)={fr[-1]:.6f}, full(0)={full0:.4f} dB "
-          f"== main-lobe 59.6548 dB, span main→full ≤ {10*math.log10(1/fr[0]):.3f} dB "
+          f"== main-lobe 59.6548 dB, span main→full ≤ {10*math.log10(1/fr[0]):.3f} dB, "
+          f"enbw table {'matches' if table_ok else 'DRIFTED'} "
           f"[{'OK' if laws_ok else 'FAIL'}]")
     ok = ok and laws_ok
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
@@ -452,16 +475,21 @@ def build_script() -> Script:
                      "calibration. When given, overrides --power. Live.")
         .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
                  help="GPS satellite PRN / Gold code index (1..32). Fixed per run.")
-        .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES,
-                 default=DEFAULT_SIDELOBES, presets=SIDELOBE_PRESETS, required=False, live=True,
+        .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,
+                 default=DEFAULT_SIDELOBES, required=False, live=True,
                  help="Passband width, as the number of C/A sidelobes KEPT beside the main "
-                      "lobe: a ±(n+1)·1.023 MHz band. The filter is always on (unity passband "
-                      "gain). More sidelobes pass more of the signal's power (the full-power "
-                      "calibration quantity tracks this). Live (rebuilds the filtered loop).")
-        .number("-Transition", "--transition", unit="MHz", min=0.05, max=5.0, default=0.5,
-                required=False, live=True,
-                help="Filter skirt transition width beyond the passband edge (MHz) — the "
-                     "steepness knob. Live (rebuilds the filtered loop).")
+                      "lobe: a ±(n+1)·1.023 MHz band. 0 keeps the main lobe only. The filter is "
+                      "always on (unity passband gain). More sidelobes pass more of the signal's "
+                      "power (the full-power calibration quantity tracks this). Max 28 keeps the "
+                      "band inside the sample rate. Live (rebuilds the filtered loop).")
+        .derived("-Passband-bandwidth", name="passband_bw_mhz", unit="MHz",
+                 formula={"linear": ["sidelobes", 2.046, 2.046]},
+                 help="Occupied bandwidth the filter passes at the current sidelobe count: "
+                      "2·(n+1)·1.023 MHz (i.e. ±(n+1)·1.023 MHz).")
+        .derived("-Full-power-bandwidth", name="enbw_mhz", unit="MHz", hidden=True,
+                 formula={"table": _ENBW_TABLE_ARGS},
+                 help="Equivalent-noise bandwidth mapping the measured peak density to the full "
+                      "in-band power. Feeds the full-power calibration law; not shown.")
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
@@ -482,10 +510,11 @@ def main() -> int:
     amplitude = pmap.amplitude
 
     # Filter "shape" (the regeneration-requiring params) — mutated by live changes. The filter
-    # is ALWAYS on; only its width (sidelobes) and skirt (transition) vary. Defined before the
-    # gain map so the calibration's power laws can read the current equivalent bandwidth.
+    # is ALWAYS on; only its width (sidelobes) varies (the skirt transition is fixed). Defined
+    # before the gain map so the calibration's power laws can read the current equivalent
+    # bandwidth.
     shape = {"sidelobes": int(getattr(args, "sidelobes", DEFAULT_SIDELOBES) or 0),
-             "trans_hz": float(getattr(args, "transition", 0.5) or 0.5) * 1e6}
+             "trans_hz": TRANS_HZ}
 
     def pwr_params() -> dict:
         """The live keyed-parameter values the calibration's power laws read: the filter's
@@ -604,24 +633,21 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
-        elif name in ("sidelobes", "transition"):
-            if name == "sidelobes":
-                shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
-            else:
-                shape["trans_hz"] = float(value) * 1e6
+        elif name == "sidelobes":
+            shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
             regenerate()
             # Widening/narrowing the passband changes the equivalent bandwidth, so a held
             # absolute --power must re-map to keep the delivered power (full-power quantity)
             # constant; the amp's limiting cap moves with it too. calkit no-ops this for a
             # bandwidth-independent (main-lobe) or relative target.
-            if name == "sidelobes" and state["power"] is not None:
+            if state["power"] is not None:
                 state["gain"] = pmap.gain_for_power(state["power"], freq=center_freq_hz,
                                                     params=pwr_params())
                 if state["rf_on"]:
                     tb.set_gain(state["gain"])
                 ctrl.report("power", round(pmap.power_for_gain(
                     state["gain"], freq=center_freq_hz, params=pwr_params()), 2))
-            ctrl.report(name, value)
+            ctrl.report("sidelobes", shape["sidelobes"])
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
