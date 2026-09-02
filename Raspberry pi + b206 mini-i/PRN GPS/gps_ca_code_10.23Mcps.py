@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-GPS L1 C/A transmitter for GNU Radio + UHD (Ettus B200-mini family).
+GPS C/A (10.23 Mcps) transmitter for GNU Radio + UHD (Ettus B200-mini family).
 
-Transmit a BPSK GPS L1 C/A Gold code (1.023 Mcps) at the L1 carrier (1575.42 MHz),
-prebuilt once and looped so a Raspberry Pi sustains the rate with no runtime IQ math.
+Transmit a BPSK GPS C/A Gold code at the DECADE chip rate (10.23 Mcps) on the L1
+(1575.42 MHz, default) or L2 (1227.6 MHz) carrier — pick the band with --freq — prebuilt
+once and looped so a Raspberry Pi sustains the rate with no runtime IQ math. Same C/A Gold
+code as the 1.023 Mcps script, clocked ×10 so the main lobe is ±10.23 MHz.
 
-⚠  RF SAFETY / LEGAL: L1 (1575.42 MHz) is a live GNSS band. Transmit ONLY into a
-   shielded/conducted setup (cable + attenuators into a receiver or spectrum analyser)
-   you are LICENSED / AUTHORISED to use. Radiating a PRN can jam or spoof real GNSS.
+⚠  RF SAFETY / LEGAL: L1 (1575.42 MHz) and L2 (1227.6 MHz) are live GNSS bands. Transmit
+   ONLY into a shielded/conducted setup (cable + attenuators into a receiver or spectrum
+   analyser) you are LICENSED / AUTHORISED to use. Radiating a PRN can jam or spoof real GNSS.
 
 Fixed radio setup
 ─────────────────
-  • sample rate 61.38 MHz (= 60 samples/chip, exact), master clock pinned 1:1;
+  • sample rate 61.38 MHz (= 6 samples/chip at 10.23 Mcps, exact), master clock pinned 1:1;
   • over-the-wire sc8 (constant-modulus BPSK loses nothing at 8-bit; halves USB load);
   • baseband amplitude 0.5 (the amplitude the calibration is measured at — not a knob).
 None of these are parameters; they are fixed so the loop length and calibration stay exact.
@@ -34,7 +36,9 @@ UNITY passband gain, so whatever it passes is unchanged in power: if the main lo
 passband is ALWAYS an integer number of C/A sidelobes, which is what makes the emitted power a
 well-defined function of the sidelobe count (see the calibration note below).
   • --sidelobes <n>             passband keeps the main lobe + n C/A sidelobes, i.e. a
-                                ±(n+1)·1.023 MHz band (live, a 0..28 slider).
+                                ±(n+1)·10.23 MHz band (live, a 0..2 slider). n = 2 puts the
+                                passband edge at ±30.69 MHz = ±Fs/2 — the whole representable
+                                signal (there are no further sidelobes below Nyquist to keep).
 The skirt transition width is FIXED at 0.05 MHz (not a knob), so the emitted power stays a
 well-defined function of the sidelobe count alone. --sidelobes is LIVE: changing it rebuilds
 the (circularly-)filtered loop and swaps it into the running source; the flowgraph never
@@ -59,10 +63,11 @@ docs/calibration-v2.md §13 (sdr-agent).
 
 CLI
 ───
-    gps_l1ca_tx.py --prn 5 --power -30                       # calibrated dBm (main lobe + 2 sidelobes)
-    gps_l1ca_tx.py --prn 5 --gain 60 --sidelobes 5          # relative gain, main + 5 sidelobes
-    gps_l1ca_tx.py --self-test        # verify the Gold-code generator (+ filter/laws, if numpy)
-    gps_l1ca_tx.py --describe-params  # paramkit JSON schema for the GUI
+    gps_ca_code_10.23Mcps.py --prn 5 --power -30            # calibrated dBm (main lobe + 2 sidelobes)
+    gps_ca_code_10.23Mcps.py --prn 5 --gain 60 --sidelobes 1   # relative gain, main + 1 sidelobe
+    gps_ca_code_10.23Mcps.py --prn 5 --freq 1227.6         # same signal on the L2 carrier
+    gps_ca_code_10.23Mcps.py --self-test        # verify the Gold-code generator (+ filter/laws, if numpy)
+    gps_ca_code_10.23Mcps.py --describe-params  # paramkit JSON schema for the GUI
 """
 from __future__ import annotations
 
@@ -86,7 +91,7 @@ from paramkit import Script, PowerMap
 # unit's resolved calibration injected at $SDR_CALIBRATION_FILE; calkit maps --power through
 # it at the unit's real operating plane (e.g. EIRP). Absent it, the script runs uncalibrated
 # (relative gain only). See the agent's docs/calibration.md.
-CAL_SIGNAL_ID = "GPS L1 C/A (1.023 Mcps)"
+CAL_SIGNAL_ID = "GPS C/A (10.23 Mcps)"
 
 # Which parameter carries the transmit frequency. A frequency-dependent calibration chain (a
 # cable/antenna whose loss varies with frequency) has a --power scale that MOVES with frequency,
@@ -95,7 +100,7 @@ CAL_SIGNAL_ID = "GPS L1 C/A (1.023 Mcps)"
 CAL_FREQ_PARAM = "freq"
 
 # ── Fixed radio setup (NOT parameters — see the module docstring) ───────────────────
-SAMP_RATE_HZ = 61.38e6        # 60 samples/chip at 1.023 Mcps (exact); master clock 1:1
+SAMP_RATE_HZ = 61.38e6        # 6 samples/chip at 10.23 Mcps (exact); master clock 1:1
 OTW_FORMAT = "sc8"            # over-the-wire; BPSK is constant-modulus, 8-bit is lossless here
 AMPLITUDE = 0.5              # FIXED baseband amplitude the calibration is measured at
 
@@ -103,22 +108,26 @@ AMPLITUDE = 0.5              # FIXED baseband amplitude the calibration is measu
 GAIN_AT_MAX_DB = 89.75       # operating gain ceiling (also the hard cap the script commands)
 HW_MAX_GAIN_DB = 89.75       # B200-mini physical TX-gain ceiling
 
-# ── Signal constants (fixed — this IS GPS L1 C/A) ───────────────────────────────────
-CARRIER_HZ = 1575.42e6        # GPS L1 (the --freq default; retunable for bench testing)
-CODE_RATE_HZ = 1.023e6        # C/A chip rate (~2 MHz null-to-null)
-SIGNAL_NAME = "GPS L1 C/A (1.023 Mcps)"
+# ── Signal constants (fixed — this IS GPS C/A at 10.23 Mcps) ────────────────────────
+CARRIER_HZ = 1575.42e6        # GPS L1 default; --freq retunes to L2 (1227.6) or any bench freq
+CODE_RATE_HZ = 10.23e6        # C/A chip rate ×10 (~20 MHz null-to-null)
+SIGNAL_NAME = "GPS C/A (10.23 Mcps)"
 CODE_LEN = 1023               # chips in a C/A Gold code period
-CA_NULL_HZ = 1.023e6          # main-lobe null spacing == the chip rate; sidelobes step by this
+CA_NULL_HZ = 10.23e6          # main-lobe null spacing == the chip rate; sidelobes step by this
 
-FREQUENCIES = {"GPS L1 (1575.42 MHz)": CARRIER_HZ / 1e6}   # presets are in MHz
+# Carrier presets: the same 10.23 Mcps C/A signal on either GPS band. Default is L1.
+FREQUENCIES = {"GPS L1 (1575.42 MHz)": CARRIER_HZ / 1e6,
+               "GPS L2 (1227.6 MHz)": 1227.6}   # presets are in MHz
 
 # Filter passband width, in C/A sidelobes KEPT beside the main lobe: the passband is the main
-# lobe plus that many sidelobes, i.e. a ±(n+1)·1.023 MHz band. The maximum keeps the whole
-# passband (edge + skirt) inside ±Fs/2: with the fixed 0.05 MHz transition, n = 28 is the
-# largest that fits ((28+1)·1.023 + 0.025 = 29.7 MHz < 30.69 = Fs/2).
-MAX_SIDELOBES = 28
+# lobe plus that many sidelobes, i.e. a ±(n+1)·10.23 MHz band. At 10.23 Mcps the sidelobes are
+# 10× wider than the 1.023 signal, so only two fit below Nyquist: n = 2 puts the passband edge at
+# exactly (2+1)·10.23 = 30.69 MHz = Fs/2, which is the whole representable signal — the sampled
+# buffer has no content beyond ±Fs/2 (a 3rd sidelobe would alias), so there is nothing past n = 2
+# to keep and the fixed 0.05 MHz skirt beyond the edge falls outside the band and is inert there.
+MAX_SIDELOBES = 2
 DEFAULT_SIDELOBES = 2
-CA_NULL_MHZ = 1.023          # sidelobe/main-lobe null spacing (MHz) == the chip rate
+CA_NULL_MHZ = 10.23          # sidelobe/main-lobe null spacing (MHz) == the chip rate
 
 # Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband is always
 # an integer number of sidelobes; the skirt is a constant so the emitted power stays a
@@ -134,12 +143,14 @@ TRANS_HZ = TRANSITION_MHZ * 1e6
 #   • Main-lobe integrated power (dBm) = peak_dBm/Hz + 10·log10(Rc · I_ML)      ← CONSTANT
 #   • Full signal power (dBm)          = peak_dBm/Hz + 10·log10(Rc · frac(n))    ← tracks --sidelobes
 #
-# Rc = 1.023e6 Hz (chip rate); I_ML = 0.902823 is the fraction of the signal's total power inside
+# Rc = 10.23e6 Hz (chip rate); I_ML = 0.902823 is the fraction of the signal's total power inside
 # the main lobe (±Rc); frac(n) is the fraction inside the filter passband (±(n+1)·Rc), computed
 # below by integrating sinc². The full power is measured through the SAME filter the operator
 # transmits with, so it IS the amplifier's limiting quantity. NOTE: because 90.3% of a C/A
-# signal's power is already in the main lobe, the full power exceeds the main-lobe power by AT
-# MOST 0.44 dB — they are EQUAL at n=0 (passband = main lobe) and diverge by only frac(n)/I_ML.
+# signal's power is already in the main lobe, the full power exceeds the main-lobe power by only
+# frac(n)/I_ML — EQUAL at n=0 (passband = main lobe), ~0.30 dB at n=2 (the full representable
+# signal); the frac→1 asymptotic ceiling is 0.44 dB. The shape (and I_ML) is identical to the
+# 1.023 signal — only Rc scales — so enbw and the main-lobe k are exactly 10× / +10 dB of it.
 
 def _sinc2(x: float) -> float:
     """sinc²(x) with sinc(x) = sin(πx)/(πx); the normalized C/A power-spectral shape."""
@@ -186,10 +197,7 @@ def enbw_mhz(sidelobes: int) -> float:
 # asserts it matches enbw_mhz() so the two can never silently drift.
 _ENBW_TABLE_ARGS = [
     "sidelobes",
-    0.923588, 0.971788, 0.988638, 0.997168, 1.002311, 1.005749, 1.008208, 1.010054,
-    1.011490, 1.012640, 1.013581, 1.014365, 1.015029, 1.015598, 1.016091, 1.016523,
-    1.016904, 1.017242, 1.017545, 1.017818, 1.018065, 1.018289, 1.018494, 1.018682,
-    1.018854, 1.019014, 1.019161, 1.019298, 1.019426,
+    9.235883, 9.717879, 9.886379,      # enbw_mhz(0), (1), (2) = 10.23·frac(n)
 ]
 
 
@@ -198,14 +206,15 @@ _ENBW_TABLE_ARGS = [
 # which is --power (and sets the FULL power as the limiting cap) per unit; the chosen law is
 # embedded in that unit's calibration doc. Constants are LITERAL (the agent reads CAL_POWER_LAWS
 # statically): 60 = 10·log10(1 MHz / 1 Hz); the full-power term adds 10·log10(enbw_mhz); the
-# main-lobe k = 10·log10(Rc · I_ML) = 59.654784. `rep` = enbw_mhz(DEFAULT_SIDELOBES) for the
-# range read-outs shown before a live --sidelobes is known.
+# main-lobe k = 10·log10(Rc · I_ML) = 69.654784 (the 1.023 script's 59.654784 + 10 dB, since Rc
+# is ×10). `rep` = enbw_mhz(DEFAULT_SIDELOBES) for the range read-outs shown before a live
+# --sidelobes is known.
 CAL_POWER_LAWS = [
     {"id": "full_power", "name": "Full signal power (filter passband)", "unit": "dBm",
      "in": "density", "out": "abs",
-     "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 0.988638},
+     "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 9.886379},
     {"id": "main_lobe_power", "name": "Main-lobe integrated power", "unit": "dBm",
-     "in": "density", "out": "abs", "k": 59.654784},
+     "in": "density", "out": "abs", "k": 69.654784},
 ]
 
 _PMAP = None
@@ -351,14 +360,19 @@ def _self_test() -> int:
         f = np.fft.fftshift(np.fft.fftfreq(len(x), 1.0 / SAMP_RATE_HZ))
         return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
 
-    filt, taps, fp = filter_buffer(base, sidelobes=2, trans_hz=TRANS_HZ)
+    # Probe the filter shape at n = 1, NOT the default n = 2: at 10.23 Mcps the n = 2 passband edge
+    # is Fs/2, so its passband spans the whole representable band and there is no out-of-band region
+    # to measure rejection against. At n = 1 (passband ±20.46 MHz) the main lobe and 1st sidelobe are
+    # kept and the 2nd sidelobe (2.2..3·Rc, below Nyquist) must be rejected.
+    filt, taps, fp = filter_buffer(base, sidelobes=1, trans_hz=TRANS_HZ)
     main = 10 * np.log10(band(filt, 0, CA_NULL_HZ) / band(base, 0, CA_NULL_HZ))
-    kept = 10 * np.log10(band(filt, 2 * CA_NULL_HZ, 3 * CA_NULL_HZ)
-                         / band(base, 2 * CA_NULL_HZ, 3 * CA_NULL_HZ))
-    cut = 10 * np.log10(band(filt, 10e6, 12e6) / band(base, 10e6, 12e6))
+    kept = 10 * np.log10(band(filt, CA_NULL_HZ, 2 * CA_NULL_HZ)
+                         / band(base, CA_NULL_HZ, 2 * CA_NULL_HZ))
+    cut = 10 * np.log10(band(filt, 2.2 * CA_NULL_HZ, 3 * CA_NULL_HZ)
+                        / band(base, 2.2 * CA_NULL_HZ, 3 * CA_NULL_HZ))
     peak = float(np.max(np.abs(filt)))
     f_ok = abs(main) < 0.1 and abs(kept) < 0.1 and cut < -40 and peak * AMPLITUDE < 1.0
-    print(f"filter (main+2 sidelobes, {taps} taps): main lobe {main:+.3f} dB, kept sidelobe "
+    print(f"filter (main+1 sidelobe, {taps} taps): main lobe {main:+.3f} dB, kept sidelobe "
           f"{kept:+.3f} dB, far sidelobe {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} "
           f"[{'OK' if f_ok else 'FAIL'}]")
     ok = ok and f_ok
@@ -376,9 +390,9 @@ def _self_test() -> int:
                 and _ENBW_TABLE_ARGS[0] == "sidelobes"
                 and all(abs(_ENBW_TABLE_ARGS[1 + n] - enbw_mhz(n)) < 5e-6
                         for n in range(MAX_SIDELOBES + 1)))
-    laws_ok = mono and bounded and abs(full0 - 59.654784) < 0.01 and table_ok
+    laws_ok = mono and bounded and abs(full0 - 69.654784) < 0.01 and table_ok
     print(f"calibration: I_ML={fr[0]:.6f}, frac(max)={fr[-1]:.6f}, full(0)={full0:.4f} dB "
-          f"== main-lobe 59.6548 dB, span main→full ≤ {10*math.log10(1/fr[0]):.3f} dB, "
+          f"== main-lobe 69.6548 dB, span main→full ≤ {10*math.log10(1/fr[0]):.3f} dB, "
           f"enbw table {'matches' if table_ok else 'DRIFTED'} "
           f"[{'OK' if laws_ok else 'FAIL'}]")
     ok = ok and laws_ok
@@ -463,7 +477,7 @@ def build_script() -> Script:
                "(spectral density → full / main-lobe power); uncalibrated it runs on a relative gain.")
         .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
                 presets=FREQUENCIES, default=CARRIER_HZ / 1e6,
-                help="RF carrier in MHz (default L1 = 1575.42). Fixed per run.")
+                help="RF carrier in MHz (default L1 = 1575.42; L2 = 1227.6 preset). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -478,14 +492,15 @@ def build_script() -> Script:
         .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,
                  default=DEFAULT_SIDELOBES, required=False, live=True,
                  help="Passband width, as the number of C/A sidelobes KEPT beside the main "
-                      "lobe: a ±(n+1)·1.023 MHz band. 0 keeps the main lobe only. The filter is "
+                      "lobe: a ±(n+1)·10.23 MHz band. 0 keeps the main lobe only. The filter is "
                       "always on (unity passband gain). More sidelobes pass more of the signal's "
-                      "power (the full-power calibration quantity tracks this). Max 28 keeps the "
-                      "band inside the sample rate. Live (rebuilds the filtered loop).")
+                      "power (the full-power calibration quantity tracks this). Max 2 fills the "
+                      "band to ±Fs/2 = ±30.69 MHz (the whole representable signal). Live "
+                      "(rebuilds the filtered loop).")
         .derived("-Passband-bandwidth", name="passband_bw_mhz", unit="MHz",
-                 formula={"linear": ["sidelobes", 2.046, 2.046]},
+                 formula={"linear": ["sidelobes", 20.46, 20.46]},
                  help="Occupied bandwidth the filter passes at the current sidelobe count: "
-                      "2·(n+1)·1.023 MHz (i.e. ±(n+1)·1.023 MHz).")
+                      "2·(n+1)·10.23 MHz (i.e. ±(n+1)·10.23 MHz).")
         .derived("-Full-power-bandwidth", name="enbw_mhz", unit="MHz", hidden=True,
                  formula={"table": _ENBW_TABLE_ARGS},
                  help="Equivalent-noise bandwidth mapping the measured peak density to the full "
@@ -589,7 +604,7 @@ def main() -> int:
     print(f"  PRN            : {args.prn}")
     print(f"  carrier        : {center_freq_hz/1e6:.3f} MHz")
     print(f"  sample rate    : {tb.actual_samp_rate()/1e6:.6f} MHz (fixed, 1:1 master clock)")
-    print(f"  code rate      : 1.023 Mcps (~2.046 MHz null-to-null), loop {nsamp} samples")
+    print(f"  code rate      : 10.23 Mcps (~20.46 MHz null-to-null), loop {nsamp} samples")
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
         print(f"  power (achieved on grid): "
