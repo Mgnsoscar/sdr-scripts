@@ -109,18 +109,23 @@ CAL_MEAS_BW_MHZ = 10.0
 #
 # `k` is the constant dB the reading adds to the measured value; `param`/`coeff`/`ref` add a
 # `coeff·log10(param/ref)` term. Both encode CAL_MEAS_BW_MHZ (10): k = 10·log10(10) = 10 for the
-# total-power law; ref = 10 for the density-restatement law. The laws are only OFFERED here; the
-# operator picks which is --power's quantity per unit in the editor (and can switch units on the
-# --power field between the two, since they differ by exactly 10·log10(bw)). The chosen law is
-# embedded in that unit's calibration doc. `rep` is a representative --bw for the range read-outs
-# shown before a live --bw is known.
+# total-power law; ref = 10 for the density-restatement laws. Each law may declare its display
+# `unit` (dBm, dBm/MHz, dBm/Hz). The laws are only OFFERED here; the operator picks which is
+# --power's quantity per unit in the editor (and can switch the --power field among them on the
+# Run/tune form — they all differ by constants and 10·log10(bw)). The chosen law is embedded in
+# that unit's calibration doc. `rep` is a representative --bw for the range read-outs shown
+# before a live --bw is known.
 CAL_POWER_LAWS = [
-    {"id": "fbw_power", "name": "Full-bandwidth (total) power",
+    {"id": "fbw_power", "name": "Full-bandwidth (total) power", "unit": "dBm",
      "in": "density", "out": "abs",
      "k": 10.0, "rep": 10.0},                                # +10·log10(CAL_MEAS_BW_MHZ)
-    {"id": "psd_live", "name": "Spectral density (at live sweep bw)",
+    {"id": "psd_live", "name": "Spectral density", "unit": "dBm/MHz",
      "in": "density", "out": "density",
      "param": "bw", "coeff": -10.0, "ref": 10.0, "rep": 10.0},  # −10·log10(bw / CAL_MEAS_BW_MHZ)
+    # Same spectral density, expressed per Hz: dBm/Hz = dBm/MHz − 10·log10(1e6) = dBm/MHz − 60.
+    {"id": "psd_hz", "name": "Spectral density", "unit": "dBm/Hz",
+     "in": "density", "out": "density",
+     "param": "bw", "coeff": -10.0, "ref": 10.0, "k": -60.0, "rep": 10.0},
 ]
 
 
