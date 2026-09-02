@@ -92,20 +92,35 @@ CAL_SIGNAL_ID = "fm_chirp"
 # the Run / sequence form at the same frequency. See calkit / calibration-v2.
 CAL_FREQ_PARAM = "freq"
 
+# Sweep bandwidth (MHz) the spectral-density calibration is MEASURED at. It anchors the two
+# conversion laws below: one density measurement at this bandwidth yields BOTH total power and
+# density-at-any-bandwidth, with no second measurement. If you calibrate at a different sweep
+# width, change this and the two constants derived from it (k and ref).
+CAL_MEAS_BW_MHZ = 10.0
+
 # Power-quantity conversion laws this signal offers the calibration editor (see
-# docs/calibration-v2.md §13 in sdr-agent). A chirp is naturally measured as a spectral
-# DENSITY (dBm per MHz of occupied bandwidth); its FULL-BANDWIDTH (total) power is that
-# density plus 10·log10(sweep_bw / 1 MHz). Declaring it lets an operator calibrate the
-# node in dBm/MHz yet report — and safety-limit — total power, with the conversion tracking
-# --bw as it is tuned. The law is only OFFERED here; whether a unit's calibration uses it
-# (as its reported and/or limiting reading) is chosen per unit in the editor, and the chosen
-# law is embedded in that unit's calibration doc. `param` names this script's --bw (MHz),
-# `ref` its 1 MHz reference, `rep` a representative value (the default sweep BW) for the
-# range read-outs shown before a live --bw is known.
+# docs/calibration-v2.md §13 in sdr-agent). A chirp's baseband is CONSTANT-AMPLITUDE, so its
+# TOTAL (full-bandwidth) power depends only on gain — widening the sweep spreads the same power
+# over more spectrum (density drops), it does NOT add power. So from one spectral-density
+# measurement taken at CAL_MEAS_BW_MHZ, both readings below are exact at ANY live sweep width:
+#
+#   Full-bandwidth power = density + 10·log10(CAL_MEAS_BW_MHZ)     ← CONSTANT (bandwidth-invariant)
+#   Spectral density(bw) = density − 10·log10(bw / CAL_MEAS_BW_MHZ) ← tracks the live --bw
+#
+# `k` is the constant dB the reading adds to the measured value; `param`/`coeff`/`ref` add a
+# `coeff·log10(param/ref)` term. Both encode CAL_MEAS_BW_MHZ (10): k = 10·log10(10) = 10 for the
+# total-power law; ref = 10 for the density-restatement law. The laws are only OFFERED here; the
+# operator picks which is --power's quantity per unit in the editor (and can switch units on the
+# --power field between the two, since they differ by exactly 10·log10(bw)). The chosen law is
+# embedded in that unit's calibration doc. `rep` is a representative --bw for the range read-outs
+# shown before a live --bw is known.
 CAL_POWER_LAWS = [
-    {"id": "fbw_power", "name": "Full-bandwidth power",
+    {"id": "fbw_power", "name": "Full-bandwidth (total) power",
      "in": "density", "out": "abs",
-     "param": "bw", "coeff": 10.0, "ref": 1.0, "rep": 20.0},
+     "k": 10.0, "rep": 10.0},                                # +10·log10(CAL_MEAS_BW_MHZ)
+    {"id": "psd_live", "name": "Spectral density (at live sweep bw)",
+     "in": "density", "out": "density",
+     "param": "bw", "coeff": -10.0, "ref": 10.0, "rep": 10.0},  # −10·log10(bw / CAL_MEAS_BW_MHZ)
 ]
 
 
