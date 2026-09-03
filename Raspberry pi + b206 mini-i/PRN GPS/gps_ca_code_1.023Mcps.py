@@ -121,7 +121,7 @@ FREQUENCIES = {"GPS L1 (1575.42 MHz)": CARRIER_HZ / 1e6,
 # passband (edge + skirt) inside ±Fs/2: with the fixed 0.05 MHz transition, n = 28 is the
 # largest that fits ((28+1)·1.023 + 0.025 = 29.7 MHz < 30.69 = Fs/2).
 MAX_SIDELOBES = 28
-DEFAULT_SIDELOBES = 2
+DEFAULT_SIDELOBES = 5
 CA_NULL_MHZ = 1.023          # sidelobe/main-lobe null spacing (MHz) == the chip rate
 
 # Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband is always
@@ -465,9 +465,6 @@ def build_script() -> Script:
                "buffer, always-on power-preserving digital passband filter set to an integer "
                "number of sidelobes. Level is set in dBm via the unit's calibration "
                "(spectral density → full / main-lobe power); uncalibrated it runs on a relative gain.")
-        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
-                presets=FREQUENCIES, default=CARRIER_HZ / 1e6,
-                help="RF carrier in MHz (default L1 = 1575.42; L2 = 1227.6 preset). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -477,6 +474,9 @@ def build_script() -> Script:
                 required=False, live=True,
                 help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
                      "calibration. When given, overrides --power. Live.")
+        .number("-Center-frequency", "--freq", unit="MHz", min=1000, max=1800,
+                presets=FREQUENCIES, default=CARRIER_HZ / 1e6,
+                help="RF carrier in MHz (default L1 = 1575.42; L2 = 1227.6 preset). Fixed per run.")
         .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
                  help="GPS satellite PRN / Gold code index (1..32). Fixed per run.")
         .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,

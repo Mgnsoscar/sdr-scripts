@@ -126,7 +126,7 @@ FREQUENCIES = {"GPS L1 (1575.42 MHz)": CARRIER_HZ / 1e6,
 # buffer has no content beyond ±Fs/2 (a 3rd sidelobe would alias), so there is nothing past n = 2
 # to keep and the fixed 0.05 MHz skirt beyond the edge falls outside the band and is inert there.
 MAX_SIDELOBES = 2
-DEFAULT_SIDELOBES = 2
+DEFAULT_SIDELOBES = 1
 CA_NULL_MHZ = 10.23          # sidelobe/main-lobe null spacing (MHz) == the chip rate
 
 # Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband is always
@@ -475,9 +475,6 @@ def build_script() -> Script:
                "buffer, always-on power-preserving digital passband filter set to an integer "
                "number of sidelobes. Level is set in dBm via the unit's calibration "
                "(spectral density → full / main-lobe power); uncalibrated it runs on a relative gain.")
-        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
-                presets=FREQUENCIES, default=CARRIER_HZ / 1e6,
-                help="RF carrier in MHz (default L1 = 1575.42; L2 = 1227.6 preset). Fixed per run.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -487,6 +484,9 @@ def build_script() -> Script:
                 required=False, live=True,
                 help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
                      "calibration. When given, overrides --power. Live.")
+        .number("-Center-frequency", "--freq", unit="MHz", min=1000, max=1800,
+                presets=FREQUENCIES, default=CARRIER_HZ / 1e6,
+                help="RF carrier in MHz (default L1 = 1575.42; L2 = 1227.6 preset). Fixed per run.")
         .integer("-PRN", "--prn", min=1, max=32, default=1, required=True,
                  help="GPS satellite PRN / Gold code index (1..32). Fixed per run.")
         .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,

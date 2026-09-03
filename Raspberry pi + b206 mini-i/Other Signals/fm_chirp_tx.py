@@ -83,7 +83,7 @@ from paramkit import Script, PowerMap
 # it and --power maps through the unit's MEASURED curve at its real operating plane
 # (e.g. EIRP). Absent it, the script runs uncalibrated (relative gain only)
 # (unchanged behaviour). See the agent's docs/calibration.md.
-CAL_SIGNAL_ID = "fm_chirp"
+CAL_SIGNAL_ID = "Chirp/Sweep"
 
 # Which parameter carries the transmit frequency. A frequency-dependent calibration chain
 # (a cable/antenna whose loss varies with frequency) has a --power scale that MOVES with
@@ -431,38 +431,6 @@ def build_script() -> Script:
                "/ sc8, looped buffer, always-on power-preserving digital passband filter "
                "(passband = sweep bandwidth). Level is set in dBm via the unit's calibration; "
                "uncalibrated it runs on a relative gain. Authorised, shielded setups only.")
-        # The sweep band is entered one of two ways; the mode reveals its own fields.
-        .choice("-Band-mode", "--band-mode",
-                options={"Centre + width": "center_bw", "Start / stop": "start_stop"},
-                default="center_bw", required=False,
-                help="How the sweep band is entered: a centre carrier + width, or absolute "
-                     "start/stop edges (carrier = their midpoint, width = their span). Fixed "
-                     "at launch.")
-        # ── center_bw mode ──────────────────────────────────────────────────────────
-        .number("-Center-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
-                presets=FREQUENCIES, default=1575.42, required=False, live=True,
-                show_when={"band_mode": "center_bw"},
-                help="RF carrier in MHz. Live.")
-        # ── start_stop mode ─────────────────────────────────────────────────────────
-        .number("-Start-frequency", "--start", unit="MHz", min=70.0, max=6000.0,
-                step=0.01, default=1570.42, required=False, live=True,
-                show_when={"band_mode": "start_stop"},
-                help="Sweep start — the low RF edge, in MHz. Live.")
-        .number("-Stop-frequency", "--stop", unit="MHz", min=70.0, max=6000.0,
-                step=0.01, default=1580.42, required=False, live=True,
-                show_when={"band_mode": "start_stop"},
-                help="Sweep stop — the high RF edge, in MHz. Live.")
-        .derived("-Carrier", name="band_center", unit="MHz",
-                 formula={"center": ["start", "stop"]}, is_freq=True,
-                 show_when={"band_mode": "start_stop"},
-                 help="Carrier the LO tunes to = midpoint of start/stop. Power is calibrated "
-                      "here.")
-        .derived("-Sweep-width", name="band_span", unit="MHz",
-                 formula={"span": ["start", "stop"]}, min=0.001, max=MAX_SWEEP_BW_MHZ,
-                 show_when={"band_mode": "start_stop"}, provides="bw",
-                 help="Resulting sweep width = stop − start. Must stay within the SDR's "
-                      "maximum sweep width. This is the sweep bandwidth the calibration power "
-                      "laws key on in start/stop mode (it stands in for --bw).")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -472,12 +440,44 @@ def build_script() -> Script:
                 required=False, live=True,
                 help="RELATIVE power: the SDR's raw TX gain (dB) directly, bypassing the dBm "
                      "calibration. When given, overrides --power. Live.")
-        .number("-Sweep-BW", "--bw", unit="MHz", min=0.001, max=MAX_SWEEP_BW_MHZ, default=20.0,
+        # The sweep band is entered one of two ways; the mode reveals its own fields.
+        .choice("-Band-mode", "--band-mode",
+                options={"Centre + width": "center_bw", "Start / stop": "start_stop"},
+                default="center_bw", required=False,
+                help="How the sweep band is entered: a centre carrier + width, or absolute "
+                     "start/stop edges (carrier = their midpoint, width = their span). Fixed "
+                     "at launch.")
+        # ── center_bw mode ──────────────────────────────────────────────────────────
+        .number("-Center-frequency", "--freq", unit="MHz", min=1000, max=1800,
+                presets=FREQUENCIES, default=1575.42, required=False, live=True,
+                show_when={"band_mode": "center_bw"},
+                help="RF carrier in MHz. Live.")
+        # ── start_stop mode ─────────────────────────────────────────────────────────
+        .number("-Start-frequency", "--start", unit="MHz", min=1000, max=1800,
+                step=1, default=1570.42, required=False, live=True,
+                show_when={"band_mode": "start_stop"},
+                help="Sweep start — the low RF edge, in MHz. Live.")
+        .number("-Stop-frequency", "--stop", unit="MHz", min=1000, max=1800.0,
+                step=1, default=1580.42, required=False, live=True,
+                show_when={"band_mode": "start_stop"},
+                help="Sweep stop — the high RF edge, in MHz. Live.")
+        .derived("-Carrier", name="band_center", unit="MHz",
+                 formula={"center": ["start", "stop"]}, is_freq=True,
+                 show_when={"band_mode": "start_stop"},
+                 help="Carrier the LO tunes to = midpoint of start/stop. Power is calibrated "
+                      "here.")
+        .derived("-Sweep-width", name="band_span", unit="MHz",
+                 formula={"span": ["start", "stop"]}, min=0.1, max=MAX_SWEEP_BW_MHZ,
+                 show_when={"band_mode": "start_stop"}, provides="bw",
+                 help="Resulting sweep width = stop − start. Must stay within the SDR's "
+                      "maximum sweep width. This is the sweep bandwidth the calibration power "
+                      "laws key on in start/stop mode (it stands in for --bw).")
+        .number("-Sweep-BW", "--bw", unit="MHz", min=0.1, max=MAX_SWEEP_BW_MHZ, default=10.0,
                 required=False, live=True, show_when={"band_mode": "center_bw"},
                 help="Peak-to-peak sweep width; f sweeps ±bw/2 around the carrier. Live "
                      "(regenerates the loop).")
         .number("-Sweep-rate", "--rate", unit="kHz", min=0.1, max=5000.0,
-                default=200.0, required=True, live=True,
+                default=10, required=True, live=True,
                 help="How fast the sweep repeats, in kHz. Live (regenerates the loop).")
         # The passband filter is always on (passband = sweep bandwidth, fixed 0.05 MHz
         # transition) and tracks --bw automatically, so it exposes no parameters.
