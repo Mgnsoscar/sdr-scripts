@@ -36,7 +36,23 @@ to check the calibrated-power path end-to-end without hardware.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
 ## Current state
-Latest work this branch: `fm_chirp_tx.py`'s `band_span` derived field (start/stop mode) declares
+Latest work this branch: `Raspberry pi + b206 mini-i/Other Signals/mock_fm_chirp_tx.py` — a
+NO-HARDWARE stand-in for `fm_chirp_tx.py`. Same calibration surface (identical param schema,
+`CAL_SIGNAL_ID="fm_chirp"`, `CAL_FREQ_PARAM`, `CAL_POWER_LAWS`), so the client renders the SAME
+power card (density / total-power / dBm-per-Hz) and DEPENDS ON row and drives it like the real
+chirp; but it imports no UHD/GNU Radio and a `FakeRadio` only LOGS the SDR gain it would command
+(mirrors `mock_tx.py`/`mock_sdr_tx.py`). `--power` maps to gain via `PowerMap.gain_for_power`
+folded at the carrier + sweep bw, exactly as the real chirp — so the gain it prints is the ground
+truth for "did my power quantity map right". Runs under the agent (`SDR_CALIBRATION_FILE`
+injected) or standalone (`--calibration <artifact>`, `--make-sample-calibration <out>` builds+
+resolves a representative density calibration — needs sdr-agent on PYTHONPATH). Extra flags:
+`--once` (print gain + a `RESULT gain_db=… power_dbm=… source=…` line and exit), `--self-test`.
+Because the client reads params via a STATIC AST reader (`agent/argspec.py`), the schema + CAL
+constants live verbatim in the file (an import wouldn't be seen); `tests/test_mock_chirp_power_
+quantities.py` guards against drift from `fm_chirp_tx.py` and checks the gain maps right across
+power quantities (total power bw-invariant; a held density needs more gain as the sweep widens).
+
+Prior work this branch: `fm_chirp_tx.py`'s `band_span` derived field (start/stop mode) declares
 `provides="bw"` — so in start/stop mode the client folds the calibration power laws at the actual
 sweep span (stop − start), not the stale hidden `--bw`. The runtime transmit fold was already
 correct (`resolve_band` → `sweep_bw_hz`); this fixed only the client display fold. `provides` is a
