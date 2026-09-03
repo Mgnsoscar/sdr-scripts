@@ -52,8 +52,9 @@ Sample rate is fixed at 61.38 MHz (the B200's ceiling; a chirp has no chip grid,
 is simply as wide as the sweep can go), over-the-wire sc8, and baseband amplitude 0.5 (the
 amplitude the calibration is measured at). None are parameters. A digital passband filter is
 ALWAYS applied (unity passband gain): it brick-wall band-limits the sweep and strips the
-sawtooth reset splatter. Its passband always equals the sweep bandwidth (the filter passes
-±bw/2) with a fixed 0.05 MHz transition skirt — none of this is a parameter.
+sawtooth reset splatter. Its passband is the sweep bandwidth plus one 0.05 MHz transition width
+of guard, so the whole sweep (±bw/2) stays flat and the skirt falls just beyond it — none of
+this is a parameter.
 
 CLI
 ───
@@ -204,11 +205,13 @@ FREQUENCIES = {
     "Iridium (1621.25 MHz)": 1621.25,
 }
 
-# Passband filter (always on, not a parameter). A chirp is broadband by design (it sweeps
-# ±bw/2, i.e. bw wide), so the passband is centred on the carrier and its TOTAL width always
-# equals the sweep bandwidth — the filter passes ±bw/2, brick-walling the sweep to its own extent
-# and stripping the sawtooth reset splatter. The transition skirt beyond the passband edge is
-# fixed. Both track --bw automatically; _design_lowpass clamps the cutoff to Nyquist.
+# Passband filter (always on, not a parameter). A chirp is broadband by design (it sweeps ±bw/2,
+# i.e. bw wide), so the passband is centred on the carrier and its TOTAL width is the sweep
+# bandwidth plus one transition width of guard (bw + FILTER_TRANSITION): the flat passband then
+# fully covers the sweep (±bw/2) and the transition skirt falls entirely in the guard band beyond
+# it, so the sweep edges stay flat (unity gain) instead of sitting on the roll-off. The skirt also
+# strips the sawtooth reset splatter. The width tracks --bw automatically; _design_lowpass clamps
+# the cutoff to Nyquist.
 FILTER_TRANSITION_MHZ = 0.05
 FILTER_TRANSITION_HZ = FILTER_TRANSITION_MHZ * 1e6
 
@@ -429,7 +432,8 @@ def build_script() -> Script:
     return (
         Script("FM-chirp transmitter (sawtooth sweep) — fixed 61.38 MHz "
                "/ sc8, looped buffer, always-on power-preserving digital passband filter "
-               "(passband = sweep bandwidth). Level is set in dBm via the unit's calibration; "
+               "(passband = sweep bandwidth + guard, keeping the whole sweep flat). Level is set "
+               "in dBm via the unit's calibration; "
                "uncalibrated it runs on a relative gain. Authorised, shielded setups only.")
         # The sweep band is entered one of two ways; the mode reveals its own fields.
         .choice("-Band-mode", "--band-mode",
@@ -566,12 +570,14 @@ def main() -> int:
         return {"bw": shape["bw_hz"] / 1e6}
 
     def make_current():
-        """The buffer for the current shape: the base sweep, always band-limited to a passband
-        equal to the sweep bandwidth (±bw/2) with the fixed transition skirt. Returns
-        (iq, n_per, reps, actual_rate, finfo)."""
+        """The buffer for the current shape: the base sweep, always band-limited. The passband
+        is the sweep bandwidth PLUS one transition width of guard, so the whole sweep (±bw/2)
+        stays flat (unity gain) and the transition skirt falls entirely in the guard band beyond
+        ±bw/2 — the sweep edges aren't rolled off. Returns (iq, n_per, reps, actual_rate, finfo)."""
         base, n_per, reps, actual = build_chirp_buffer(
             shape["waveform"], shape["bw_hz"], shape["rate_hz"])
-        filt, taps, fp = filter_buffer(base, shape["bw_hz"], FILTER_TRANSITION_HZ)
+        width_hz = shape["bw_hz"] + FILTER_TRANSITION_HZ   # sweep + guard → sweep stays flat
+        filt, taps, fp = filter_buffer(base, width_hz, FILTER_TRANSITION_HZ)
         return filt, n_per, reps, actual, {"taps": taps, "edge_hz": fp,
                                            "trans_hz": FILTER_TRANSITION_HZ}
 
@@ -600,7 +606,8 @@ def main() -> int:
         return actual
 
     def _fmt_band(info):
-        return (f"on (always) — passband ±{info['edge_hz']/1e6:.2f} MHz (= sweep bw), "
+        return (f"on (always) — passband ±{info['edge_hz']/1e6:.2f} MHz "
+                f"(sweep + {info['trans_hz']/1e6:g} MHz guard), "
                 f"{info['trans_hz']/1e6:g} MHz transition, {info['taps']} taps")
 
     print("── FM chirp TX ─────────────────────────────────────────────")

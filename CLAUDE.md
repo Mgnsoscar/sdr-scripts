@@ -37,10 +37,11 @@ to check the calibrated-power path end-to-end without hardware.
 
 ## Current state
 Latest work this branch: `fm_chirp_tx.py` dropped the `--filter` / `--passband` / `--transition`
-parameters — the digital passband filter is now ALWAYS on, its passband always equals the sweep
-bandwidth (tracks `--bw`, the filter passes ±bw/2), with a fixed `FILTER_TRANSITION_MHZ = 0.05`
-skirt. `make_current` always filters; live tuning drops those knobs (a `--bw` change re-derives the
-passband automatically). `--self-test` still exercises the filter internally.
+parameters — the digital passband filter is now ALWAYS on, its passband width is the sweep
+bandwidth plus one `FILTER_TRANSITION_MHZ = 0.05` guard (`width = bw + transition`), so the whole
+sweep (±bw/2) stays flat and the skirt falls just beyond it (edge droop 0.00 dB vs ≈−0.03 dB when
+passband == bw). `make_current` always filters and tracks `--bw`; live tuning drops those knobs (a
+`--bw` change re-derives the passband automatically). `--self-test` still exercises the filter.
 
 Prior work this branch: `fm_chirp_tx.py` marks its two spectral-density laws (`psd_live`,
 `psd_hz`) with `restates_measurement: True` and leads with `psd_live`, so the Run/tune form drops
