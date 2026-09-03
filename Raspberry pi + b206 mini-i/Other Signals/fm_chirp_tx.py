@@ -459,9 +459,10 @@ def build_script() -> Script:
                       "here.")
         .derived("-Sweep-width", name="band_span", unit="MHz",
                  formula={"span": ["start", "stop"]}, min=0.001, max=MAX_SWEEP_BW_MHZ,
-                 show_when={"band_mode": "start_stop"},
+                 show_when={"band_mode": "start_stop"}, provides="bw",
                  help="Resulting sweep width = stop − start. Must stay within the SDR's "
-                      "maximum sweep width.")
+                      "maximum sweep width. This is the sweep bandwidth the calibration power "
+                      "laws key on in start/stop mode (it stands in for --bw).")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
