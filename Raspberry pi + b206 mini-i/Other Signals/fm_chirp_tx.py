@@ -115,16 +115,25 @@ CAL_MEAS_BW_MHZ = 10.0
 # Run/tune form — they all differ by constants and 10·log10(bw)). The chosen law is embedded in
 # that unit's calibration doc. `rep` is a representative --bw for the range read-outs shown
 # before a live --bw is known.
+#
+# `restates_measurement`: the density is MEASURED at a fixed sweep (CAL_MEAS_BW_MHZ), so the raw
+# measured quantity is bandwidth-INVARIANT — it is really total power minus a constant, not the
+# live passband density. The psd laws below re-express that same reading at the LIVE sweep width,
+# so they carry `restates_measurement: True`. The client then drops the raw measured quantity from
+# the operator's "control in" choices (it would otherwise appear as a second, confusingly
+# bandwidth-frozen "dBm/MHz" density) and offers these live restatements instead. Total power is a
+# DISTINCT reading (not a restatement), so it is NOT flagged and stays on offer. `psd_live` leads
+# so the live spectral density is the default control quantity for this density-measured signal.
 CAL_POWER_LAWS = [
+    {"id": "psd_live", "name": "Spectral density", "unit": "dBm/MHz",
+     "in": "density", "out": "density", "restates_measurement": True,
+     "param": "bw", "coeff": -10.0, "ref": 10.0, "rep": 10.0},  # −10·log10(bw / CAL_MEAS_BW_MHZ)
     {"id": "fbw_power", "name": "Full-bandwidth (total) power", "unit": "dBm",
      "in": "density", "out": "abs",
      "k": 10.0, "rep": 10.0},                                # +10·log10(CAL_MEAS_BW_MHZ)
-    {"id": "psd_live", "name": "Spectral density", "unit": "dBm/MHz",
-     "in": "density", "out": "density",
-     "param": "bw", "coeff": -10.0, "ref": 10.0, "rep": 10.0},  # −10·log10(bw / CAL_MEAS_BW_MHZ)
     # Same spectral density, expressed per Hz: dBm/Hz = dBm/MHz − 10·log10(1e6) = dBm/MHz − 60.
     {"id": "psd_hz", "name": "Spectral density", "unit": "dBm/Hz",
-     "in": "density", "out": "density",
+     "in": "density", "out": "density", "restates_measurement": True,
      "param": "bw", "coeff": -10.0, "ref": 10.0, "k": -60.0, "rep": 10.0},
 ]
 

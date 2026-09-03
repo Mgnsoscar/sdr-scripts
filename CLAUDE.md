@@ -25,10 +25,25 @@ to check the calibrated-power path end-to-end without hardware.
   → full-bandwidth power), each with `in`/`out` families (`abs`/`density`) and an affine
   log10 form. A **limiting** law must return dBm (`out: abs`). Shared evaluation lives in
   `sdr-agent/paramkit/power_law.py` (mirrored to `sdr-client/state/power_law.py`).
+  - `restates_measurement: True` (optional, per law) — this law RE-EXPRESSES the measured
+    reading itself, not a distinct quantity (e.g. a chirp's live spectral density restating the
+    density measured at a fixed reference sweep). The Run/tune form then drops the raw measured
+    quantity from the operator's "control in" choices and offers the live restatement instead —
+    so a bandwidth-frozen measured density doesn't sit confusingly beside its live twin. It is an
+    explicit opt-out (never inferred from unit/family), so a same-unit but genuinely different
+    reading (main-lobe vs total-in-band power, both dBm) is unaffected. Any extra law key rides
+    through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
 ## Current state
-Latest work this branch: the GPS C/A transmit scripts were consolidated to exactly two, named by
+Latest work this branch: `fm_chirp_tx.py` marks its two spectral-density laws (`psd_live`,
+`psd_hz`) with `restates_measurement: True` and leads with `psd_live`, so the Run/tune form drops
+the raw fixed-bandwidth measured density (a bw-invariant "total power − 10 dB" in disguise) from
+the "control in" picker and offers the live density + total power instead — fixing a two-densities
+confusion. Total power (`fbw_power`) is a distinct reading and stays on offer. Honored by
+`sdr-client/ui/param_form.py` (`_power_views`); no agent change (argspec passes law keys through).
+
+Prior work this branch: the GPS C/A transmit scripts were consolidated to exactly two, named by
 chip rate, with generic (band-agnostic) calibration ids and both L1+L2 carrier presets —
 `Raspberry pi + b206 mini-i/PRN GPS/gps_ca_code_1.023Mcps.py` and `gps_ca_code_10.23Mcps.py`
 (the 10.23 script got the full spectral-density calibration treatment: enbw table, max sidelobes,
