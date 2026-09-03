@@ -36,7 +36,13 @@ to check the calibrated-power path end-to-end without hardware.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
 ## Current state
-Latest work this branch: `fm_chirp_tx.py` marks its two spectral-density laws (`psd_live`,
+Latest work this branch: `fm_chirp_tx.py` dropped the `--filter` / `--passband` / `--transition`
+parameters — the digital passband filter is now ALWAYS on, its passband always equals the sweep
+bandwidth (tracks `--bw`, the filter passes ±bw/2), with a fixed `FILTER_TRANSITION_MHZ = 0.05`
+skirt. `make_current` always filters; live tuning drops those knobs (a `--bw` change re-derives the
+passband automatically). `--self-test` still exercises the filter internally.
+
+Prior work this branch: `fm_chirp_tx.py` marks its two spectral-density laws (`psd_live`,
 `psd_hz`) with `restates_measurement: True` and leads with `psd_live`, so the Run/tune form drops
 the raw fixed-bandwidth measured density (a bw-invariant "total power − 10 dB" in disguise) from
 the "control in" picker and offers the live density + total power instead — fixing a two-densities

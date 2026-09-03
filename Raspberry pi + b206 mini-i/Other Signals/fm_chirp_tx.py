@@ -50,15 +50,15 @@ Fixed radio setup
 ─────────────────
 Sample rate is fixed at 61.38 MHz (the B200's ceiling; a chirp has no chip grid, so this
 is simply as wide as the sweep can go), over-the-wire sc8, and baseband amplitude 0.5 (the
-amplitude the calibration is measured at). None are parameters. An optional digital passband
-filter (--filter/--passband/--transition) brick-wall band-limits the sweep and strips the
-sawtooth/square reset splatter; --passband is the TOTAL filter width (the filter passes
-±passband/2), so set it a hair above bw to keep the whole sweep.
+amplitude the calibration is measured at). None are parameters. A digital passband filter is
+ALWAYS applied (unity passband gain): it brick-wall band-limits the sweep and strips the
+sawtooth reset splatter. Its passband always equals the sweep bandwidth (the filter passes
+±bw/2) with a fixed 0.05 MHz transition skirt — none of this is a parameter.
 
 CLI
 ───
     fm_chirp_tx.py --freq 1575.42 --bw 20 --rate 200 --power -30
-    fm_chirp_tx.py --freq 1575.42 --bw 20 --gain 60 --filter on --passband 22   # clean band-limit
+    fm_chirp_tx.py --freq 1575.42 --bw 20 --gain 60          # raw-gain override
     fm_chirp_tx.py --self-test        # verify seamless phase closure (+ filter), no hardware
     fm_chirp_tx.py --describe-params  # paramkit JSON schema for the GUI
 """
@@ -204,16 +204,13 @@ FREQUENCIES = {
     "Iridium (1621.25 MHz)": 1621.25,
 }
 
-# Filter presets: {label: TOTAL passband width in MHz}. A chirp is broadband by design (it
-# sweeps ±bw/2, i.e. bw wide), so the passband is a total width centred on the carrier — the
-# filter passes ±passband/2: set it a hair above bw to brick-wall the sweep and strip the
-# sawtooth/square reset splatter, or below bw to gate the sweep into a sub-band. Clamped to
-# Nyquist (the full 61.38 MHz).
-MIN_PASSBAND_MHZ = 1.0
-MAX_PASSBAND_MHZ = 61.2
-PASSBAND_PRESETS = {
-    "20 MHz": 20.0, "30 MHz": 30.0, "40 MHz": 40.0, "56 MHz": 56.0,
-}
+# Passband filter (always on, not a parameter). A chirp is broadband by design (it sweeps
+# ±bw/2, i.e. bw wide), so the passband is centred on the carrier and its TOTAL width always
+# equals the sweep bandwidth — the filter passes ±bw/2, brick-walling the sweep to its own extent
+# and stripping the sawtooth reset splatter. The transition skirt beyond the passband edge is
+# fixed. Both track --bw automatically; _design_lowpass clamps the cutoff to Nyquist.
+FILTER_TRANSITION_MHZ = 0.05
+FILTER_TRANSITION_HZ = FILTER_TRANSITION_MHZ * 1e6
 
 
 # ── Modulating waveform (NumPy, for the buffer builder) ────────────────────────
@@ -431,9 +428,9 @@ def _build_top_block(initial_iq, center_freq_hz: float, lo_offset_hz: float,
 def build_script() -> Script:
     return (
         Script("FM-chirp transmitter (sawtooth sweep) — fixed 61.38 MHz "
-               "/ sc8, looped buffer, optional power-preserving digital passband filter. Level "
-               "is set in dBm via the unit's calibration; uncalibrated it runs on a relative "
-               "gain. Authorised, shielded setups only.")
+               "/ sc8, looped buffer, always-on power-preserving digital passband filter "
+               "(passband = sweep bandwidth). Level is set in dBm via the unit's calibration; "
+               "uncalibrated it runs on a relative gain. Authorised, shielded setups only.")
         # The sweep band is entered one of two ways; the mode reveals its own fields.
         .choice("-Band-mode", "--band-mode",
                 options={"Centre + width": "center_bw", "Start / stop": "start_stop"},
@@ -481,21 +478,8 @@ def build_script() -> Script:
         .number("-Sweep-rate", "--rate", unit="kHz", min=0.1, max=5000.0,
                 default=200.0, required=True, live=True,
                 help="How fast the sweep repeats, in kHz. Live (regenerates the loop).")
-        .choice("-Filter", "--filter", options=["off", "on"], default="off",
-                required=False, live=True,
-                help="Digital passband filter on the looped buffer (unity passband gain). Set "
-                     "the passband a hair above bw to brick-wall the sweep and strip reset "
-                     "splatter. Live.")
-        .number("-Passband", "--passband", unit="MHz",
-                min=MIN_PASSBAND_MHZ, max=MAX_PASSBAND_MHZ, default=30.0,
-                presets=PASSBAND_PRESETS, required=False, live=True,
-                help="Total passband width kept, centred on the carrier (MHz) — the filter passes "
-                     "±passband/2. Clamped to Nyquist. ≥ bw keeps the whole sweep; < bw gates it "
-                     "into a sub-band. Live (rebuilds the filtered loop).")
-        .number("-Transition", "--transition", unit="MHz", min=0.05, max=8.0, default=1.0,
-                required=False, live=True,
-                help="Filter skirt transition width beyond the passband edge (MHz) — the "
-                     "steepness knob. Live (rebuilds the filtered loop).")
+        # The passband filter is always on (passband = sweep bandwidth, fixed 0.05 MHz
+        # transition) and tracks --bw automatically, so it exposes no parameters.
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
@@ -572,10 +556,7 @@ def main() -> int:
     band_mode = getattr(args, "band_mode", "center_bw")
     shape = {"waveform": "Sawtooth",              # fixed — the only sweep shape this script emits
              "bw_hz": sweep_bw_hz,
-             "rate_hz": args.rate * 1e3,               # --rate is in kHz
-             "filter_on": getattr(args, "filter", "off") == "on",
-             "width_hz": float(getattr(args, "passband", 30.0) or 30.0) * 1e6,  # total width
-             "trans_hz": float(getattr(args, "transition", 1.0) or 1.0) * 1e6}
+             "rate_hz": args.rate * 1e3}               # --rate is in kHz
 
     def pwr_params():
         """Live parameter values a power-quantity bridge may key on (docs/calibration-v2.md
@@ -585,15 +566,14 @@ def main() -> int:
         return {"bw": shape["bw_hz"] / 1e6}
 
     def make_current():
-        """The buffer for the current shape (the base sweep, optionally band-limited).
-        Returns (iq, n_per, reps, actual_rate, finfo)."""
+        """The buffer for the current shape: the base sweep, always band-limited to a passband
+        equal to the sweep bandwidth (±bw/2) with the fixed transition skirt. Returns
+        (iq, n_per, reps, actual_rate, finfo)."""
         base, n_per, reps, actual = build_chirp_buffer(
             shape["waveform"], shape["bw_hz"], shape["rate_hz"])
-        if not shape["filter_on"]:
-            return base, n_per, reps, actual, {"on": False}
-        filt, taps, fp = filter_buffer(base, shape["width_hz"], shape["trans_hz"])
-        return filt, n_per, reps, actual, {"on": True, "taps": taps, "edge_hz": fp,
-                                           "trans_hz": shape["trans_hz"]}
+        filt, taps, fp = filter_buffer(base, shape["bw_hz"], FILTER_TRANSITION_HZ)
+        return filt, n_per, reps, actual, {"taps": taps, "edge_hz": fp,
+                                           "trans_hz": FILTER_TRANSITION_HZ}
 
     iq, n_per, reps, actual_rate, finfo = make_current()
 
@@ -620,9 +600,7 @@ def main() -> int:
         return actual
 
     def _fmt_band(info):
-        if not info.get("on"):
-            return "off (full sweep)"
-        return (f"on — passband ±{info['edge_hz']/1e6:.2f} MHz, "
+        return (f"on (always) — passband ±{info['edge_hz']/1e6:.2f} MHz (= sweep bw), "
                 f"{info['trans_hz']/1e6:g} MHz transition, {info['taps']} taps")
 
     print("── FM chirp TX ─────────────────────────────────────────────")
@@ -730,18 +708,11 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
-        elif name in ("bw", "rate", "filter", "passband", "transition"):
+        elif name in ("bw", "rate"):
             if name == "bw":
-                shape["bw_hz"] = value * 1e6
-            elif name == "rate":
+                shape["bw_hz"] = value * 1e6           # the filter passband tracks bw automatically
+            else:  # rate
                 shape["rate_hz"] = value * 1e3            # --rate is in kHz
-            elif name == "filter":
-                shape["filter_on"] = str(value).strip().lower() in ("on", "1", "true", "yes")
-            elif name == "passband":
-                shape["width_hz"] = max(MIN_PASSBAND_MHZ, min(MAX_PASSBAND_MHZ,
-                                                              float(value))) * 1e6
-            else:  # transition
-                shape["trans_hz"] = float(value) * 1e6
             actual = regenerate()
             ctrl.report("rate" if name == "rate" else name,
                         actual / 1e3 if name == "rate" else value)
