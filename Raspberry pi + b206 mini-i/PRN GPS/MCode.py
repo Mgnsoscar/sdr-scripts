@@ -67,6 +67,7 @@ CLI
 """
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sys
@@ -84,6 +85,10 @@ from paramkit import Script, PowerMap
 # unit's resolved calibration injected at $SDR_CALIBRATION_FILE; calkit maps --power through
 # it. Absent it, the script runs uncalibrated (relative gain only). See docs/calibration.md.
 CAL_SIGNAL_ID = "gps_l1_mcode"
+
+# Which parameter carries the transmit frequency, so a frequency-dependent calibration chain
+# folds --power at the live carrier (see the C/A scripts / docs/calibration-v2.md).
+CAL_FREQ_PARAM = "freq"
 
 # ── Fixed radio setup (NOT parameters — see the module docstring) ───────────────────
 SAMP_RATE_HZ = 61.38e6        # 12 samples/chip, 6 samples/subcarrier-cycle (exact); clock 1:1
@@ -136,6 +141,30 @@ _FIRST10_OCTAL = {
     25: 0o1743, 26: 0o1761, 27: 0o1770, 28: 0o1774, 29: 0o1127, 30: 0o1453,
     31: 0o1625, 32: 0o1712,
 }
+
+# ── Spectral-density calibration (docs/calibration-v2.md §13, sdr-agent) ─────────────
+# BOC(10,5) is a SPLIT spectrum: TWO main lobes at ±10.23 MHz (each null-to-null over ±5.115 MHz
+# about the subcarrier, so |f| ∈ [5.115, 15.345] MHz), plus square-subcarrier harmonics further
+# out. Its power distribution is fixed by ONE measured number — the power spectral DENSITY at the
+# main-lobe PEAK (~±9.5 MHz off the carrier), in dBm/Hz (per Hz, NOT per MHz). From that single
+# number CAL_POWER_LAWS derives two absolute-power quantities the operator can pick for --power
+# (the measured density stays available as a third):
+#
+#   • Main-lobes integrated power (dBm) = peak_dBm/Hz + 10·log10(BW_ML)   ← BOTH main lobes
+#   • Full signal power (dBm)           = peak_dBm/Hz + 10·log10(BW_full) ← widest passband (±Fs/2)
+#
+# BW_ML / BW_full are effective bandwidths (Hz) = ∫G/G_peak of the sine-BOC(10,5) PSD, over the two
+# main lobes (±[5.115,15.345] MHz) and over the widest the passband filter can keep (±30.69 MHz).
+# The full-signal power is the WIDEST-passband (worst-case) reading, so it is the safe amplifier-
+# limiting quantity: narrowing --passband only lowers the emitted power. No carrier/total quantity
+# is offered — the square-subcarrier harmonics the filter strips make it ill-defined here.
+# --self-test recomputes both effective bandwidths from the BOC PSD and asserts these literals.
+CAL_POWER_LAWS = [
+    {"id": "main_lobe_power", "name": "Main-lobes integrated power (both lobes)", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 69.5073},     # 10·log10(∫G over ±[5.115,15.345] MHz / G_peak)
+    {"id": "full_power", "name": "Full signal power (widest passband)", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 70.1261},      # 10·log10(∫G over ±30.69 MHz / G_peak)
+]
 
 _PMAP = None
 
@@ -286,6 +315,30 @@ def _self_test() -> int:
           f"harmonic band {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} "
           f"[{'OK' if f_ok else 'FAIL'}]")
     ok = ok and f_ok
+
+    # Calibration law constants: recompute the BOC(10,5) effective bandwidths (both main lobes /
+    # widest passband) from the sine-BOC PSD and assert the CAL_POWER_LAWS literals didn't drift.
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+
+    def _boc_psd(fv):                       # sine-BOC(10,5): n = 2·fsub/fc = 4 (even)
+        a = np.sin(np.pi * fv / (2 * SUBCARRIER_HZ)); c = np.cos(np.pi * fv / (2 * SUBCARRIER_HZ))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = (np.sin(np.pi * fv / CODE_RATE_HZ) * a / (np.pi * fv * c)) ** 2
+        return np.nan_to_num(np.where(fv == 0, 0.0, v))
+    fv = np.arange(-40e6 + 7, 40e6, 2e3)    # +7 Hz offset dodges the exact f = odd·fsub singularities
+    g = _boc_psd(fv); gp = g.max()
+
+    def _ebw(lo, hi):                       # effective bandwidth (Hz) = ∫G / G_peak over |f|∈[lo,hi]
+        m = (np.abs(fv) >= lo) & (np.abs(fv) < hi)
+        return float(_trapz(g[m], fv[m])) / gp
+    ml_k = 10 * np.log10(_ebw(5.115e6, 15.345e6))
+    full_k = 10 * np.log10(_ebw(0.0, 30.69e6))
+    laws = {l["id"]: l["k"] for l in CAL_POWER_LAWS}
+    laws_ok = (abs(laws["main_lobe_power"] - ml_k) < 0.02
+               and abs(laws["full_power"] - full_k) < 0.02)
+    print(f"calibration: both-main-lobes k={ml_k:.4f} (law {laws['main_lobe_power']}), "
+          f"full k={full_k:.4f} (law {laws['full_power']}) [{'OK' if laws_ok else 'FAIL'}]")
+    ok = ok and laws_ok
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 

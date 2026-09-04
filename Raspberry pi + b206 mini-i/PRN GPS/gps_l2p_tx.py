@@ -38,6 +38,7 @@ CLI
 """
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sys
@@ -76,6 +77,30 @@ DEFAULT_SAMPLE_RATE = "20.46"
 GPS_UTC_LEAP_SECONDS = 18
 GPS_UNIX_EPOCH = 315_964_800                  # Unix time of 1980-01-06 00:00:00 UTC
 SECONDS_PER_WEEK = 604_800
+
+# ── Spectral-density calibration (docs/calibration-v2.md §13, sdr-agent) ─────────────
+# The GPS L2 P(Y) code is a BPSK(10) sinc² spectrum, so its whole power distribution is fixed by
+# ONE measured number — the power spectral DENSITY at the main-lobe PEAK (the carrier), in dBm/Hz
+# (per Hz, NOT per MHz). From that single number CAL_POWER_LAWS derives two absolute-power
+# quantities the operator can pick for --power (in the calibration editor); the measured density
+# itself (dBm/Hz) stays available as a third:
+#
+#   • Main-lobe integrated power (dBm)   = peak_dBm/Hz + 10·log10(Rc · I_ML)   ← ±10.23 MHz
+#   • Carrier (total signal) power (dBm) = peak_dBm/Hz + 10·log10(Rc)          ← all frequency
+#
+# Rc = 10.23e6 Hz (chip rate); I_ML = 0.902823 is the sinc² power fraction inside the main lobe
+# (±Rc). This code streams (no passband filter), and at the fixed sample rate only ~the main lobe
+# is representable, so the EMITTED power never exceeds the carrier (total) reading — making the
+# carrier power the safe amplifier-limiting quantity. Both quantities are bandwidth-independent
+# constants. (--self-test recomputes both from ∫sinc² and asserts these literals.)
+I_ML = 0.902823                              # sinc² power fraction within the main lobe (±Rc)
+
+CAL_POWER_LAWS = [
+    {"id": "main_lobe_power", "name": "Main-lobe integrated power", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 69.654784},    # 10·log10(Rc · I_ML), Rc = 10.23e6
+    {"id": "carrier_power", "name": "Carrier (total signal) power", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 70.098756},     # 10·log10(Rc), Rc = 10.23e6
+]
 
 _PMAP = None
 
@@ -232,6 +257,25 @@ def _self_test() -> int:
         got = format(int("".join(map(str, pc.chunk(prn, 0, 12))), 2), "04o")
         assert got == octal, f"PRN {prn}: {got} != ICD {octal}"
     print(f"P-code first-12 chips match IS-GPS-200N Table 3-Ia (PRN 1..10) ✓")
+
+    # Calibration law constants: recompute I_ML from ∫sinc² and assert the CAL_POWER_LAWS literals.
+    def _sinc2(x):
+        if x == 0.0:
+            return 1.0
+        s = math.sin(math.pi * x) / (math.pi * x)
+        return s * s
+    step, acc, prev = 1e-3, 0.0, _sinc2(0.0)
+    for i in range(1, int(round(1.0 / step)) + 1):
+        cur = _sinc2(i * step); acc += 0.5 * (prev + cur) * step; prev = cur
+    i_ml = 2.0 * acc
+    Rc = CHIP_RATE_HZ
+    main_k, carrier_k = 10 * math.log10(Rc * i_ml), 10 * math.log10(Rc)
+    laws = {l["id"]: l["k"] for l in CAL_POWER_LAWS}
+    assert abs(i_ml - I_ML) < 5e-4
+    assert abs(laws["main_lobe_power"] - main_k) < 5e-3
+    assert abs(laws["carrier_power"] - carrier_k) < 5e-3
+    print(f"calibration: I_ML={i_ml:.6f}, main-lobe k={main_k:.4f} (law {laws['main_lobe_power']}), "
+          f"carrier k={carrier_k:.4f} (law {laws['carrier_power']}) ✓")
     print("SELF-TEST OK")
     return 0
 

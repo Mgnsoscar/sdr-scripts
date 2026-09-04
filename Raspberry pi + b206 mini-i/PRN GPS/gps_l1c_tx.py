@@ -99,6 +99,10 @@ import math
 # (relative gain only). See the agent's docs/calibration.md.
 CAL_SIGNAL_ID = "gps_l1c"
 
+# Which parameter carries the transmit frequency, so a frequency-dependent calibration chain
+# folds --power at the live carrier (see the C/A scripts / docs/calibration-v2.md).
+CAL_FREQ_PARAM = "freq"
+
 # ── Fixed radio setup (NOT parameters — see the module docstring) ───────────────────
 SAMP_RATE_HZ = 61.38e6        # 60 samples/chip; BOC(6,1) subcarrier at 10 samples/cycle (exact)
 OTW_FORMAT = "sc8"            # over-the-wire; halves USB load
@@ -177,6 +181,28 @@ L1CO_PARAMS = (
     (0o6211,0o2057), (0o4321,0o3467), (0o7201,0o0706), (0o4451,0o2032), (0o5411,0o1464), (0o5141,0o0520),
     (0o7041,0o1766), (0o6637,0o3270), (0o4577,0o0341),
 )
+
+# ── Spectral-density calibration (docs/calibration-v2.md §13, sdr-agent) ─────────────
+# L1C is a SPLIT (BOC) spectrum; the calibration is on the BOC(1,1) CORE — two main lobes at
+# ±1.023 MHz, bounded by the DC null and the ±2.046 MHz null. ~91% of L1C power is BOC(1,1) (all
+# data + 29/33 of the pilot); the other ~9% sits in the TMBOC BOC(6,1) lobes at ±6.138 MHz. Its
+# distribution is fixed by ONE measured number — the power spectral DENSITY at the (BOC(1,1) core)
+# main-lobe PEAK (~±0.76 MHz off the carrier), in dBm/Hz (per Hz, NOT per MHz):
+#
+#   • Main-lobes integrated power (dBm) = peak_dBm/Hz + 10·log10(BW_ML)   ← BOTH core lobes (±2.046 MHz)
+#   • Full signal power (dBm)           = peak_dBm/Hz + 10·log10(BW_full) ← widest passband (±30.69 MHz)
+#
+# BW_ML / BW_full are effective bandwidths (Hz) = ∫G/G_peak of the TMBOC PSD (0.909·BOC(1,1) +
+# 0.091·BOC(6,1)) — over the core lobes and over the widest --nulls filter (±Fs/2). The full power
+# INCLUDES the BOC(6,1) lobes, so it is the safe amplifier-limiting quantity whatever --nulls keeps
+# (narrowing only lowers the emitted power). No carrier/total quantity is offered for a BOC signal.
+# --self-test recomputes both effective bandwidths from the TMBOC PSD and asserts these literals.
+CAL_POWER_LAWS = [
+    {"id": "main_lobe_power", "name": "Main-lobes integrated power (BOC(1,1) core, both lobes)",
+     "unit": "dBm", "in": "density", "out": "abs", "k": 62.2246},   # 10·log10(∫G ±2.046 MHz / G_peak)
+    {"id": "full_power", "name": "Full signal power (widest passband)", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 63.2576},                   # 10·log10(∫G ±30.69 MHz / G_peak)
+]
 
 _PMAP = None
 
@@ -364,6 +390,37 @@ def _self_test() -> int:
     print(f"filter (nulls=7 → ±{fp/1e6:.2f} MHz, {taps} taps): kept band {kept:+.3f} dB, "
           f"out-of-band {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} [{'OK' if f_ok else 'FAIL'}]")
     ok = ok and f_ok
+
+    # Calibration law constants: recompute the TMBOC effective bandwidths (BOC(1,1) core lobes /
+    # widest passband) and assert the CAL_POWER_LAWS literals. The BOC(6,1) weight is derived from
+    # the actual TMBOC pattern + the pilot power, so a code change can't silently invalidate them.
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+
+    def _boc_psd(fv, fs, fc):                # sine-BOC(fs,fc); n = 2·fs/fc (even for both used here)
+        a = np.sin(np.pi * fv / (2 * fs)); c = np.cos(np.pi * fv / (2 * fs))
+        top = np.sin(np.pi * fv / fc) if round(2 * fs / fc) % 2 == 0 else np.cos(np.pi * fv / fc)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = (top * a / (np.pi * fv * c)) ** 2
+        return np.nan_to_num(np.where(fv == 0, 0.0, v))
+    fv = np.arange(-40e6 + 7, 40e6, 2e3)
+    w61 = (A_PILOT ** 2) * (sum(TMBOC) / len(TMBOC))      # pilot power × BOC(6,1) chip fraction (≈0.091)
+    w11 = 1.0 - w61
+    g11 = _boc_psd(fv, CHIP_RATE_HZ, CHIP_RATE_HZ); g11 /= _trapz(g11, fv)
+    g61 = _boc_psd(fv, 6 * CHIP_RATE_HZ, CHIP_RATE_HZ); g61 /= _trapz(g61, fv)
+    gt = w11 * g11 + w61 * g61; gtp = gt.max()
+
+    def _ebw(lo, hi):
+        m = (np.abs(fv) >= lo) & (np.abs(fv) < hi)
+        return float(_trapz(gt[m], fv[m])) / gtp
+    ml_k = 10 * np.log10(_ebw(0.0, 2.046e6))
+    full_k = 10 * np.log10(_ebw(0.0, 30.69e6))
+    laws = {l["id"]: l["k"] for l in CAL_POWER_LAWS}
+    laws_ok = (abs(laws["main_lobe_power"] - ml_k) < 0.02
+               and abs(laws["full_power"] - full_k) < 0.02)
+    print(f"calibration: BOC(6,1) weight {w61:.4f}, core-lobes k={ml_k:.4f} "
+          f"(law {laws['main_lobe_power']}), full k={full_k:.4f} (law {laws['full_power']}) "
+          f"[{'OK' if laws_ok else 'FAIL'}]")
+    ok = ok and laws_ok
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 

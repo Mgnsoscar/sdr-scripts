@@ -68,6 +68,7 @@ CLI
 """
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sys
@@ -86,6 +87,10 @@ from paramkit import Script, PowerMap
 # it at the unit's real operating plane (e.g. EIRP). Absent it, the script runs uncalibrated
 # (relative gain only). See the agent's docs/calibration.md.
 CAL_SIGNAL_ID = "gps_l2c"
+
+# Which parameter carries the transmit frequency, so a frequency-dependent calibration chain
+# folds --power at the live carrier (see the C/A scripts / docs/calibration-v2.md).
+CAL_FREQ_PARAM = "freq"
 
 # ── Fixed radio setup (NOT parameters — see the module docstring) ───────────────────
 SAMP_RATE_HZ = 61.38e6        # 60 samples/combined-chip at 1.023 Mcps (exact); master clock 1:1
@@ -119,6 +124,30 @@ SIDELOBE_PRESETS = {
     "Main + 5 sidelobes (±6.14 MHz)": 5,
     "Main + 10 sidelobes (±11.25 MHz)": 10,
 }
+
+# ── Spectral-density calibration (docs/calibration-v2.md §13, sdr-agent) ─────────────
+# GPS L2C (CM/CL chip-by-chip multiplexed → a combined 1.023 Mcps BPSK) is a sinc² power spectrum
+# whose whole distribution is fixed by ONE measured number — the power spectral DENSITY at the
+# main-lobe PEAK (the carrier), in dBm/Hz (per Hz, NOT per MHz). From that single number
+# CAL_POWER_LAWS derives two absolute-power quantities the operator can pick for --power (in the
+# calibration editor); the measured density itself (dBm/Hz) stays available as a third:
+#
+#   • Main-lobe integrated power (dBm)   = peak_dBm/Hz + 10·log10(Rc · I_ML)   ← ±1.023 MHz
+#   • Carrier (total signal) power (dBm) = peak_dBm/Hz + 10·log10(Rc)          ← all frequency
+#
+# Rc = 1.023e6 Hz (combined chip rate = null spacing); I_ML = 0.902823 is the sinc² power fraction
+# inside the main lobe (±Rc). Both are BANDWIDTH-INDEPENDENT constants, so --power is stable across
+# the optional filter: narrowing the passband only lowers the EMITTED power, never above the carrier
+# (total) reading — which makes the carrier power the safe amplifier-limiting quantity whatever the
+# filter passes. (--self-test recomputes both constants from ∫sinc² and asserts these literals.)
+I_ML = 0.902823                              # sinc² power fraction within the main lobe (±Rc)
+
+CAL_POWER_LAWS = [
+    {"id": "main_lobe_power", "name": "Main-lobe integrated power", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 59.654784},    # 10·log10(Rc · I_ML), Rc = 1.023e6
+    {"id": "carrier_power", "name": "Carrier (total signal) power", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 60.098756},     # 10·log10(Rc), Rc = 1.023e6
+]
 
 _PMAP = None
 
@@ -351,6 +380,29 @@ def _self_test() -> int:
           f"{kept:+.3f} dB, far sidelobe {cut:.0f} dB, peak×amp {peak*AMPLITUDE:.2f} "
           f"[{'OK' if f_ok else 'FAIL'}]")
     ok = ok and f_ok
+
+    # Calibration law constants: recompute I_ML from ∫sinc² and assert the CAL_POWER_LAWS literals
+    # (main-lobe / carrier) — so the baked constants can never silently drift from the spectrum.
+    def _sinc2(x):
+        if x == 0.0:
+            return 1.0
+        s = math.sin(math.pi * x) / (math.pi * x)
+        return s * s
+    step, acc, prev = 1e-3, 0.0, _sinc2(0.0)
+    for i in range(1, int(round(1.0 / step)) + 1):
+        cur = _sinc2(i * step); acc += 0.5 * (prev + cur) * step; prev = cur
+    i_ml = 2.0 * acc                                    # sinc² power fraction within ±Rc
+    Rc = COMBINED_CHIP_RATE
+    main_k = 10 * math.log10(Rc * i_ml)
+    carrier_k = 10 * math.log10(Rc)
+    laws = {l["id"]: l["k"] for l in CAL_POWER_LAWS}
+    laws_ok = (abs(i_ml - I_ML) < 5e-4
+               and abs(laws["main_lobe_power"] - main_k) < 5e-3
+               and abs(laws["carrier_power"] - carrier_k) < 5e-3)
+    print(f"calibration: I_ML={i_ml:.6f}, main-lobe k={main_k:.4f} (law {laws['main_lobe_power']}), "
+          f"carrier k={carrier_k:.4f} (law {laws['carrier_power']}) "
+          f"[{'OK' if laws_ok else 'FAIL'}]")
+    ok = ok and laws_ok
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 

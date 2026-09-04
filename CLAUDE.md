@@ -35,8 +35,31 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
-## Current state
-Latest work this branch: `Raspberry pi + b206 mini-i/Other Signals/mock_fm_chirp_tx.py` — a
+## Current state — GPS PRN spectral-density calibration: COMPLETE (branch `claude/gps-calibration`)
+The six remaining `PRN GPS` scripts got the C/A spectral-density calibration surface (measured =
+peak PSD in **dBm/Hz**; `CAL_POWER_LAWS` convert it to absolute-power quantities the operator picks
+for `--power`). Scripts-only — laws ride through `argspec` verbatim; no agent/client/capability change.
+- **BPSK (single main lobe):** `gps_l5` (Rc 10.23), `gps_l2c` (Rc 1.023), `gps_l1p`/`gps_l2p`
+  (Rc 10.23, streamed/filterless, fixed carrier → no `CAL_FREQ_PARAM`). Two CONSTANT laws:
+  `main_lobe_power` (k = 10·log10(Rc·I_ML)) and `carrier_power` (total, k = 10·log10(Rc), ≈ +0.444 dB
+  above the main lobe). Bandwidth-independent, so carrier is the safe amp-limiting quantity (a filter
+  only lowers emitted power). `CAL_FREQ_PARAM="freq"` on l5/l2c (they have `--freq`).
+- **BOC (two main lobes):** `MCode` BOC(10,5) — both main lobes ±[5.115,15.345] MHz; `gps_l1c`
+  TMBOC — the BOC(1,1) **core** (both ±1.023 MHz lobes) per owner's choice. Each offers
+  `main_lobe_power` (both lobes) + `full_power` (widest-passband, the amp limit — M-code to ±30.69,
+  L1C to ±30.69 incl. the BOC(6,1) lobes). No carrier quantity (subcarrier harmonics the filter
+  strips make it ill-defined). Constants computed by integrating the sine-BOC PSD (Betz).
+- Every constant is baked as a literal AND re-derived in each script's `--self-test` (∫sinc² for
+  BPSK, ∫BOC for BOC) so it can't silently drift. Guard test:
+  `tests/test_gps_power_quantities.py` (argspec extracts each surface; laws evaluate via the real
+  `paramkit.power_law`; BPSK carrier = main + 0.444 dB; BOC full > main, no carrier).
+- Measurement is **dBm/Hz** everywhere (per Hz, not per MHz), per the owner's request.
+
+Prior work this branch (packaging-standalone base): `Raspberry pi + b206 mini-i/Other Signals/mock_fm_chirp_tx.py` — a
+NO-HARDWARE stand-in for `fm_chirp_tx.py`. Same calibration surface (identical param schema,
+`CAL_SIGNAL_ID="fm_chirp"`, `CAL_FREQ_PARAM`, `CAL_POWER_LAWS`), so the client renders the SAME
+power card (density / total-power / dBm-per-Hz) and DEPENDS ON row and drives it like the real
+chirp; but it imports no UHD/GNU Radio and a `FakeRadio` only LOGS the SDR gain it would command
 NO-HARDWARE stand-in for `fm_chirp_tx.py`. Same calibration surface (identical param schema,
 `CAL_SIGNAL_ID="fm_chirp"`, `CAL_FREQ_PARAM`, `CAL_POWER_LAWS`), so the client renders the SAME
 power card (density / total-power / dBm-per-Hz) and DEPENDS ON row and drives it like the real
