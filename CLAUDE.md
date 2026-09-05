@@ -39,20 +39,34 @@ to check the calibrated-power path end-to-end without hardware.
 The six remaining `PRN GPS` scripts got the C/A spectral-density calibration surface (measured =
 peak PSD in **dBm/Hz**; `CAL_POWER_LAWS` convert it to absolute-power quantities the operator picks
 for `--power`). Scripts-only — laws ride through `argspec` verbatim; no agent/client/capability change.
-- **BPSK (single main lobe):** `gps_l5` (Rc 10.23), `gps_l2c` (Rc 1.023), `gps_l1p`/`gps_l2p`
-  (Rc 10.23, streamed/filterless, fixed carrier → no `CAL_FREQ_PARAM`). Two CONSTANT laws:
-  `main_lobe_power` (k = 10·log10(Rc·I_ML)) and `carrier_power` (total, k = 10·log10(Rc), ≈ +0.444 dB
-  above the main lobe). Bandwidth-independent, so carrier is the safe amp-limiting quantity (a filter
-  only lowers emitted power). `CAL_FREQ_PARAM="freq"` on l5/l2c (they have `--freq`).
-- **BOC (two main lobes):** `MCode` BOC(10,5) — both main lobes ±[5.115,15.345] MHz; `gps_l1c`
-  TMBOC — the BOC(1,1) **core** (both ±1.023 MHz lobes) per owner's choice. Each offers
-  `main_lobe_power` (both lobes) + `full_power` (widest-passband, the amp limit — M-code to ±30.69,
-  L1C to ±30.69 incl. the BOC(6,1) lobes). No carrier quantity (subcarrier harmonics the filter
-  strips make it ill-defined). Constants computed by integrating the sine-BOC PSD (Betz).
+**Owner decided (this revision): NO carrier/total-signal quantity on any signal.** Every script offers
+exactly the measured PSD (dBm/Hz) + `main_lobe_power` + `full_power` — nothing else.
+- **Filtered BPSK — `gps_l5` (Rc 10.23), `gps_l2c` (Rc 1.023):** the always-on-filter C/A treatment
+  (ported verbatim from `gps_ca_code_*.py`). The digital passband filter is ALWAYS on (fixed 0.05 MHz
+  transition; the `--filter on/off` and `--transition` knobs are GONE), width = `--sidelobes`.
+  `main_lobe_power` (k = 10·log10(Rc·I_ML): 69.654784 / 59.654784) is a CONSTANT; `full_power`
+  (k = 60 + 10·log10(`enbw_mhz`)) is KEYED on the filter's equivalent-noise bandwidth (a hidden
+  `enbw_mhz` derived field, `{"table": ["sidelobes", …]}` — the 10.23 / 1.023 enbw tables) so the
+  full-power reading + its amp-limit cap TRACK the live filter; `pwr_params()` supplies the live
+  `enbw_mhz`, and a live `--sidelobes` change re-maps a held `--power`. `full_power(0 sidelobes)`
+  == `main_lobe_power` (passband == main lobe). `CAL_FREQ_PARAM="freq"`.
+- **Streamed BPSK — `gps_l1p`/`gps_l2p` (Rc 10.23, streamed/filterless, fixed carrier → no
+  `CAL_FREQ_PARAM`):** no filter, so `full_power` is the fixed TOTAL signal power (k = 10·log10(Rc)
+  = 70.098756, ≈ +0.444 dB above the main lobe) — a conservative, bandwidth-independent amp-limit
+  reading. `main_lobe_power` k = 69.654784.
+- **BOC — `MCode` BOC(10,5) (both main lobes ±[5.115,15.345] MHz), `gps_l1c` TMBOC (BOC(1,1) core,
+  both ±1.023 MHz lobes):** UNCHANGED — they already offered `main_lobe_power` (both lobes) +
+  `full_power` (widest-passband, ±30.69) and never had a carrier quantity, so they already match the
+  scheme. `full_power` is the conservative widest-passband amp limit (a fixed constant, NOT live-
+  tracking the filter): L1C's `--nulls` is discrete and *could* table-track like `--sidelobes`, but
+  M-code's `--passband` is CONTINUOUS (can't be a static nearest-int table the client folds), so both
+  BOC scripts keep the conservative fixed reading for consistency. Constants from the sine-BOC PSD.
 - Every constant is baked as a literal AND re-derived in each script's `--self-test` (∫sinc² for
   BPSK, ∫BOC for BOC) so it can't silently drift. Guard test:
-  `tests/test_gps_power_quantities.py` (argspec extracts each surface; laws evaluate via the real
-  `paramkit.power_law`; BPSK carrier = main + 0.444 dB; BOC full > main, no carrier).
+  `tests/test_gps_power_quantities.py` — argspec extracts each surface; laws evaluate via the real
+  `paramkit.power_law`; asserts NO `carrier_power` anywhere; filtered-BPSK `full_power` keyed on
+  `enbw_mhz` + meets the main lobe at 0 sidelobes + tracks monotonically; streamed-BPSK full = main
+  + 0.444 dB; BOC full > main (< 1.5 dB).
 - Measurement is **dBm/Hz** everywhere (per Hz, not per MHz), per the owner's request.
 
 Prior work this branch (packaging-standalone base): `Raspberry pi + b206 mini-i/Other Signals/mock_fm_chirp_tx.py` — a

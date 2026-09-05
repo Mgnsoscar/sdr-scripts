@@ -85,21 +85,22 @@ SECONDS_PER_WEEK = 604_800
 # quantities the operator can pick for --power (in the calibration editor); the measured density
 # itself (dBm/Hz) stays available as a third:
 #
-#   • Main-lobe integrated power (dBm)   = peak_dBm/Hz + 10·log10(Rc · I_ML)   ← ±10.23 MHz
-#   • Carrier (total signal) power (dBm) = peak_dBm/Hz + 10·log10(Rc)          ← all frequency
+#   • Main-lobe integrated power (dBm) = peak_dBm/Hz + 10·log10(Rc · I_ML)   ← ±10.23 MHz
+#   • Full signal power (dBm)          = peak_dBm/Hz + 10·log10(Rc)          ← the whole signal
 #
 # Rc = 10.23e6 Hz (chip rate); I_ML = 0.902823 is the sinc² power fraction inside the main lobe
-# (±Rc). This code streams (no passband filter), and at the fixed sample rate only ~the main lobe
-# is representable, so the EMITTED power never exceeds the carrier (total) reading — making the
-# carrier power the safe amplifier-limiting quantity. Both quantities are bandwidth-independent
+# (±Rc). This code STREAMS with no passband filter, so the FULL signal power is the TOTAL signal
+# power (10·log10(Rc), all frequency) — a fixed, bandwidth-independent constant that bounds the
+# emitted power (at the fixed sample rate only ~the main lobe is representable, so the emitted
+# power never exceeds it), making it the safe amplifier-limiting quantity. Both quantities are
 # constants. (--self-test recomputes both from ∫sinc² and asserts these literals.)
 I_ML = 0.902823                              # sinc² power fraction within the main lobe (±Rc)
 
 CAL_POWER_LAWS = [
     {"id": "main_lobe_power", "name": "Main-lobe integrated power", "unit": "dBm",
      "in": "density", "out": "abs", "k": 69.654784},    # 10·log10(Rc · I_ML), Rc = 10.23e6
-    {"id": "carrier_power", "name": "Carrier (total signal) power", "unit": "dBm",
-     "in": "density", "out": "abs", "k": 70.098756},     # 10·log10(Rc), Rc = 10.23e6
+    {"id": "full_power", "name": "Full signal power (total)", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 70.098756},     # 10·log10(Rc) total, Rc = 10.23e6
 ]
 
 _PMAP = None
@@ -269,13 +270,13 @@ def _self_test() -> int:
         cur = _sinc2(i * step); acc += 0.5 * (prev + cur) * step; prev = cur
     i_ml = 2.0 * acc
     Rc = CHIP_RATE_HZ
-    main_k, carrier_k = 10 * math.log10(Rc * i_ml), 10 * math.log10(Rc)
+    main_k, full_k = 10 * math.log10(Rc * i_ml), 10 * math.log10(Rc)
     laws = {l["id"]: l["k"] for l in CAL_POWER_LAWS}
     assert abs(i_ml - I_ML) < 5e-4
     assert abs(laws["main_lobe_power"] - main_k) < 5e-3
-    assert abs(laws["carrier_power"] - carrier_k) < 5e-3
+    assert abs(laws["full_power"] - full_k) < 5e-3
     print(f"calibration: I_ML={i_ml:.6f}, main-lobe k={main_k:.4f} (law {laws['main_lobe_power']}), "
-          f"carrier k={carrier_k:.4f} (law {laws['carrier_power']}) ✓")
+          f"full k={full_k:.4f} (law {laws['full_power']}) ✓")
     print("SELF-TEST OK")
     return 0
 
