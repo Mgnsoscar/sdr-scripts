@@ -69,7 +69,7 @@ def _doc():
                 "type": "measured", "quantity": "spectral density",
                 "limiting": {"kind": "law", "law": FBW, "max_dbm": 0.0}}},
         },
-        "signals": {"fm_chirp": {
+        "signals": {"Chirp/Sweep": {
             "measurement": {"quantity": "spectral density", "unit": "dBm/MHz"},
             "curves": {"sdr_output": {"interp": "linear", "points": [
                 {"gain_db": GAIN_MIN, "power_dbm": -150.0},
@@ -82,7 +82,7 @@ def _doc():
 @pytest.fixture(scope="module")
 def artifact_file(tmp_path_factory):
     import json
-    art = resolve(_doc(), None, "fm_chirp").to_public_dict()
+    art = resolve(_doc(), None, "Chirp/Sweep").to_public_dict()
     path = tmp_path_factory.mktemp("cal") / "fm_chirp.json"
     path.write_text(json.dumps(art))
     return path
@@ -179,7 +179,7 @@ def test_mock_matches_the_real_chirp_calibration_surface():
     from agent.argspec import extract_params
     real = extract_params(_REAL.read_text(encoding="utf-8"))
     mock = extract_params(_MOCK.read_text(encoding="utf-8"))
-    assert mock["calibration_signal"] == real["calibration_signal"] == "fm_chirp"
+    assert mock["calibration_signal"] == real["calibration_signal"] == "Chirp/Sweep"
     assert mock["calibration_freq_param"] == real["calibration_freq_param"]
     assert mock["calibration_power_laws"] == real["calibration_power_laws"]
 

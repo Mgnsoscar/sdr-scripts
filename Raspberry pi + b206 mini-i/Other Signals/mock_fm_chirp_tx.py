@@ -26,7 +26,7 @@ Getting a calibration (needed for absolute --power)
 ───────────────────────────────────────────────────
 Absolute ``--power`` (dBm / a density) only has meaning with a calibration; uncalibrated the
 script runs on a relative ``--gain``. Three ways to supply one:
-  • under the agent — a task with SDR_CAL_SIGNAL_ID=fm_chirp gets this unit's resolved
+  • under the agent — a task with SDR_CAL_SIGNAL_ID="Chirp/Sweep" gets this unit's resolved
     calibration injected (env SDR_CALIBRATION_FILE), exactly like the real chirp;
   • --calibration <artifact.json> — point it at a resolved calibration artifact yourself;
   • --make-sample-calibration <out.json> — build + resolve a representative chirp calibration
@@ -70,7 +70,7 @@ from paramkit import Script, PowerMap
 # ── Calibration surface — kept IN STEP with fm_chirp_tx.py so the client treats this mock as the
 #    real chirp. The static schema reader (agent/argspec.py) reads these literals from THIS file,
 #    so they must live here verbatim (an import wouldn't be seen). ────────────────────────────────
-CAL_SIGNAL_ID = "fm_chirp"          # same signal id as fm_chirp_tx.py → same injected calibration
+CAL_SIGNAL_ID = "Chirp/Sweep"       # same signal id as fm_chirp_tx.py → same injected calibration
 CAL_FREQ_PARAM = "freq"             # the carrier the calibration folds at (live)
 CAL_MEAS_BW_MHZ = 10.0              # sweep bandwidth the spectral-density calibration is measured at
 
@@ -277,7 +277,7 @@ def _make_sample_calibration(out_path: str) -> int:
     artifact = resolve(doc, None, CAL_SIGNAL_ID).to_public_dict()
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(artifact, fh, indent=2)
-    print(f"wrote sample fm_chirp calibration → {out_path}")
+    print(f"wrote sample {CAL_SIGNAL_ID} calibration → {out_path}")
     print("run e.g.:  mock_fm_chirp_tx.py --calibration %s --bw 20 --power -120 --once"
           % out_path)
     return 0
