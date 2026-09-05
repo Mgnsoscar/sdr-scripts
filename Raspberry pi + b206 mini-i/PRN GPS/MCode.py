@@ -514,7 +514,14 @@ def build_script() -> Script:
                       "±Fs/2 = ±30.69 MHz (the whole representable signal). Live (rebuilds the "
                       "filtered loop).")
         .derived("-Passband-bandwidth", name="passband_bw_mhz", unit="MHz",
-                 formula={"linear": ["sidelobes", 10.23, 30.69]},
+                 formula={"linear": ["sidelobes", 10.23, 30.69],
+                          # per-sidelobe-count annotation the GUI appends to the readout
+                          # (nearest-int lookup on --sidelobes): e.g. "30.69 MHz  (both main lobes)".
+                          "labels": ["sidelobes",
+                                     "both main lobes",
+                                     "+ 1 null step",
+                                     "+ 2 null steps",
+                                     "full square subcarrier (±Fs/2)"]},
                  help="Occupied bandwidth the filter passes at the current sidelobe count: "
                       "2·(n+3)·5.115 MHz (i.e. ±(n+3)·5.115 MHz).")
         .derived("-Full-power-bandwidth", name="enbw_mhz", unit="MHz", hidden=True,

@@ -625,7 +625,18 @@ def build_script() -> Script:
                       "full-power calibration quantity tracks this). Max 28 fills the band to "
                       "±Fs/2 = ±30.69 MHz. Live (rebuilds the filtered loops).")
         .derived("-Passband-bandwidth", name="passband_bw_mhz", unit="MHz",
-                 formula={"linear": ["sidelobes", 2.046, 4.092]},
+                 formula={"linear": ["sidelobes", 2.046, 4.092],
+                          # per-sidelobe-count annotation the GUI appends to the readout
+                          # (nearest-int lookup on --sidelobes, last entry covers 6..28): e.g.
+                          # "14.32 MHz  (full TMBOC)". Past the TMBOC lobes all power is captured.
+                          "labels": ["sidelobes",
+                                     "BOC(1,1) core",
+                                     "core + 1 sidelobe",
+                                     "core + 2 sidelobes",
+                                     "core + 3 sidelobes",
+                                     "incl. BOC(6,1) lobes",
+                                     "full TMBOC",
+                                     "full signal"]},
                  help="Occupied bandwidth the filter passes at the current sidelobe count: "
                       "2·(n+2)·1.023 MHz (i.e. ±(n+2)·1.023 MHz).")
         .derived("-Full-power-bandwidth", name="enbw_mhz", unit="MHz", hidden=True,
