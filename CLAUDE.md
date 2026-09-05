@@ -54,19 +54,25 @@ exactly the measured PSD (dBm/Hz) + `main_lobe_power` + `full_power` — nothing
   `CAL_FREQ_PARAM`):** no filter, so `full_power` is the fixed TOTAL signal power (k = 10·log10(Rc)
   = 70.098756, ≈ +0.444 dB above the main lobe) — a conservative, bandwidth-independent amp-limit
   reading. `main_lobe_power` k = 69.654784.
-- **BOC — `MCode` BOC(10,5) (both main lobes ±[5.115,15.345] MHz), `gps_l1c` TMBOC (BOC(1,1) core,
-  both ±1.023 MHz lobes):** UNCHANGED — they already offered `main_lobe_power` (both lobes) +
-  `full_power` (widest-passband, ±30.69) and never had a carrier quantity, so they already match the
-  scheme. `full_power` is the conservative widest-passband amp limit (a fixed constant, NOT live-
-  tracking the filter): L1C's `--nulls` is discrete and *could* table-track like `--sidelobes`, but
-  M-code's `--passband` is CONTINUOUS (can't be a static nearest-int table the client folds), so both
-  BOC scripts keep the conservative fixed reading for consistency. Constants from the sine-BOC PSD.
+- **BOC — `MCode` BOC(10,5), `gps_l1c` TMBOC (BOC(1,1) core):** now the SAME always-on-filter,
+  live-tracking treatment as the BPSK filtered signals. Both dropped `--filter on/off` /
+  `--transition` (and M-code's continuous `--passband`) and expose a discrete `--sidelobes` count
+  (0 = the main lobe(s); n = keep n further spectral-null steps), the passband edge snapping to the
+  BOC PSD nulls: M-code `--sidelobes` 0..3 → edge ±(n+3)·5.115 MHz (0 = both split lobes ±15.345,
+  3 = ±30.69 = Fs/2); L1C `--sidelobes` 0..28 → edge ±(n+2)·1.023 MHz (0 = the BOC(1,1) core ±2.046,
+  5 = full TMBOC ±7.16, 28 = ±30.69). `main_lobe_power` stays a CONSTANT (both main lobes /
+  the BOC(1,1) core, k = 69.5073 / 62.2246); `full_power` is now KEYED on an `enbw_mhz` table (∫ the
+  sine-BOC PSD out to the live edge, baked literal + re-derived in `--self-test`) so it tracks
+  `--sidelobes` and re-maps a held `--power`, exactly like the BPSK path. `full_power(0)` ==
+  `main_lobe_power` for L1C (edge = the core); for M-code it sits ~0.39 dB above (the ±15.345 lowpass
+  also passes the low-power DC gap between the split lobes). No carrier quantity.
 - Every constant is baked as a literal AND re-derived in each script's `--self-test` (∫sinc² for
-  BPSK, ∫BOC for BOC) so it can't silently drift. Guard test:
-  `tests/test_gps_power_quantities.py` — argspec extracts each surface; laws evaluate via the real
-  `paramkit.power_law`; asserts NO `carrier_power` anywhere; filtered-BPSK `full_power` keyed on
-  `enbw_mhz` + meets the main lobe at 0 sidelobes + tracks monotonically; streamed-BPSK full = main
-  + 0.444 dB; BOC full > main (< 1.5 dB).
+  BPSK, ∫BOC for BOC) so it can't silently drift; the filtered scripts' baked `enbw_mhz` tables are
+  re-derived from the PSD in `--self-test` (< 1e-3 MHz) so they can't drift from the runtime. Guard
+  test: `tests/test_gps_power_quantities.py` — argspec extracts each surface; laws evaluate via the
+  real `paramkit.power_law`; asserts NO `carrier_power` anywhere; every FILTERED signal's
+  `full_power` keyed on `enbw_mhz` + monotonic + meets the main lobe(s) at 0 sidelobes (M-code just
+  above, DC gap); streamed-BPSK full = main + 0.444 dB.
 - Measurement is **dBm/Hz** everywhere (per Hz, not per MHz), per the owner's request.
 
 Prior work this branch (packaging-standalone base): `Raspberry pi + b206 mini-i/Other Signals/mock_fm_chirp_tx.py` — a
