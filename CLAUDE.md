@@ -35,6 +35,25 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — chirp measured density re-anchored to dBm/Hz: COMPLETE (branch `claude/chirp-density-dbm-hz`)
+The FM-chirp/sweep signal's MEASURED spectral density is now anchored in **dBm/Hz** (per Hz — the
+operator enters the analyzer's dBm/Hz reading directly), matching the GPS scripts' convention;
+previously the `CAL_POWER_LAWS` assumed the measured density was dBm/MHz, so entering a dBm/Hz
+measurement gave total-power / ceiling readings 60 dB off. Scripts-only (`fm_chirp_tx.py` +
+`mock_fm_chirp_tx.py`) — the client/agent read the measured unit + laws from the doc/argspec and
+were already generic. Changes to `CAL_POWER_LAWS`: (1) `psd_live` (the default control quantity)
+unit `dBm/MHz` → `dBm/Hz`, same live restatement (`coeff −10, ref 10`); (2) `fbw_power` (total
+power, dBm) `k` `10.0` → `70.0` (= 60 + 10·log10(CAL_MEAS_BW_MHZ): total = density(dBm/Hz) +
+10·log10(10 MHz in Hz), bandwidth-invariant); (3) the third law flips from a per-Hz view to a
+per-MHz view — `psd_hz` (k −60) → `psd_mhz` (`unit dBm/MHz`, `k +60`), the same live density in the
+other unit. The mock's `--make-sample-calibration` + the guard test re-express the sample curve per
+Hz (density = gain − 210, was gain − 150 dBm/MHz; local `fbw` k → 70) so the physical unit is
+unchanged, just relabeled. Docs: agent `docs/calibration-v2.md` §13 example now says dBm/Hz. Tests:
+`tests/test_mock_chirp_power_quantities.py` (base density maps to the curve gain; total power
+bw-invariant at base + 70; a held per-Hz density needs more gain as the sweep widens; drift guard
+mock ≡ real laws). The fixed-bandwidth `fm_chirp_<n>MHz_tx.py` variants + the Ettus channel carry no
+`CAL_POWER_LAWS`, so they're untouched.
+
 ## Current state — GPS PRN spectral-density calibration: COMPLETE (branch `claude/gps-calibration`)
 The six remaining `PRN GPS` scripts got the C/A spectral-density calibration surface (measured =
 peak PSD in **dBm/Hz**; `CAL_POWER_LAWS` convert it to absolute-power quantities the operator picks

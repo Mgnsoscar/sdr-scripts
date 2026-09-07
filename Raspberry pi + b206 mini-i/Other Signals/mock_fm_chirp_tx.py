@@ -77,17 +77,17 @@ CAL_MEAS_BW_MHZ = 10.0              # sweep bandwidth the spectral-density calib
 # Power-quantity conversion laws this signal offers (verbatim from fm_chirp_tx.py). A chirp's
 # baseband is CONSTANT-AMPLITUDE, so its TOTAL power depends only on gain; widening the sweep
 # spreads the same power over more spectrum (density drops). From one density measured at
-# CAL_MEAS_BW_MHZ, both readings below are exact at any live sweep width.
+# CAL_MEAS_BW_MHZ (in dBm/Hz), both readings below are exact at any live sweep width.
 CAL_POWER_LAWS = [
-    {"id": "psd_live", "name": "Spectral density", "unit": "dBm/MHz",
+    {"id": "psd_live", "name": "Spectral density", "unit": "dBm/Hz",
      "in": "density", "out": "density", "restates_measurement": True,
      "param": "bw", "coeff": -10.0, "ref": 10.0, "rep": 10.0},   # −10·log10(bw / CAL_MEAS_BW_MHZ)
     {"id": "fbw_power", "name": "Full-bandwidth (total) power", "unit": "dBm",
      "in": "density", "out": "abs",
-     "k": 10.0, "rep": 10.0},                                    # +10·log10(CAL_MEAS_BW_MHZ)
-    {"id": "psd_hz", "name": "Spectral density", "unit": "dBm/Hz",
+     "k": 70.0, "rep": 10.0},                                    # +10·log10(CAL_MEAS_BW_MHZ·1e6)
+    {"id": "psd_mhz", "name": "Spectral density", "unit": "dBm/MHz",
      "in": "density", "out": "density", "restates_measurement": True,
-     "param": "bw", "coeff": -10.0, "ref": 10.0, "k": -60.0, "rep": 10.0},
+     "param": "bw", "coeff": -10.0, "ref": 10.0, "k": 60.0, "rep": 10.0},
 ]
 
 # ── RF-chain limits (no baked dBm scale; absolute --power comes only from the calibration) ───────
@@ -242,8 +242,8 @@ def resolve_band(band_mode: str, freq, bw, start, stop):
 
 def _make_sample_calibration(out_path: str) -> int:
     """Build a representative fm_chirp unit calibration and resolve it to an artifact JSON, so the
-    mock can be run standalone. The SDR is measured in spectral density (dBm/MHz) at the 10 MHz
-    reference sweep over a 0..70 dB / 0.5 dB gain grid (density = gain − 150); the dBm safety
+    mock can be run standalone. The SDR is measured in spectral density (dBm/Hz) at the 10 MHz
+    reference sweep over a 0..70 dB / 0.5 dB gain grid (density = gain − 210); the dBm safety
     ceiling is gauged through the total-power (fbw) law, as a density measurement requires. Needs
     the resolver, which lives in sdr-agent (put it on PYTHONPATH)."""
     import json
@@ -255,8 +255,8 @@ def _make_sample_calibration(out_path: str) -> int:
               f"({exc})", file=sys.stderr)
         return 2
     fbw = {"id": "fbw_power", "name": "Full-bandwidth (total) power",
-           "in": "density", "out": "abs", "k": 10.0, "rep": 10.0}
-    points = [{"gain_db": 0.0, "power_dbm": -150.0}, {"gain_db": 70.0, "power_dbm": -80.0}]
+           "in": "density", "out": "abs", "k": 70.0, "rep": 10.0}
+    points = [{"gain_db": 0.0, "power_dbm": -210.0}, {"gain_db": 70.0, "power_dbm": -140.0}]
     doc = {
         "schema_version": 1, "unit_type": "broadcaster",
         "chain": {
@@ -269,7 +269,7 @@ def _make_sample_calibration(out_path: str) -> int:
                 "limiting": {"kind": "law", "law": fbw, "max_dbm": 0.0}}},
         },
         "signals": {CAL_SIGNAL_ID: {
-            "measurement": {"quantity": "spectral density", "unit": "dBm/MHz"},
+            "measurement": {"quantity": "spectral density", "unit": "dBm/Hz"},
             "curves": {"sdr_output": {"interp": "linear", "points": points}},
             "center_freq_hz": 1575.42e6}},
         "defaults": {"amplitude": AMPLITUDE},

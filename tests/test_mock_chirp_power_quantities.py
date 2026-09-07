@@ -49,11 +49,12 @@ _SCRIPTS = Path(__file__).resolve().parents[1] / "Raspberry pi + b206 mini-i" / 
 _MOCK = _SCRIPTS / "mock_fm_chirp_tx.py"
 _REAL = _SCRIPTS / "fm_chirp_tx.py"
 
-# The SDR is measured in spectral density (dBm/MHz) at the 10 MHz reference sweep: density =
-# gain − 150 over a 0..70 dB / 0.5 dB grid. This mirrors the mock's own sample calibration.
+# The SDR is measured in spectral density (dBm/Hz) at the 10 MHz reference sweep: density =
+# gain − 210 over a 0..70 dB / 0.5 dB grid. This mirrors the mock's own sample calibration.
+# Total power (fbw) = density + 10·log10(10 MHz in Hz) = density + 70 (per Hz → +60 vs per MHz).
 GAIN_MIN, GAIN_MAX, GAIN_STEP = 0.0, 70.0, 0.5
 CAL_MEAS_BW_MHZ = 10.0
-FBW = {"id": "fbw_power", "in": "density", "out": "abs", "k": 10.0, "rep": 10.0}
+FBW = {"id": "fbw_power", "in": "density", "out": "abs", "k": 70.0, "rep": 10.0}
 PSD = {"id": "psd_live", "in": "density", "out": "density",
        "param": "bw", "coeff": -10.0, "ref": 10.0, "rep": 10.0}
 
@@ -70,10 +71,10 @@ def _doc():
                 "limiting": {"kind": "law", "law": FBW, "max_dbm": 0.0}}},
         },
         "signals": {"Chirp/Sweep": {
-            "measurement": {"quantity": "spectral density", "unit": "dBm/MHz"},
+            "measurement": {"quantity": "spectral density", "unit": "dBm/Hz"},
             "curves": {"sdr_output": {"interp": "linear", "points": [
-                {"gain_db": GAIN_MIN, "power_dbm": -150.0},
-                {"gain_db": GAIN_MAX, "power_dbm": -80.0}]}},
+                {"gain_db": GAIN_MIN, "power_dbm": -210.0},
+                {"gain_db": GAIN_MAX, "power_dbm": -140.0}]}},
             "center_freq_hz": 1575.42e6}},
         "defaults": {"amplitude": 0.5},
     }
@@ -105,10 +106,10 @@ def _gain(stdout):
     return float(m.group(1))
 
 
-def _expected_gain(base_density_dbm_per_mhz):
+def _expected_gain(base_density_dbm_per_hz):
     """The gain the curve dictates for a base measured density, snapped to the 0.5 dB grid and
-    clamped — computed independently of the script (density = gain − 150)."""
-    g = base_density_dbm_per_mhz + 150.0
+    clamped — computed independently of the script (density = gain − 210)."""
+    g = base_density_dbm_per_hz + 210.0
     g = round(g / GAIN_STEP) * GAIN_STEP
     return max(GAIN_MIN, min(GAIN_MAX, round(g, 6)))
 
@@ -123,7 +124,7 @@ def _base_for(quantity_law, operator_value, bw_mhz):
 # ── base --power maps to the curve's gain ───────────────────────────────────────
 
 @pytest.mark.parametrize("base_density,want_gain", [
-    (-120.0, 30.0), (-130.0, 20.0), (-95.0, 55.0), (-150.0, 0.0), (-80.0, 70.0),
+    (-180.0, 30.0), (-190.0, 20.0), (-155.0, 55.0), (-210.0, 0.0), (-140.0, 70.0),
 ])
 def test_base_power_maps_to_the_curve_gain(base_density, want_gain, artifact_file):
     out = _run(["--freq", "1575.42", "--bw", "20", "--rate", "200",
@@ -140,24 +141,24 @@ def test_total_power_quantity_gives_the_same_gain_across_bandwidth(bw, artifact_
     base = _base_for(FBW, total_dbm, bw)    # what the client sends (base measured density)
     out = _run(["--freq", "1575.42", "--bw", f"{bw:g}", "--rate", "200",
                 "--power", f"{base:g}"], artifact=artifact_file)
-    # total = base + 10 → base = −120 for every bw → gain 30 for every bw
-    assert base == pytest.approx(-120.0)
+    # total = base + 70 → base = −180 for every bw → gain 30 for every bw
+    assert base == pytest.approx(-180.0)
     assert _gain(out) == pytest.approx(30.0)
 
 
 # ── a fixed spectral density needs more gain as the sweep widens ────────────────
 
 def test_spectral_density_quantity_tracks_bandwidth(artifact_file):
-    density_dbm_per_mhz = -120.0            # held live spectral density (psd_live)
+    density_dbm_per_hz = -180.0             # held live spectral density (psd_live), per Hz
     gains = {}
     for bw in (10.0, 20.0, 40.0):
-        base = _base_for(PSD, density_dbm_per_mhz, bw)   # base = D + 10·log10(bw/10)
+        base = _base_for(PSD, density_dbm_per_hz, bw)    # base = D + 10·log10(bw/10)
         out = _run(["--freq", "1575.42", "--bw", f"{bw:g}", "--rate", "200",
                     "--power", f"{base:g}"], artifact=artifact_file)
         gains[bw] = _gain(out)
-        assert base == pytest.approx(density_dbm_per_mhz + 10 * math.log10(bw / CAL_MEAS_BW_MHZ))
+        assert base == pytest.approx(density_dbm_per_hz + 10 * math.log10(bw / CAL_MEAS_BW_MHZ))
         assert gains[bw] == pytest.approx(_expected_gain(base))
-    # more bandwidth ⇒ higher base density ⇒ more gain to hold the same per-MHz density
+    # more bandwidth ⇒ higher base density ⇒ more gain to hold the same per-Hz density
     assert gains[10.0] < gains[20.0] < gains[40.0]
     assert gains[10.0] == pytest.approx(30.0)            # at the reference sweep, base = D
 
