@@ -35,6 +35,30 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — L1C sidelobes: whole-sidelobe slider + Tune-form bandwidth readout: COMPLETE (branch `claude/l1c-sidelobes-slider`, cross-repo)
+`gps_l1c_tx.py` `--sidelobes` reworked so a count means WHOLE sidelobes each side (never a half-cut
+outer lobe), rendered as a SLIDER, capped at 13, with the operator's requested per-count labels.
+- **Whole sidelobes:** L1C's PSD ZEROS sit at the EVEN multiples of 1.023 MHz (±2.046, ±4.092, …);
+  the odd multiples are lobe PEAKS. The old edge `(n+2)·1.023` landed on a peak for odd n (cutting
+  the outer lobe in half). New edge = `(n+1)·2.046 MHz` (`SIDELOBE_STEP_HZ = 2·L1C_NULL_HZ`), the
+  (n+1)th even null — one whole sidelobe per step. `filter_buffer`/`finfo`/`regenerate` + the
+  `--self-test` enbw check all use it; the enbw table was recomputed for the new edges (14 entries,
+  0..13) and re-derived in `--self-test` (< 1e-3). `main_lobe_power` k (62.2246) + `full(0)==core`
+  unchanged (n=0 is still the ±2.046 core). `full_power` `rep` → enbw_mhz(5) = 2.066514.
+- **Slider:** dropped `presets=SIDELOBE_PRESETS` — a numeric field with presets renders as a preset
+  DROPDOWN in the client (`param_form._widget_for`); with no presets it's a spinbox + range rail
+  (the slider), exactly like the C/A scripts. `MAX_SIDELOBES=13` (±28.64 MHz), `DEFAULT=5`.
+- **Labels** on `passband_bw_mhz` (formula `linear [sidelobes, 4.092, 4.092]` = 4.092·n + 4.092 MHz):
+  the exact per-count text — `BOC(1,1) core` at 0; `+ N`; `+ BOC(6,1) core` once fully contained
+  (n≥3, edge ±8.18 > the ±7.16 lobe edge); `+ 1` for the BOC(6,1) first sidelobe (n≥9, ±18.41 MHz).
+- **Tune-form bandwidth readout (client):** `sdr-client/ui/live_tune_dialog.py` `_prepare_specs` now
+  RENDERS a visible derived field whose formula reads only LIVE knobs (like `passband_bw_mhz` off the
+  live `--sidelobes`) read-only, instead of routing every non-live spec to fold context — so the
+  bandwidth tracks the slider while retuning. Hidden derived fields (a law's `enbw_mhz` key) stay
+  context. Only the RPi `gps_l1c_tx.py` carries this surface (the Ettus channel + fixed-bw variants
+  don't). Tests: scripts `tests/test_gps_power_quantities.py` (slider/no-presets, labels); client
+  `tests/test_live_tune_power.py` (visible derived readout renders + tracks the live source).
+
 ## Current state — chirp measured density re-anchored to dBm/Hz: COMPLETE (branch `claude/chirp-density-dbm-hz`)
 The FM-chirp/sweep signal's MEASURED spectral density is now anchored in **dBm/Hz** (per Hz — the
 operator enters the analyzer's dBm/Hz reading directly), matching the GPS scripts' convention;

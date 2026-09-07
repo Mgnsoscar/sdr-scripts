@@ -171,3 +171,44 @@ def test_filtered_full_power_tracks_sidelobes():
         # the widest reading stays modestly above the main lobe(s) (< 1.5 dB — split spectra keep
         # most power in the main lobe(s)).
         assert deltas[-1] - c["main_k"] < 1.5, fname
+
+
+def _param(p, dest):
+    for pr in p["params"]:
+        if pr.get("dest") == dest:
+            return pr
+    raise AssertionError(f"no param {dest!r}")
+
+
+def test_l1c_sidelobes_is_a_whole_sidelobe_slider():
+    # --sidelobes is a slider (no presets → the client renders a spinbox + range rail, like C/A),
+    # counts WHOLE sidelobes each side, 0..13.
+    p = _extract("gps_l1c_tx.py")
+    sl = _param(p, "sidelobes")
+    assert sl["kind"] == "integer" and sl.get("live") is True
+    assert sl["min"] == 0 and sl["max"] == 13 and sl.get("step") == 1
+    assert not sl.get("presets"), "presets keep the field a dropdown, not a slider"
+    # passband bandwidth = 2·(n+1)·2.046 MHz = 4.092·n + 4.092 (a full sidelobe is 2.046 MHz wide,
+    # so an odd count is never cut in half).
+    pb = _param(p, "passband_bw_mhz")
+    assert pb["kind"] == "derived" and pb.get("hidden") is not True
+    assert pb["formula"]["linear"] == ["sidelobes", 4.092, 4.092]
+
+
+def test_l1c_passband_labels_name_the_contained_lobes():
+    # The per-count annotation the GUI appends to the passband readout: BOC(1,1) core + n whole
+    # sidelobes, the BOC(6,1) CORE once it's fully contained (n≥3, edge ±8.18 > ±7.16), the BOC(6,1)
+    # FIRST sidelobe once contained (n≥9, ±18.41 MHz).
+    p = _extract("gps_l1c_tx.py")
+    labels = _param(p, "passband_bw_mhz")["formula"]["labels"]
+    assert labels[0] == "sidelobes"
+    vals = labels[1:]
+    assert len(vals) == 14                       # 0..13
+    assert vals[0] == "BOC(1,1) core"
+    for n in range(1, 14):
+        want = f"BOC(1,1) core + {n}"
+        if n >= 3:
+            want += " + BOC(6,1) core"
+        if n >= 9:
+            want += " + 1"
+        assert vals[n] == want, (n, vals[n])

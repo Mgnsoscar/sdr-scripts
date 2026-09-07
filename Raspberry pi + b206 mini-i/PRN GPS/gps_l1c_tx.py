@@ -60,13 +60,15 @@ UNITY passband gain, so whatever it passes is unchanged in power. The same filte
 the pilot and data component buffers (filtering is linear, and the overlay is a ±1 per-period
 sign that commutes with it), so the summed signal is filtered identically. L1C is a split (BOC)
 signal — BOC(1,1) lobes at ±1.023 MHz, TMBOC BOC(6,1) lobes at ±6.138 MHz — whose spectral
-nulls sit at every 1.023 MHz. The BOC(1,1) core is bounded by the ±2.046 MHz null, so the
-passband edge SNAPS TO THE NULLS as: keep the core + `sidelobes` further null-steps.
-  • --sidelobes <n>             passband keeps the BOC(1,1) core + n further null-steps
-                                (each 1.023 MHz), i.e. a ±(n+2)·1.023 MHz band (live, presets).
-                                0 = the BOC(1,1) core only (±2.046 MHz); 5 = the full TMBOC
-                                (±7.16 MHz, just outside the BOC(6,1) lobes); 28 = ±30.69 =
-                                ±Fs/2 (the whole representable signal).
+ZEROS sit at the EVEN multiples of 1.023 MHz (±2.046, ±4.092, …); the odd multiples are lobe
+PEAKS. A FULL sidelobe spans one even null to the next (2.046 MHz), and the BOC(1,1) core is
+bounded by the first even null (±2.046 MHz), so the passband edge SNAPS TO THE EVEN NULLS as:
+keep the core + `sidelobes` WHOLE further sidelobes → a ±(n+1)·2.046 MHz band.
+  • --sidelobes <n>             passband keeps the BOC(1,1) core + n whole sidelobes each side,
+                                i.e. a ±(n+1)·2.046 MHz band (live, a slider). 0 = the BOC(1,1)
+                                core only (±2.046 MHz); 3 first fully contains the BOC(6,1) core
+                                lobes (edge ±8.18 > the ±7.16 MHz lobe edge); 9 first contains the
+                                BOC(6,1) first sidelobe (±18.41 MHz); 13 = ±28.64 MHz.
 The skirt transition width is FIXED at 0.05 MHz (not a knob), so the emitted power stays a
 well-defined function of the sidelobe count alone. --sidelobes is LIVE: changing it rebuilds
 the (circularly-)filtered loops and swaps them into the running sources; the flow never stops.
@@ -140,20 +142,17 @@ SIGNAL_NAME = "GPS L1C"
 
 FREQUENCIES = {"GPS L1 (1575.42 MHz)": L1_HZ / 1e6}   # presets are in MHz now
 
-# The L1C code is 1.023 Mcps, so its spectral nulls sit at every 1.023 MHz. The BOC(1,1) core is
-# bounded by the ±2.046 MHz (2nd) null, so the passband edge snaps to the nulls as: keep the core
-# + `sidelobes` further null-steps → edge at ±(n+2)·1.023 MHz. n=0 keeps the BOC(1,1) core; n=5
-# the full TMBOC (just outside the ±6.138 MHz BOC(6,1) lobes, at ±7.16 MHz); n=28 fills ±Fs/2.
-L1C_NULL_HZ = 1.023e6
-CORE_NULLS = 2                   # the BOC(1,1) core ends at the 2nd null (±2.046 MHz)
-MAX_SIDELOBES = 28               # (28+2)·1.023 = 30.69 MHz = Fs/2 — the whole representable signal
-DEFAULT_SIDELOBES = 5            # the full TMBOC (±7.16 MHz)
-SIDELOBE_PRESETS = {
-    "BOC(1,1) core only (±2.05 MHz)": 0,
-    "Between the lobes (±4.09 MHz)": 2,
-    "Full TMBOC — incl BOC(6,1) lobes (±7.16 MHz)": 5,
-    "Wide (±14.32 MHz)": 12,
-}
+# The L1C code is 1.023 Mcps, so its PSD zeros sit at EVERY-OTHER 1.023 MHz — at the even
+# multiples (±2.046, ±4.092, ±6.138, …); the odd multiples (±1.023, ±3.069, …) are lobe PEAKS
+# (the BOC(1,1) sub-carrier tangent fills them). A FULL sidelobe therefore spans one even null to
+# the next, i.e. 2·1.023 = 2.046 MHz, so `--sidelobes` counts WHOLE sidelobes each side and the
+# passband edge snaps to the (n+1)th even null → ±(n+1)·2.046 MHz. n=0 is the BOC(1,1) core
+# (±2.046 MHz); n=3 first fully contains the BOC(6,1) core lobes (±6.138 MHz, bounded at ±7.16);
+# n=9 first contains the BOC(6,1) first sidelobe (±18.41 MHz); n=13 = ±28.64 MHz.
+L1C_NULL_HZ = 1.023e6            # the code-rate null spacing (odd multiples are lobe PEAKS)
+SIDELOBE_STEP_HZ = 2 * L1C_NULL_HZ   # a FULL sidelobe spans null-to-null = 2·1.023 = 2.046 MHz
+MAX_SIDELOBES = 13               # (13+1)·2.046 = 28.644 MHz (< Fs/2 = 30.69 MHz)
+DEFAULT_SIDELOBES = 5            # BOC(1,1) core + 5 full sidelobes (incl. the BOC(6,1) core)
 
 # Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband edge snaps
 # to a spectral null; a constant skirt keeps the emitted power a well-defined function of the
@@ -215,29 +214,27 @@ L1CO_PARAMS = (
 #
 # BW_ML is the effective bandwidth (Hz) = ∫G/G_peak of the TMBOC PSD (0.909·BOC(1,1) +
 # 0.091·BOC(6,1)) over the BOC(1,1) core (±2.046 MHz); enbw_mhz is the effective bandwidth (MHz)
-# the ±(n+2)·1.023 MHz lowpass passes at the current --sidelobes. The full power INCLUDES the
+# the ±(n+1)·2.046 MHz lowpass passes at the current --sidelobes. The full power INCLUDES the
 # BOC(6,1) lobes once --sidelobes reaches them, so it is the safe amplifier-limiting quantity and
 # TRACKS --sidelobes (narrowing lowers it). At 0 sidelobes the passband IS the core, so full power
 # equals the main-lobes power there. No carrier/total quantity is offered for a BOC signal.
 # --self-test recomputes BW_ML and the enbw table from the TMBOC PSD and asserts these literals.
 
-# Effective bandwidth (MHz) the ±(n+2)·1.023 MHz lowpass passes at sidelobes 0..MAX,
-# = ∫G(TMBOC)/G_peak over |f| < (n+2)·1.023 MHz. A HIDDEN derived field for the GUI's static AST
+# Effective bandwidth (MHz) the ±(n+1)·2.046 MHz lowpass passes at sidelobes 0..MAX,
+# = ∫G(TMBOC)/G_peak over |f| < (n+1)·2.046 MHz. A HIDDEN derived field for the GUI's static AST
 # reader (it can't run the PSD integration): a nearest-integer table lookup on --sidelobes — the
 # first element names the source field, the rest are enbw_mhz(0..MAX). Kept a LITERAL so the reader
 # can read it AND the runtime enbw_mhz() reads the SAME literals; --self-test recomputes them from
 # the TMBOC PSD (< 1e-3 MHz) so the two can never silently drift.
 _ENBW_TABLE_ARGS = [
     "sidelobes",
-    1.669003, 1.748812, 1.809067, 1.841331, 1.945677, 2.027690, 2.041373, 2.049564,
-    2.056676, 2.061802, 2.066514, 2.070138, 2.073549, 2.076315, 2.079025, 2.081593,
-    2.092184, 2.101983, 2.103927, 2.105382, 2.106726, 2.107872, 2.108972, 2.109935,
-    2.110873, 2.111715, 2.112563, 2.113433, 2.117183,     # enbw_mhz(0..28)
+    1.669003, 1.809067, 1.945677, 2.041373, 2.056676, 2.066514, 2.073549,
+    2.079025, 2.092184, 2.103927, 2.106726, 2.108972, 2.110873, 2.112563,   # enbw_mhz(0..13)
 ]
 
 
 def enbw_mhz(sidelobes: int) -> float:
-    """The equivalent-noise bandwidth (MHz) the ±(n+2)·1.023 MHz lowpass passes at `sidelobes`
+    """The equivalent-noise bandwidth (MHz) the ±(n+1)·2.046 MHz lowpass passes at `sidelobes`
     sidelobes: full_dBm = peak_dBm/Hz + 10·log10(enbw·1e6). Reads the baked _ENBW_TABLE_ARGS (the
     same literals the client folds through); --self-test re-derives it from the TMBOC PSD to guard
     drift. Passed live to the power map so the delivered full power and the limiting cap both track
@@ -254,7 +251,7 @@ def enbw_mhz(sidelobes: int) -> float:
 CAL_POWER_LAWS = [
     {"id": "full_power", "name": "Full signal power (filter passband)", "unit": "dBm",
      "in": "density", "out": "abs",
-     "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 2.027690},
+     "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 2.066514},
     {"id": "main_lobe_power", "name": "Main-lobes integrated power (BOC(1,1) core, both lobes)",
      "unit": "dBm", "in": "density", "out": "abs", "k": 62.2246},   # 10·log10(∫G ±2.046 MHz / G_peak)
 ]
@@ -366,15 +363,15 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
 
 
 def filter_buffer(base_iq, sidelobes: int, trans_hz: float, base_fft=None):
-    """Circularly filter a looped L1C component buffer, passband edge snapped to the null at the
-    BOC(1,1) core + `sidelobes` further null-steps (±(n+2)·1.023 MHz). Circular convolution keeps
-    the result exactly periodic, so the filtered loop has no seam; unity passband gain leaves the
-    kept lobes' power unchanged. Pass `base_fft` (= np.fft.fft(base_iq)) to reuse it across live
+    """Circularly filter a looped L1C component buffer, passband edge snapped to the even null at
+    the BOC(1,1) core + `sidelobes` FULL further sidelobes (±(n+1)·2.046 MHz). Circular convolution
+    keeps the result exactly periodic, so the filtered loop has no seam; unity passband gain leaves
+    the kept lobes' power unchanged. Pass `base_fft` (= np.fft.fft(base_iq)) to reuse it across live
     filter changes — each component loop is fixed per run, so its DFT need only be computed once,
     which cuts the per-change CPU spike (and the underflows it can cause). Returns
     (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
-    fp = (int(sidelobes) + CORE_NULLS) * L1C_NULL_HZ  # flat passband edge, on the (n+2)th null
+    fp = (int(sidelobes) + 1) * SIDELOBE_STEP_HZ      # flat passband edge, on the (n+1)th even null
     fc = fp + trans_hz / 2.0                          # −6 dB cutoff = edge + half the transition
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
@@ -435,11 +432,13 @@ def _self_test() -> int:
         return float(np.sum(np.abs(X[(np.abs(f) >= lo) & (np.abs(f) < hi)]) ** 2))
 
     # Filter each component (as the flow does) then sum — must equal filtering the sum.
-    df, taps, fp = filter_buffer(data_buf, sidelobes=5, trans_hz=TRANS_HZ)     # full TMBOC (±7.16)
+    df, taps, fp = filter_buffer(data_buf, sidelobes=5, trans_hz=TRANS_HZ)  # core + 5 sidelobes (±12.28 MHz)
     pf, _, _ = filter_buffer(pilot_buf, sidelobes=5, trans_hz=TRANS_HZ)
     filt = df + pf
     kept = 10 * np.log10(band(filt, 0, fp) / band(base, 0, fp))
-    cut = 10 * np.log10(band(filt, 12e6, 20e6) / max(band(base, 12e6, 20e6), 1e-30))
+    # Out-of-band window clear of the ±12.28 MHz edge + skirt (includes the BOC(6,1) first sidelobe
+    # at ±18.41 MHz, so there is real power to reject).
+    cut = 10 * np.log10(band(filt, 14e6, 28e6) / max(band(base, 14e6, 28e6), 1e-30))
     peak = float(np.max(np.abs(filt)))
     f_ok = abs(kept) < 0.1 and cut < -40 and peak * AMPLITUDE < 1.0
     print(f"filter (sidelobes=5 → ±{fp/1e6:.2f} MHz, {taps} taps): kept band {kept:+.3f} dB, "
@@ -471,13 +470,13 @@ def _self_test() -> int:
     ml_k = 10 * np.log10(_ebw(0.0, 2.046e6))
     laws = {l["id"]: l for l in CAL_POWER_LAWS}
     ml_ok = abs(laws["main_lobe_power"]["k"] - ml_k) < 0.02
-    # full_power is KEYED on enbw_mhz; the enbw table must match ∫G over ±(n+2)·1.023 MHz / G_peak.
+    # full_power is KEYED on enbw_mhz; the enbw table must match ∫G over ±(n+1)·2.046 MHz / G_peak.
     tab_ok = (laws["full_power"].get("param") == "enbw_mhz"
               and abs(laws["full_power"]["k"] - 60.0) < 1e-9
               and _ENBW_TABLE_ARGS[0] == "sidelobes"
               and len(_ENBW_TABLE_ARGS) == MAX_SIDELOBES + 2
               and all(abs(_ENBW_TABLE_ARGS[1 + m]
-                          - _ebw(0.0, (m + CORE_NULLS) * L1C_NULL_HZ) / 1e6) < 1e-3
+                          - _ebw(0.0, (m + 1) * SIDELOBE_STEP_HZ) / 1e6) < 1e-3
                       for m in range(MAX_SIDELOBES + 1)))
     mono = all(_ENBW_TABLE_ARGS[1 + i] < _ENBW_TABLE_ARGS[2 + i] for i in range(MAX_SIDELOBES))
     # 0 sidelobes: the passband IS the core, so full power == main-lobes power there.
@@ -617,28 +616,37 @@ def build_script() -> Script:
                 help="full = apply the 1800-symbol pilot overlay (18 s, runtime multiply); "
                      "off = 10 ms primary loop only.")
         .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,
-                 default=DEFAULT_SIDELOBES, presets=SIDELOBE_PRESETS, required=False, live=True,
-                 help="Passband width, as the number of null-steps KEPT beyond the BOC(1,1) core: "
-                      "a ±(n+2)·1.023 MHz band. 0 keeps the BOC(1,1) core only (±2.046 MHz); 5 the "
-                      "full TMBOC (incl. the BOC(6,1) lobes, ±7.16 MHz). The filter is always on "
-                      "(unity passband gain). More sidelobes pass more of the signal's power (the "
-                      "full-power calibration quantity tracks this). Max 28 fills the band to "
-                      "±Fs/2 = ±30.69 MHz. Live (rebuilds the filtered loops).")
+                 default=DEFAULT_SIDELOBES, required=False, live=True,
+                 help="Passband width, as the number of WHOLE sidelobes KEPT each side beyond the "
+                      "BOC(1,1) core: a ±(n+1)·2.046 MHz band (each sidelobe is a full null-to-null "
+                      "2.046 MHz lobe, never cut in half). 0 keeps the BOC(1,1) core only "
+                      "(±2.046 MHz); 3 first contains the BOC(6,1) core lobes; 5 is the default. "
+                      "The filter is always on (unity passband gain). More sidelobes pass more of "
+                      "the signal's power (the full-power calibration quantity tracks this). Max 13 "
+                      "= ±28.64 MHz. Live (rebuilds the filtered loops).")
         .derived("-Passband-bandwidth", name="passband_bw_mhz", unit="MHz",
-                 formula={"linear": ["sidelobes", 2.046, 4.092],
-                          # per-sidelobe-count annotation the GUI appends to the readout
-                          # (nearest-int lookup on --sidelobes, last entry covers 6..28): e.g.
-                          # "14.32 MHz  (full TMBOC)". Past the TMBOC lobes all power is captured.
+                 formula={"linear": ["sidelobes", 4.092, 4.092],   # 4.092·n + 4.092 = 2·(n+1)·2.046
+                          # per-sidelobe-count annotation the GUI appends to the readout (nearest-int
+                          # lookup on --sidelobes): which lobes the passband contains at that count.
+                          # The BOC(6,1) CORE first fits at 3 sidelobes (±8.18 MHz > the ±7.16 MHz
+                          # lobe edge); the BOC(6,1) FIRST sidelobe (at ±18.41 MHz) first fits at 9.
                           "labels": ["sidelobes",
                                      "BOC(1,1) core",
-                                     "core + 1 sidelobe",
-                                     "core + 2 sidelobes",
-                                     "core + 3 sidelobes",
-                                     "incl. BOC(6,1) lobes",
-                                     "full TMBOC",
-                                     "full signal"]},
+                                     "BOC(1,1) core + 1",
+                                     "BOC(1,1) core + 2",
+                                     "BOC(1,1) core + 3 + BOC(6,1) core",
+                                     "BOC(1,1) core + 4 + BOC(6,1) core",
+                                     "BOC(1,1) core + 5 + BOC(6,1) core",
+                                     "BOC(1,1) core + 6 + BOC(6,1) core",
+                                     "BOC(1,1) core + 7 + BOC(6,1) core",
+                                     "BOC(1,1) core + 8 + BOC(6,1) core",
+                                     "BOC(1,1) core + 9 + BOC(6,1) core + 1",
+                                     "BOC(1,1) core + 10 + BOC(6,1) core + 1",
+                                     "BOC(1,1) core + 11 + BOC(6,1) core + 1",
+                                     "BOC(1,1) core + 12 + BOC(6,1) core + 1",
+                                     "BOC(1,1) core + 13 + BOC(6,1) core + 1"]},
                  help="Occupied bandwidth the filter passes at the current sidelobe count: "
-                      "2·(n+2)·1.023 MHz (i.e. ±(n+2)·1.023 MHz).")
+                      "2·(n+1)·2.046 MHz (i.e. ±(n+1)·2.046 MHz).")
         .derived("-Full-power-bandwidth", name="enbw_mhz", unit="MHz", hidden=True,
                  formula={"table": _ENBW_TABLE_ARGS},
                  help="Equivalent-noise bandwidth mapping the measured peak density to the full "
@@ -711,7 +719,7 @@ def main() -> int:
         return filtered, {"on": True, "taps": taps, "edge_hz": fp,
                           "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
 
-    finfo = {"on": True, "edge_hz": (shape["sidelobes"] + CORE_NULLS) * L1C_NULL_HZ,
+    finfo = {"on": True, "edge_hz": (shape["sidelobes"] + 1) * SIDELOBE_STEP_HZ,
              "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
     data_iq0 = pilot_iq0 = None
     if want_data:
@@ -729,7 +737,7 @@ def main() -> int:
         atomically (one seam, then they loop clean). Runs on the control thread; the flow keeps
         streaming the old buffers until the swap. In-RAM — no file, so a source can never be
         left dead by a read error."""
-        info = {"on": True, "edge_hz": (shape["sidelobes"] + CORE_NULLS) * L1C_NULL_HZ,
+        info = {"on": True, "edge_hz": (shape["sidelobes"] + 1) * SIDELOBE_STEP_HZ,
                 "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
         data_iq = pilot_iq = None
         if want_data:
@@ -752,7 +760,7 @@ def main() -> int:
         tb.set_amplitude(0.0)
 
     def _fmt_band(info):
-        return (f"on — core + {info['sidelobes']} null-step(s) "
+        return (f"on — core + {info['sidelobes']} full sidelobe(s) "
                 f"(±{info['edge_hz']/1e6:.2f} MHz), {info['trans_hz']/1e6:g} MHz transition"
                 + (f", {info['taps']} taps" if 'taps' in info else ""))
 
