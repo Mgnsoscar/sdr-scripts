@@ -129,14 +129,6 @@ FREQUENCIES = {"GPS L2 (1227.60 MHz)": L2_HZ / 1e6}   # presets are in MHz now
 MAX_SIDELOBES = 28
 DEFAULT_SIDELOBES = 2
 L2C_NULL_MHZ = 1.023             # sidelobe/main-lobe null spacing (MHz) == the chip rate
-SIDELOBE_PRESETS = {
-    "Main lobe only (±1.02 MHz)": 0,
-    "Main + 1 sidelobe (±2.05 MHz)": 1,
-    "Main + 2 sidelobes (±3.07 MHz)": 2,
-    "Main + 3 sidelobes (±4.09 MHz)": 3,
-    "Main + 5 sidelobes (±6.14 MHz)": 5,
-    "Main + 10 sidelobes (±11.25 MHz)": 10,
-}
 
 # Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband is always
 # an integer number of sidelobes; the skirt is a constant so the emitted power stays a
@@ -579,7 +571,7 @@ def build_script() -> Script:
                      "~736 MB in RAM at 61.38 MHz); cm = 20 ms CM period (CL truncated; "
                      "~9.8 MB, envelope-correct) for tight RAM.")
         .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,
-                 default=DEFAULT_SIDELOBES, presets=SIDELOBE_PRESETS, required=False, live=True,
+                 default=DEFAULT_SIDELOBES, required=False, live=True,
                  help="Passband width, as the number of sidelobes KEPT beside the main lobe: "
                       "a ±(n+1)·1.023 MHz band. 0 keeps the main lobe only. The filter is always "
                       "on (unity passband gain). More sidelobes pass more of the signal's power "

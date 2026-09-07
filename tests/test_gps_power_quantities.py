@@ -195,6 +195,18 @@ def test_l1c_sidelobes_is_a_whole_sidelobe_slider():
     assert pb["formula"]["linear"] == ["sidelobes", 4.092, 4.092]
 
 
+@pytest.mark.parametrize("fname", ["gps_l2c_tx.py", "gps_l5_tx.py"])
+def test_l2c_l5_sidelobes_render_as_a_slider(fname):
+    # A numeric field with presets renders as a preset DROPDOWN in the client; with no presets it
+    # renders as a spinbox + range rail (a slider), like the C/A scripts. L2C/L5 are BPSK (nulls at
+    # the chip rate), so a sidelobe count already means whole sidelobes — only the widget changes.
+    p = _extract(fname)
+    sl = _param(p, "sidelobes")
+    assert sl["kind"] == "integer" and sl.get("live") is True
+    assert sl["min"] == 0 and sl.get("step") == 1
+    assert not sl.get("presets"), "presets keep the field a dropdown, not a slider"
+
+
 def test_l1c_passband_labels_name_the_contained_lobes():
     # The per-count annotation the GUI appends to the passband readout: BOC(1,1) core + n whole
     # sidelobes, the BOC(6,1) CORE once it's fully contained (n≥3, edge ±8.18 > ±7.16), the BOC(6,1)

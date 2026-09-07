@@ -117,11 +117,6 @@ FREQUENCIES = {"GPS L5 (1176.45 MHz)": L5_HZ / 1e6}   # presets are in MHz now
 MAX_SIDELOBES = 2
 DEFAULT_SIDELOBES = 1
 L5_NULL_MHZ = 10.23          # sidelobe/main-lobe null spacing (MHz) == the chip rate
-SIDELOBE_PRESETS = {
-    "Main lobe only (±10.23 MHz)": 0,
-    "Main + 1 sidelobe (±20.46 MHz)": 1,
-    "Main + 2 sidelobes (±30.69 MHz, ≈ full)": 2,
-}
 
 # Filter skirt transition width beyond the passband edge (MHz) — FIXED. The passband is always
 # an integer number of sidelobes; the skirt is a constant so the emitted power stays a
@@ -549,7 +544,7 @@ def build_script() -> Script:
         .choice("-Channel", "--channel", options=["IQ", "I", "Q"], default="IQ",
                 help="IQ = full L5 (QPSK); I = data channel only; Q = pilot only.")
         .integer("-Sidelobes", "--sidelobes", min=0, max=MAX_SIDELOBES, step=1,
-                 default=DEFAULT_SIDELOBES, presets=SIDELOBE_PRESETS, required=False, live=True,
+                 default=DEFAULT_SIDELOBES, required=False, live=True,
                  help="Passband width, as the number of sidelobes KEPT beside the main lobe: "
                       "a ±(n+1)·10.23 MHz band. 0 keeps the main lobe only. The filter is always "
                       "on (unity passband gain). More sidelobes pass more of the signal's power "

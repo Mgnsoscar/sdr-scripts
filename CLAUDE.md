@@ -35,6 +35,16 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — L2C + L5 sidelobes slider: COMPLETE (branch `claude/l1c-sidelobes-slider`)
+`gps_l2c_tx.py` + `gps_l5_tx.py` `--sidelobes` render as a SLIDER now: dropped `presets=
+SIDELOBE_PRESETS` (a numeric field with presets renders as a preset DROPDOWN; with none it's a
+spinbox + range rail, like the C/A scripts) and removed the now-unused `SIDELOBE_PRESETS` dict.
+These are BPSK (nulls at the chip rate — L2C 1.023 MHz, L5 10.23 MHz), so a sidelobe count already
+means WHOLE sidelobes (the L1C half-cut issue was BOC-only); only the widget changed — no physics,
+enbw, label, or max change (L2C max 28, L5 max 2). MCode keeps its preset dropdown (not requested).
+Scripts-only; the client already renders a presetless integer as a slider. Tests:
+`tests/test_gps_power_quantities.py` (`test_l2c_l5_sidelobes_render_as_a_slider`).
+
 ## Current state — L1C sidelobes: whole-sidelobe slider + Tune-form bandwidth readout: COMPLETE (branch `claude/l1c-sidelobes-slider`, cross-repo)
 `gps_l1c_tx.py` `--sidelobes` reworked so a count means WHOLE sidelobes each side (never a half-cut
 outer lobe), rendered as a SLIDER, capped at 13, with the operator's requested per-count labels.
