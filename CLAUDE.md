@@ -44,9 +44,10 @@ measurement gave total-power / ceiling readings 60 dB off. Scripts-only (`fm_chi
 were already generic. Changes to `CAL_POWER_LAWS`: (1) `psd_live` (the default control quantity)
 unit `dBm/MHz` → `dBm/Hz`, same live restatement (`coeff −10, ref 10`); (2) `fbw_power` (total
 power, dBm) `k` `10.0` → `70.0` (= 60 + 10·log10(CAL_MEAS_BW_MHZ): total = density(dBm/Hz) +
-10·log10(10 MHz in Hz), bandwidth-invariant); (3) the third law flips from a per-Hz view to a
-per-MHz view — `psd_hz` (k −60) → `psd_mhz` (`unit dBm/MHz`, `k +60`), the same live density in the
-other unit. The mock's `--make-sample-calibration` + the guard test re-express the sample curve per
+10·log10(10 MHz in Hz), bandwidth-invariant); (3) the old per-Hz secondary view `psd_hz` (k −60) is
+DROPPED — only the two quantities remain, the live density (`dBm/Hz`) and total power (`dBm`); no
+redundant dBm/MHz view (owner decision, matching the GPS scripts' density + total-power pattern).
+The mock's `--make-sample-calibration` + the guard test re-express the sample curve per
 Hz (density = gain − 210, was gain − 150 dBm/MHz; local `fbw` k → 70) so the physical unit is
 unchanged, just relabeled. Docs: agent `docs/calibration-v2.md` §13 example now says dBm/Hz. Tests:
 `tests/test_mock_chirp_power_quantities.py` (base density maps to the curve gain; total power

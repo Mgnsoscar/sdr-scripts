@@ -85,9 +85,6 @@ CAL_POWER_LAWS = [
     {"id": "fbw_power", "name": "Full-bandwidth (total) power", "unit": "dBm",
      "in": "density", "out": "abs",
      "k": 70.0, "rep": 10.0},                                    # +10·log10(CAL_MEAS_BW_MHZ·1e6)
-    {"id": "psd_mhz", "name": "Spectral density", "unit": "dBm/MHz",
-     "in": "density", "out": "density", "restates_measurement": True,
-     "param": "bw", "coeff": -10.0, "ref": 10.0, "k": 60.0, "rep": 10.0},
 ]
 
 # ── RF-chain limits (no baked dBm scale; absolute --power comes only from the calibration) ───────

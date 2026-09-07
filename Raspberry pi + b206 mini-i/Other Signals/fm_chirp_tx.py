@@ -113,21 +113,22 @@ CAL_MEAS_BW_MHZ = 10.0
 # `coeff·log10(param/ref)` term. Both encode CAL_MEAS_BW_MHZ (10): for the total-power law
 # k = 10·log10(10·1e6) = 60 + 10·log10(10) = 70 (the +60 turns the per-Hz density into a per-MHz
 # one before integrating the 10 MHz reference span); ref = 10 (MHz) for the density-restatement
-# laws. Each law may declare its display `unit` (dBm, dBm/Hz, dBm/MHz). The laws are only OFFERED
-# here; the operator picks which is --power's quantity per unit in the editor (and can switch the
-# --power field among them on the Run/tune form — they all differ by constants and 10·log10(bw)).
+# law. Each law declares its display `unit` (here dBm/Hz for the density, dBm for total power). The
+# laws are only OFFERED here; the operator picks which is --power's quantity per unit in the editor
+# (and can switch the --power field between them on the Run/tune form — they differ by a constant
+# and 10·log10(bw)).
 # The chosen law is embedded in that unit's calibration doc. `rep` is a representative --bw for the
 # range read-outs shown before a live --bw is known.
 #
 # `restates_measurement`: the density is MEASURED at a fixed sweep (CAL_MEAS_BW_MHZ), so the raw
 # measured quantity is bandwidth-INVARIANT — it is really total power minus a constant, not the
-# live passband density. The psd laws below re-express that same reading at the LIVE sweep width,
-# so they carry `restates_measurement: True`. The client then drops the raw measured quantity from
-# the operator's "control in" choices (it would otherwise appear as a second, confusingly
-# bandwidth-frozen "dBm/Hz" density) and offers these live restatements instead. Total power is a
+# live passband density. `psd_live` re-expresses that same reading at the LIVE sweep width, so it
+# carries `restates_measurement: True`. The client then drops the raw measured quantity from the
+# operator's "control in" choices (it would otherwise appear as a second, confusingly
+# bandwidth-frozen "dBm/Hz" density) and offers this live restatement instead. Total power is a
 # DISTINCT reading (not a restatement), so it is NOT flagged and stays on offer. `psd_live` leads
 # so the live spectral density (dBm/Hz) is the default control quantity for this density-measured
-# signal.
+# signal. Only the two quantities below are offered — the live density (dBm/Hz) and total power.
 CAL_POWER_LAWS = [
     {"id": "psd_live", "name": "Spectral density", "unit": "dBm/Hz",
      "in": "density", "out": "density", "restates_measurement": True,
@@ -135,10 +136,6 @@ CAL_POWER_LAWS = [
     {"id": "fbw_power", "name": "Full-bandwidth (total) power", "unit": "dBm",
      "in": "density", "out": "abs",
      "k": 70.0, "rep": 10.0},                                # +10·log10(CAL_MEAS_BW_MHZ·1e6)
-    # Same spectral density, expressed per MHz: dBm/MHz = dBm/Hz + 10·log10(1e6) = dBm/Hz + 60.
-    {"id": "psd_mhz", "name": "Spectral density", "unit": "dBm/MHz",
-     "in": "density", "out": "density", "restates_measurement": True,
-     "param": "bw", "coeff": -10.0, "ref": 10.0, "k": 60.0, "rep": 10.0},
 ]
 
 
