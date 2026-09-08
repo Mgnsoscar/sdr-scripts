@@ -35,6 +35,30 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — mock PRN + CW for the headless test unit: COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
+Two new NO-HARDWARE mock transmitters so the local, headless integration unit (sdr-agent
+`deploy/run_local.sh`) has one armable mock per signal family — a **PRN**, a **chirp** and a **CW** —
+and nothing else. Both mirror the real script's parameter schema, `CAL_SIGNAL_ID`, `CAL_FREQ_PARAM`
+and `CAL_POWER_LAWS` verbatim (a `FakeRadio` LOGS the SDR gain it *would* command; no UHD/GNU Radio),
+exactly like the pre-existing `mock_fm_chirp_tx.py`, so the client renders the SAME power card and
+`--power` folds through `PowerMap` at the same math:
+- **`PRN GPS/mock_gps_ca_code_1.023Mcps_tx.py`** — mock of `gps_ca_code_1.023Mcps.py`. Carries the C/A
+  spectral-density surface: `--power`/`--gain`/`--freq`/`--prn`/`--sidelobes` + the derived
+  `passband_bw_mhz` and the HIDDEN `enbw_mhz` table, and the `full_power` (keyed on `enbw_mhz`) +
+  `main_lobe_power` laws. The sinc² power-fraction math (`enbw_mhz(n)`) is the SAME pure-Python code
+  the real script runs (Gold code / IQ loop / filter DSP / GNU Radio dropped); `--self-test` asserts
+  the baked enbw table still matches `enbw_mhz()` so they can't drift. Live `--sidelobes` re-maps a
+  held full/absolute power.
+- **`Other Signals/mock_cw_tx.py`** — mock of `cw_tx.py`. A single dBm quantity (no power laws):
+  `--freq`/`--power`/`--rf`/`--gain`, calibrated dBm folded at the live carrier.
+Both add `--once` / `--self-test` / `--make-sample-calibration` (like `mock_fm_chirp_tx.py`). The
+generic `mock_tx.py`/`mock_sdr_tx.py` (signal id `mock`) stay — they're test infrastructure
+(`tests/test_active_power_combination.py`) — but the `mock` SIGNAL is dropped from the sample unit.
+Tests: `tests/test_mock_gps_ca_power_quantities.py`, `tests/test_mock_cw.py` (each drives the mock
+against the resolver + a drift guard: mock argspec surface == the real script's). Agent side (sample
+calibration = the three signals, `run_local.sh` task wiring): see `sdr-agent` CLAUDE.md +
+`docs/local-integration-run.md`.
+
 ## Current state — L2C + L5 sidelobes slider: COMPLETE (branch `claude/l1c-sidelobes-slider`)
 `gps_l2c_tx.py` + `gps_l5_tx.py` `--sidelobes` render as a SLIDER now: dropped `presets=
 SIDELOBE_PRESETS` (a numeric field with presets renders as a preset DROPDOWN; with none it's a
