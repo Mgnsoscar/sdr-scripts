@@ -236,6 +236,7 @@ def build_script() -> Script:
                  help="Equivalent-noise bandwidth mapping the measured peak density to the full "
                       "in-band power. Feeds the full-power calibration law; not shown.")
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                is_rf=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
     )

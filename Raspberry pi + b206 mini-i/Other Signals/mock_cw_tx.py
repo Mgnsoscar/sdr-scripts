@@ -137,7 +137,7 @@ def build_script() -> Script:
                      "calibration (folded at the current carrier) and snaps to its achievable "
                      "grid; ignored if --gain is given. Live.")
         .choice("-RF", "--rf", options=["on", "off"], default="off",
-                required=False, live=True,
+                required=False, live=True, is_rf=True,
                 help="RF output on/off. Starts OFF (muted pre-roll): set the power, then switch "
                      "ON to go on-air. OFF mutes gain AND baseband amplitude; power edits made "
                      "while OFF are staged and applied when you switch ON.")

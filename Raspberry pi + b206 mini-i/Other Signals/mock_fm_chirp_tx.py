@@ -205,6 +205,7 @@ def build_script() -> Script:
                 default=200.0, required=True, live=True,
                 help="How fast the sweep repeats, in kHz. Informational for the mock. Live.")
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
+                is_rf=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
     )
