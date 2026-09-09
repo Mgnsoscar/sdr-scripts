@@ -166,11 +166,13 @@ def power_map() -> PowerMap:
     return _PMAP
 
 
-# ── The fake radio: logs instead of touching hardware ───────────────────────────
+# ── The fake radio: records state instead of touching hardware ──────────────────
 
 class FakeRadio:
-    """Stand-in for the GNU Radio flowgraph. Records / logs the gain, carrier and amplitude it
-    would command; builds no Gold code, no filtered loop, and transmits nothing."""
+    """Stand-in for the GNU Radio flowgraph. Records the gain, carrier and amplitude it would
+    command; builds no Gold code, no filtered loop, and transmits nothing. It stays SILENT — the
+    agent's run/task log already records the launch and every parameter change, so the mock must
+    not print them too."""
 
     def __init__(self, freq_hz: float):
         self._gain = 0.0
@@ -179,19 +181,15 @@ class FakeRadio:
 
     def set_gain(self, g: float) -> None:
         self._gain = float(g)
-        log.info("  radio.set_gain(%.2f dB)", self._gain)
 
     def set_center_frequency(self, hz: float) -> None:
         self._freq = float(hz)
-        log.info("  radio.set_center_freq(%.3f MHz)", self._freq / 1e6)
 
     def set_amplitude(self, a: float) -> None:
         self._amp = float(a)
-        log.info("  radio.set_amplitude(%.3f)", self._amp)
 
     def swap_filter(self, sidelobes: int) -> None:
-        log.info("  radio.swap_filter(main + %d sidelobe(s), ±%.2f MHz)",
-                 sidelobes, (sidelobes + 1) * CA_NULL_MHZ)
+        """No-op stand-in: the real radio rebuilds its passband filter here; the mock has none."""
 
     def actual_gain(self) -> float:
         return self._gain             # a real SDR quantises; the mock reports what it was set to
@@ -353,8 +351,10 @@ def main() -> int:
         return _self_test()
     sys.argv = [sys.argv[0], *argv]
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    # Stay silent on a normal run — only errors reach the log. The agent's run/task log already
+    # records the launch and every parameter change; printing them here too would double them.
+    logging.basicConfig(level=logging.ERROR,
+                        format="%(levelname)s %(message)s", stream=sys.stderr)
 
     script = build_script()
     args = script.parse()
@@ -389,32 +389,6 @@ def main() -> int:
     state = {"rf_on": getattr(args, "rf", "on") == "on", "gain": gain_db,
              "freq": center_freq_hz, "power": _target_power}
 
-    log.info("── mock GPS C/A (1.023 Mcps) TX (no hardware) ──────────────")
-    log.info("  signal id      : %s", CAL_SIGNAL_ID)
-    log.info("  PRN            : %s", getattr(args, "prn", 1))
-    log.info("  carrier        : %.3f MHz", center_freq_hz / 1e6)
-    log.info("  sidelobes      : %d (±%.2f MHz passband, enbw %.4f MHz)",
-             shape["sidelobes"], (shape["sidelobes"] + 1) * CA_NULL_MHZ, enbw_mhz(shape["sidelobes"]))
-    if pmap.has_absolute and gain_cal is None:
-        log.info("  power (target) : %g  (%s)", args.power, pmap.label)
-        log.info("  power (on grid): %.2f",
-                 pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params()))
-    log.info("  → gain         : %.2f dB (max %g), amplitude %g",
-             gain_db, pmap.max_gain_db, amplitude)
-    log.info("  calibration    : %s", pmap.describe())
-    if pmap.warning:
-        log.info("  ⚠ CALIBRATION  : %s", pmap.warning)
-    log.info("  RF             : %s", "ON" if state["rf_on"] else "OFF (muted)")
-    if gain_cal is not None:
-        log.info("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    log.info("────────────────────────────────────────────────────────────")
-    _grid = (pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params())
-             if pmap.has_absolute else None)
-    print("RESULT gain_db=%.6g power_dbm=%s source=%s"
-          % (gain_db, ("%.6g" % _grid) if _grid is not None else "na",
-             "calibrated" if pmap.has_absolute else "uncalibrated"))
-    sys.stdout.flush()
-
     if state["rf_on"]:
         radio.set_amplitude(amplitude)
         radio.set_gain(state["gain"])
@@ -422,7 +396,13 @@ def main() -> int:
         radio.set_gain(0.0)
         radio.set_amplitude(0.0)
 
-    if once:                                         # one-shot: no live loop
+    if once:                                         # one-shot: print the resolved mapping, no loop
+        _grid = (pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params())
+                 if pmap.has_absolute else None)
+        print("RESULT gain_db=%.6g power_dbm=%s source=%s"
+              % (gain_db, ("%.6g" % _grid) if _grid is not None else "na",
+                 "calibrated" if pmap.has_absolute else "uncalibrated"))
+        sys.stdout.flush()
         return 0
 
     ctrl = script.live_control(args)
@@ -432,7 +412,6 @@ def main() -> int:
             state["power"] = float(value)
             state["gain"] = pmap.gain_for_power(float(value), freq=center_freq_hz,
                                                 params=pwr_params())
-            log.info("live: --power %s → gain %.2f dB", value, state["gain"])
             if state["rf_on"]:
                 radio.set_gain(state["gain"])
             ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=center_freq_hz,
@@ -440,14 +419,12 @@ def main() -> int:
         elif name == "gain":
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
             state["power"] = None                    # raw gain takes over the level
-            log.info("live: --gain %.2f dB (raw)", state["gain"])
             if state["rf_on"]:
                 radio.set_gain(state["gain"])
             ctrl.report("gain", round(state["gain"], 2))
         elif name == "rf":
             on = str(value).strip().lower() in ("on", "1", "true", "yes")
             state["rf_on"] = on
-            log.info("live: --rf %s", "on" if on else "off")
             if on:
                 radio.set_amplitude(amplitude)
                 radio.set_gain(state["gain"])
@@ -480,7 +457,6 @@ def main() -> int:
         time.sleep(0.1)
 
     ctrl.close()
-    log.info("mock GPS C/A TX stopped.")
     return 0
 
 

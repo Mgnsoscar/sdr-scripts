@@ -4,9 +4,9 @@ mock_atten — a NO-HARDWARE, one-shot mock of a step attenuator's control task.
 
 It stands in for the real ``ad_usb1ar36g95_atten.py`` so the ACTIVE-component path
 can be exercised end to end without any attenuator connected. It parses
-``--attenuation`` (dB), logs the value it *would* set, and exits — exactly the
-one-shot shape the agent fires when a calibrated ``--power`` is requested on a
-transmit task that lists this task as its active component's control task.
+``--attenuation`` (dB), prints the value it *would* set (one RESULT line, below), and
+exits — exactly the one-shot shape the agent fires when a calibrated ``--power`` is
+requested on a transmit task that lists this task as its active component's control task.
 
 Declare it as the ``control.task`` (param ``attenuation``) on a derived plane in the
 calibration chain; the agent resolves ``--attenuation`` from this script's schema and
@@ -44,7 +44,7 @@ log = logging.getLogger("mock_atten")
 
 def build_script() -> Script:
     return (
-        Script("Mock step attenuator (NO HARDWARE) — logs the attenuation it would set and "
+        Script("Mock step attenuator (NO HARDWARE) — sets the attenuation it would apply and "
                "exits. Stands in for a real USB attenuator's control task.")
         .number("-Attenuation", "--attenuation", unit="dB", min=MIN_DB, max=MAX_DB,
                 default=0.0,
@@ -54,10 +54,11 @@ def build_script() -> Script:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
+    # Stay silent on a normal run — only errors reach the log. The single RESULT line below is the
+    # one-shot's machine-readable result (tests + the agent's active-set log read it), not chatter.
+    logging.basicConfig(level=logging.ERROR, format="%(levelname)s %(message)s", stream=sys.stderr)
     args = build_script().parse()
     att = max(MIN_DB, min(MAX_DB, float(args.attenuation)))
-    log.info("mock attenuator: set %.2f dB (no hardware) — would hold until changed", att)
     print("RESULT attenuation_db=%.6g" % att)
     return 0
 

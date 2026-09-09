@@ -124,11 +124,12 @@ def power_map() -> PowerMap:
     return _PMAP
 
 
-# ── The fake radio: logs instead of touching hardware ───────────────────────────
+# ── The fake radio: records state instead of touching hardware ──────────────────
 
 class FakeRadio:
-    """Stand-in for the GNU Radio flowgraph. Records / logs the gain, carrier and amplitude it
-    would command; builds no buffer and transmits nothing."""
+    """Stand-in for the GNU Radio flowgraph. Records the gain, carrier and amplitude it would
+    command; builds no buffer and transmits nothing. It stays SILENT — the agent's run/task log
+    already records the launch and every parameter change, so the mock must not print them too."""
 
     def __init__(self, freq_hz: float):
         self._gain = 0.0
@@ -137,15 +138,12 @@ class FakeRadio:
 
     def set_gain(self, g: float) -> None:
         self._gain = float(g)
-        log.info("  radio.set_gain(%.2f dB)", self._gain)
 
     def set_center_frequency(self, hz: float) -> None:
         self._freq = float(hz)
-        log.info("  radio.set_center_freq(%.3f MHz)", self._freq / 1e6)
 
     def set_amplitude(self, a: float) -> None:
         self._amp = float(a)
-        log.info("  radio.set_amplitude(%.3f)", self._amp)
 
     def actual_gain(self) -> float:
         return self._gain             # a real SDR quantises; the mock reports what it was set to
@@ -339,8 +337,10 @@ def main() -> int:
         return _self_test()
     sys.argv = [sys.argv[0], *argv]
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
+    # Stay silent on a normal run — only errors reach the log. The agent's run/task log already
+    # records the launch and every parameter change; printing them here too would double them.
+    logging.basicConfig(level=logging.ERROR,
+                        format="%(levelname)s %(message)s", stream=sys.stderr)
 
     script = build_script()
     args = script.parse()
@@ -383,34 +383,6 @@ def main() -> int:
              "freq": center_freq_hz, "power": _target_power,
              "start": getattr(args, "start", None), "stop": getattr(args, "stop", None)}
 
-    band_mode = getattr(args, "band_mode", "center_bw")
-    log.info("── mock FM chirp TX (no hardware) ──────────────────────────")
-    log.info("  signal id      : %s", CAL_SIGNAL_ID)
-    log.info("  band mode      : %s", band_mode)
-    log.info("  carrier        : %.3f MHz", center_freq_hz / 1e6)
-    log.info("  sweep bw       : %g MHz (±%g MHz)", sweep_bw_hz / 1e6, sweep_bw_hz / 2e6)
-    log.info("  sweep rate     : %g kHz", getattr(args, "rate", 0.0))
-    if pmap.has_absolute and gain_cal is None:
-        log.info("  power (target) : %g  (%s)", args.power, pmap.label)
-        log.info("  power (on grid): %.2f",
-                 pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params()))
-    log.info("  → gain         : %.2f dB (max %g), amplitude %g",
-             gain_db, pmap.max_gain_db, amplitude)
-    log.info("  calibration    : %s", pmap.describe())
-    if pmap.warning:
-        log.info("  ⚠ CALIBRATION  : %s", pmap.warning)
-    log.info("  RF             : %s", "ON" if state["rf_on"] else "OFF (muted)")
-    if gain_cal is not None:
-        log.info("  ⚠ CALIBRATION  : raw --gain knob active — overrides --power")
-    log.info("────────────────────────────────────────────────────────────")
-    # One machine-readable line for tests / tooling (mirrors mock_sdr_tx.py).
-    _grid = (pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params())
-             if pmap.has_absolute else None)
-    print("RESULT gain_db=%.6g power_dbm=%s source=%s"
-          % (gain_db, ("%.6g" % _grid) if _grid is not None else "na",
-             "calibrated" if pmap.has_absolute else "uncalibrated"))
-    sys.stdout.flush()
-
     # Apply the initial state to the (fake) radio.
     if state["rf_on"]:
         radio.set_amplitude(amplitude)
@@ -419,7 +391,14 @@ def main() -> int:
         radio.set_gain(0.0)
         radio.set_amplitude(0.0)
 
-    if once:                                         # one-shot: no live loop
+    if once:                                         # one-shot: print the resolved mapping, no loop
+        # One machine-readable line for tests / tooling (mirrors mock_sdr_tx.py).
+        _grid = (pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params())
+                 if pmap.has_absolute else None)
+        print("RESULT gain_db=%.6g power_dbm=%s source=%s"
+              % (gain_db, ("%.6g" % _grid) if _grid is not None else "na",
+                 "calibrated" if pmap.has_absolute else "uncalibrated"))
+        sys.stdout.flush()
         return 0
 
     ctrl = script.live_control(args)
@@ -448,16 +427,12 @@ def main() -> int:
             state["power"] = float(value)
             state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"],
                                                 params=pwr_params())
-            log.info("live: --power %s → gain %.2f dB", value, state["gain"])
             if state["rf_on"]:
                 radio.set_gain(state["gain"])
-            else:
-                log.info("  (staged — RF is off; applies on next --rf on)")
             _report_power()
         elif name == "gain":
             state["power"] = None                    # a raw gain drops any held target power
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
-            log.info("live: --gain %.2f dB (raw)", state["gain"])
             if state["rf_on"]:
                 radio.set_gain(state["gain"])
             ctrl.report("gain", round(state["gain"], 2))
@@ -483,7 +458,6 @@ def main() -> int:
         elif name == "rf":
             on = str(value).strip().lower() in ("on", "1", "true", "yes")
             state["rf_on"] = on
-            log.info("live: --rf %s", "on" if on else "off")
             if on:
                 radio.set_amplitude(amplitude)
                 radio.set_gain(state["gain"])
@@ -498,7 +472,6 @@ def main() -> int:
             if state.get("power") is not None:
                 state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"],
                                                     params=pwr_params())
-                log.info("live: --bw %s MHz → gain %.2f dB", value, state["gain"])
                 if state["rf_on"]:
                     radio.set_gain(state["gain"])
                 _report_power()
@@ -517,7 +490,6 @@ def main() -> int:
         time.sleep(0.1)
 
     ctrl.close()
-    log.info("mock FM chirp TX stopped.")
     return 0
 
 
