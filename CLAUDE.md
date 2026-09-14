@@ -35,6 +35,43 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — CW drift over hundreds of MHz / days (`cw_drift_tx.py` rewrite): COMPLETE (branch `claude/cw-drift-wide`, scripts-only)
+Owner ask: a CW that drifts hundreds of MHz over a very long time; one script for the plain single
+tone and one for the drift. The split already existed (`Other Signals/cw_tx.py` = the pure tone,
+`cw_drift_tx.py` = the drift), but the drift script capped the duration at 20 min, REFUSED any span
+wider than the baseband window (`drift range >= samp_rate` → error, so a few MHz on a Pi) and folded
+`--power` at the START frequency only. Rewritten (scripts-only; no agent/client change — the agent's
+static `argspec` reads the new schema as-is):
+- **Wide sweeps via LO hops** — the X410 `cw_channel.py` planner ported (`plan_lo`, `SWEEP_MARGIN` 0.7):
+  the software NCO carries the tone within a window of `0.7·sample_rate`; at a window edge the analog LO
+  hops one window and the NCO wraps, BLANKED (`--hop_blank`, 20 ms default, live) to hide the synth
+  relock. `half_window_hz` / `is_wide` / `initial_lo` (a window grid centred on the sweep) /
+  `hop_count` (closed form) are pure helpers. 300 MHz at 2 MHz = 214 hops (one 20 ms blank per ~50 s of
+  a 3 h drift); at 10 MHz = 42. A narrow drift (span ≤ one window) is unchanged: LO fixed at the centre,
+  fully continuous. `--duration` max 20 min → **7 days** (`MAX_DURATION_S`); sample-rate presets 1/2/5/
+  10/20 MHz (the 40 MHz preset dropped — a Pi can't stream it; the hardware max 61.44 stays accepted).
+- **Calibrated power tracks the drift** — the held `--power` is re-folded through the calibration at the
+  LIVE frequency every `REFOLD_STEP_HZ` (250 kHz) of movement (`needs_refold` → `gain_for_power(freq=f)`,
+  the gain applied only when it changes; raw `--gain` is never re-folded). `coverage_gaps(pmap, power,
+  start, end)` samples the sweep at start and the banner names each stretch where the ceiling sits below
+  the request (`⚠ POWER … can't be delivered over X–Y MHz`; the gain clamps there — safe). A progress
+  line every 5 min (`drift @ … MHz (N % of the span) · gain · LO hops so far`).
+- **Shared calibration signal** — `CAL_SIGNAL_ID` `"cw_drift"` → **`"cw_tone"`** (same as `cw_tx.py`): at
+  any instant the drift IS a pure CW at one frequency at the same `AMPLITUDE`, so the same measured
+  curve applies and one calibration serves both; the unit's source-flatness / cable tables supply the
+  frequency dependence. A unit that had a separate `cw_drift` signal calibrated keeps it unused.
+  `CAL_FREQ_PARAM` stays `freq` (the client folds the shown range at the start; the script re-folds).
+- `--rf` is marked `is_rf=True` on BOTH real CW scripts (the mock already had it), so the client's RF
+  auto-gating / run-log muting recognise the gate by the marker, not only the on/off convention.
+- `--self-test` re-derives the planner over a 300 MHz sweep at 2 + 10 MHz (offset within ±half, hop
+  count == `hop_count`). Tests: `tests/test_cw_drift.py` (drift modes; wide-sweep walk at 2/10 MHz — NCO
+  never leaves the window, hops per window, symmetric grid, up == down; narrow never hops; loop/pingpong
+  wraps; refold cadence + a 6 dB flatness rise moves the gain 6 dB; coverage gaps name a 15 dB dip and
+  stay silent for a deliverable level / uncalibrated; `fmt_rate`; the argspec surface incl. the shared
+  signal id, 7-day max, presets; `--self-test` + `--describe-params` subprocesses). Suite 55 → 66.
+  Not verified on hardware (no radio here): the hop path is the proven `set_center_freq` + `set_tone`
+  sequence, mute-wrapped.
+
 ## Current state — mock PRN + CW for the headless test unit: COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
 Two new NO-HARDWARE mock transmitters so the local, headless integration unit (sdr-agent
 `deploy/run_local.sh`) has one armable mock per signal family — a **PRN**, a **chirp** and a **CW** —

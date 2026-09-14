@@ -5,8 +5,9 @@ Pure CW-tone transmitter for GNU Radio + UHD (Ettus B200-mini family).
 Emits a single, steady continuous-wave tone at a chosen frequency (GNSS carrier
 presets, or any value) — no modulation, no drift. The tone is the USRP LO itself
 (a constant baseband driving the DAC), so it is as clean and stable as the radio's
-reference. For a tone that ramps between two frequencies over time, use the
-companion cw_drift_tx.py.
+reference. For a tone that DRIFTS between two frequencies over time (kHz over minutes
+up to hundreds of MHz over days), use the companion cw_drift_tx.py — it shares this
+tone's calibration signal ("cw_tone"), so one calibration serves both.
 
 Because it is a single constant-envelope tone, this is the natural signal to
 CALIBRATE a unit with: measure its delivered power against commanded gain across
@@ -162,7 +163,7 @@ def build_script() -> Script:
                      "calibration when present (e.g. EIRP), else the baked SDR-port scale. "
                      "Ignored if --gain is given (relative wins). Live.")
         .choice("-RF", "--rf", options=["on", "off"], default="off",
-                required=False, live=True,
+                required=False, live=True, is_rf=True,
                 help="RF output on/off. Starts OFF (muted pre-roll): set the power, then "
                      "switch ON to go on-air. OFF mutes gain AND baseband amplitude; power "
                      "edits made while OFF are staged and applied when you switch ON.")
