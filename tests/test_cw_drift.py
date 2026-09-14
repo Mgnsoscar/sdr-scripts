@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -227,7 +228,15 @@ def test_schema_surface_and_shared_calibration_signal():
     assert set(by) >= {"freq", "freq_end", "duration", "drift", "sample_rate", "hop_blank",
                        "power", "rf", "restart", "gain"}
     assert by["duration"]["max"] == 7 * 86400 and by["duration"]["unit"] == "s"
-    assert by["freq_end"]["max"] == 6e9 and by["freq_end"]["unit"] == "Hz"
+    # Both carriers are entered in MHz (like the PRN scripts' -Center-frequency); the planner
+    # works in Hz behind the boundary. Presets + defaults are MHz too, on both scripts.
+    for dest in ("freq", "freq_end"):
+        assert by[dest]["unit"] == "MHz" and (by[dest]["min"], by[dest]["max"]) == (70.0, 6000.0)
+        vals = [p.get("value") if isinstance(p, dict) else (p[1] if isinstance(p, (list, tuple)) else p)
+                for p in by[dest]["presets"]]
+        assert 1575.42 in vals and all(70.0 <= v <= 6000.0 for v in vals)
+    assert by["freq"]["default"] == 1575.42 and by["freq_end"]["default"] == 1575.43
+    assert {p["dest"]: p for p in tone["params"]}["freq"]["unit"] == "MHz"
     assert by["hop_blank"]["live"] and by["hop_blank"]["unit"] == "ms"
     assert by["rf"]["is_rf"] and by["rf"]["live"]
     assert by["power"]["live"] and by["power"]["unit"] == "dBm"
@@ -236,6 +245,76 @@ def test_schema_surface_and_shared_calibration_signal():
     assert 10.0 in vals and 20.0 in vals and 40.0 not in vals
     tone_by = {p["dest"]: p for p in tone["params"]}
     assert tone_by["rf"]["is_rf"]                          # the pure tone marks its gate too
+
+
+# A stand-in `gnuradio` package so the REAL scripts' main() runs to their start banner with no
+# radio: the banner prints the frequencies main() derived from the MHz args, so it proves the
+# MHz → Hz boundary (a wrong scale would print 0.001600 MHz, or trip the planner).
+_FAKE_GNURADIO = '''
+class _Obj:
+    def __init__(self, *a, **k): self._gain = 0.0
+    def __getattr__(self, name): return lambda *a, **k: None
+    def get_gain(self, *a): return self._gain
+    def set_gain(self, g, *a): self._gain = float(g)
+
+class _Mod:
+    def __getattr__(self, name):
+        if name.isupper(): return name
+        return _Obj
+
+class _TopBlock:
+    def __init__(self, *a, **k): pass
+    def connect(self, *a): pass
+    def start(self): pass
+    def stop(self): pass
+    def wait(self): pass
+
+gr = _Mod(); gr.top_block = _TopBlock
+analog = _Mod(); blocks = _Mod(); uhd = _Mod()
+'''
+
+
+def _banner(tmp_path, script, args):
+    pkg = tmp_path / "gnuradio"
+    pkg.mkdir(exist_ok=True)
+    (pkg / "__init__.py").write_text(_FAKE_GNURADIO)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(_AGENT), env.get("PYTHONPATH", "")])
+    proc = subprocess.Popen([sys.executable, str(script), *args], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    lines = []
+    try:
+        while True:                                   # the banner ends with a full rule line
+            line = proc.stdout.readline()
+            if not line:
+                break
+            lines.append(line)
+            if line.strip() and set(line.strip()) == {"─"} and len(lines) > 1:
+                break
+        time.sleep(0.5)                               # let it reach the loop (SIGTERM handler)
+        proc.terminate()                              # SIGTERM → the loop exits cleanly
+        _out, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    # The banner is the deliverable. A clean exit (0) is the norm; −15 means the SIGTERM landed
+    # before the handler was installed (a slow box) — still not a crash, which shows as a
+    # traceback / a non-zero argparse or script error.
+    assert proc.returncode in (0, -15) and "Traceback" not in err, "".join(lines) + err
+    return "".join(lines)
+
+
+def test_the_tone_scripts_take_mhz_and_run_in_hz(tmp_path):
+    out = _banner(tmp_path, _DRIFT, ["--freq", "1600", "--freq_end", "1300", "--duration",
+                                     "10800", "--sample_rate", "2", "--power", "-30",
+                                     "--gain", "60", "--rf", "on"])
+    assert "1600.000000 → 1300.000000 MHz" in out and "WIDE — 300.000 MHz" in out
+    assert "214 analog-LO hops per pass" in out                 # the planner saw a 300 MHz span
+    out = _banner(tmp_path, _DRIFT, ["--freq", "1575.42", "--freq_end", "1575.43", "--duration",
+                                     "600", "--sample_rate", "2", "--power", "-30", "--gain", "60"])
+    assert "1575.420000 → 1575.430000 MHz" in out and "narrow" in out
+    out = _banner(tmp_path, _TONE, ["--freq", "1227.6", "--power", "-30", "--gain", "60"])
+    assert "tone           : 1227.600000 MHz" in out
 
 
 def test_self_test_and_describe_params_run_without_a_radio():

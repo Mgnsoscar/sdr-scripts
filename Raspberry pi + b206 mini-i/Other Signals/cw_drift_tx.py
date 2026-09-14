@@ -54,9 +54,9 @@ fire --restart to re-run the ramp from the start frequency.
 
 CLI
 ───
-    cw_drift_tx.py --freq 1575.42e6 --freq_end 1575.43e6 --duration 1200 --power -30 --rf on   # 10 kHz / 20 min
-    cw_drift_tx.py --freq 1600e6 --freq_end 1300e6 --duration 10800 --power -30 --rf on       # 300 MHz / 3 h
-    cw_drift_tx.py --freq 1227.6e6 --freq_end 1228.6e6 --drift pingpong --gain 60 --rf on
+    cw_drift_tx.py --freq 1575.42 --freq_end 1575.43 --duration 1200 --power -30 --rf on   # 10 kHz / 20 min (MHz)
+    cw_drift_tx.py --freq 1600 --freq_end 1300 --duration 10800 --power -30 --rf on       # 300 MHz / 3 h
+    cw_drift_tx.py --freq 1227.6 --freq_end 1228.6 --drift pingpong --gain 60 --rf on
     cw_drift_tx.py --self-test        # drift + LO-hop planner math, no hardware
     cw_drift_tx.py --describe-params  # paramkit JSON schema for the GUI
 """
@@ -124,18 +124,21 @@ def power_map() -> PowerMap:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+# Named GNSS carriers in MHz — the unit --freq / --freq_end are declared in (the GUI shows/enters
+# MHz, like the PRN scripts' -Center-frequency); main() scales to Hz once at the boundary and the
+# planner math below is all Hz.
 FREQUENCIES = {
-    "GPS L1 / Galileo E1 / BeiDou B1C (1575.42 MHz)": 1575.42e6,
-    "GPS L2 (1227.60 MHz)": 1227.60e6,
-    "GPS L5 / Galileo E5a (1176.45 MHz)": 1176.45e6,
-    "Galileo E5b / BeiDou B2b (1207.14 MHz)": 1207.14e6,
-    "Galileo E5 centre (1191.795 MHz)": 1191.795e6,
-    "Galileo E6 (1278.75 MHz)": 1278.75e6,
-    "BeiDou B1I (1561.098 MHz)": 1561.098e6,
-    "BeiDou B3I (1268.52 MHz)": 1268.52e6,
-    "GLONASS L1 (1602.0 MHz)": 1602.0e6,
-    "GLONASS L2 (1246.0 MHz)": 1246.0e6,
-    "Iridium (1621.25 MHz)": 1621.25e6,
+    "GPS L1 / Galileo E1 / BeiDou B1C (1575.42 MHz)": 1575.42,
+    "GPS L2 (1227.60 MHz)": 1227.60,
+    "GPS L5 / Galileo E5a (1176.45 MHz)": 1176.45,
+    "Galileo E5b / BeiDou B2b (1207.14 MHz)": 1207.14,
+    "Galileo E5 centre (1191.795 MHz)": 1191.795,
+    "Galileo E6 (1278.75 MHz)": 1278.75,
+    "BeiDou B1I (1561.098 MHz)": 1561.098,
+    "BeiDou B3I (1268.52 MHz)": 1268.52,
+    "GLONASS L1 (1602.0 MHz)": 1602.0,
+    "GLONASS L2 (1246.0 MHz)": 1246.0,
+    "Iridium (1621.25 MHz)": 1621.25,
 }
 SAMPLE_RATES_MHZ = {"1 MHz (narrow drift)": 1.0, "2 MHz (default)": 2.0, "5 MHz": 5.0,
                     "10 MHz (wide drift, fewer hops)": 10.0, "20 MHz": 20.0}
@@ -325,15 +328,15 @@ def build_script() -> Script:
                "windows, blanked). Calibrated power is re-folded at the live frequency as the "
                "tone moves. For a plain non-drifting tone use cw_tx.py. Transmit only into an "
                "authorised, shielded setup.")
-        .number("-Start-frequency", "--freq", unit="Hz", min=70e6, max=6e9,
-                presets=FREQUENCIES, default=1575.42e6, required=True,
-                help="Drift START frequency. Presets are GNSS carriers; any value allowed. "
-                     "The --power range shown is folded here; the script re-folds it along "
-                     "the sweep.")
-        .number("-End-frequency", "--freq_end", unit="Hz", min=70e6, max=6e9,
-                presets=FREQUENCIES, default=1575.43e6, required=True,
-                help="Drift END frequency — any distance from the start, hundreds of MHz "
-                     "included (a span wider than the baseband window is swept window by "
+        .number("-Start-frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=1575.42, required=True,
+                help="Drift START frequency in MHz. Presets are GNSS carriers; any value "
+                     "allowed. The --power range shown is folded here; the script re-folds it "
+                     "along the sweep.")
+        .number("-End-frequency", "--freq_end", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=1575.43, required=True,
+                help="Drift END frequency in MHz — any distance from the start, hundreds of "
+                     "MHz included (a span wider than the baseband window is swept window by "
                      "window with blanked LO hops). Equal to --freq gives a static tone — "
                      "but use cw_tx.py for that.")
         .number("-Duration", "--duration", unit="s", min=1.0, max=MAX_DURATION_S,
@@ -438,8 +441,9 @@ def main() -> int:
     script = build_script()
     args = script.parse()
 
-    start = float(args.freq)
-    end = float(args.freq_end) if args.freq_end and args.freq_end > 0 else start
+    # --freq / --freq_end are MHz (the params' declared unit); the planner + radio work in Hz.
+    start = float(args.freq) * 1e6
+    end = float(args.freq_end) * 1e6 if args.freq_end and args.freq_end > 0 else start
     drifting = end != start
     span = abs(end - start)
     samp_rate = float(args.sample_rate) * 1e6

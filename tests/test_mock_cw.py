@@ -100,15 +100,32 @@ def _expected_gain(power_dbm):
     (-120.0, 0.0), (-100.0, 20.0), (-70.0, 50.0), (-40.0, 80.0),
 ])
 def test_dbm_power_maps_to_the_curve_gain(power_dbm, want_gain, artifact_file):
-    out = _run(["--freq", "1575.42e6", "--power", f"{power_dbm:g}"], artifact=artifact_file)
+    out = _run(["--freq", "1575.42", "--power", f"{power_dbm:g}"], artifact=artifact_file)
     assert _gain(out) == pytest.approx(want_gain)
     assert _gain(out) == pytest.approx(_expected_gain(power_dbm))
 
 
 def test_raw_gain_override(artifact_file):
     # --power is required by the CW schema (matching cw_tx.py); a raw --gain overrides it.
-    out = _run(["--freq", "1575.42e6", "--power", "-60", "--gain", "55"], artifact=artifact_file)
+    out = _run(["--freq", "1575.42", "--power", "-60", "--gain", "55"], artifact=artifact_file)
     assert _gain(out) == pytest.approx(55.0)
+
+
+def test_freq_is_taken_in_mhz_and_folded_in_hz(tmp_path):
+    # --freq is declared in MHz; the script must scale it to Hz before folding, else a
+    # frequency-dependent chain would fold at ~1.6 kHz (clamped to the table's lowest point)
+    # and every carrier would get the same gain. A 6 dB flatness rise 1.3 → 1.6 GHz, zeroed at
+    # the 1575.42 MHz measured-at point: −70 dBm needs 6 dB LESS gain at 1600 than at 1300.
+    import json
+    doc = _doc()
+    doc["source_bias"] = {"power_by_freq": [[1.3e9, -3.0], [1.6e9, 3.0]]}
+    art = tmp_path / "cw_bias.json"
+    art.write_text(json.dumps(resolve(doc, None, "cw_tone").to_public_dict()))
+    g_lo = _gain(_run(["--freq", "1300", "--power", "-70"], artifact=art))
+    g_hi = _gain(_run(["--freq", "1600", "--power", "-70"], artifact=art))
+    assert g_lo - g_hi == pytest.approx(6.0, abs=0.3)
+    # The measured-at carrier itself is unbiased: the plain curve gain.
+    assert _gain(_run(["--freq", "1575.42", "--power", "-70"], artifact=art)) == pytest.approx(50.0)
 
 
 def test_mock_matches_the_real_cw_calibration_surface():
@@ -123,14 +140,22 @@ def test_mock_matches_the_real_cw_calibration_surface():
 
     def surface(d):
         keep = ("freq", "power", "gain", "rf")
-        return {p["dest"]: (p.get("unit"), p.get("kind")) for p in d["params"] if p["dest"] in keep}
+        return {p["dest"]: (p.get("unit"), p.get("kind"), p.get("min"), p.get("max"), p.get("default"))
+                for p in d["params"] if p["dest"] in keep}
     assert surface(mock) == surface(real)
+    # The carrier is entered in MHz (like the PRN scripts' -Center-frequency), presets included.
+    freq = {p["dest"]: p for p in real["params"]}["freq"]
+    assert freq["unit"] == "MHz" and freq["default"] == 1575.42
+    assert (freq["min"], freq["max"]) == (70.0, 6000.0)
+    vals = [p.get("value") if isinstance(p, dict) else (p[1] if isinstance(p, (list, tuple)) else p)
+            for p in freq["presets"]]
+    assert 1575.42 in vals and 1227.6 in vals and all(70.0 <= v <= 6000.0 for v in vals)
 
 
 def test_uncalibrated_power_is_refused():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_AGENT) + os.pathsep + env.get("PYTHONPATH", "")
-    out = subprocess.run([sys.executable, str(_MOCK), "--freq", "1575.42e6",
+    out = subprocess.run([sys.executable, str(_MOCK), "--freq", "1575.42",
                           "--power", "-60", "--once"],
                          capture_output=True, text=True, env=env, timeout=30)
     assert out.returncode == 2

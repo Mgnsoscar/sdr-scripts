@@ -22,8 +22,8 @@ relative --gain. The tone frequency (--freq) retunes live too.
 
 CLI
 ───
-    cw_tx.py --freq 1575.42e6 --power -30 --rf on      # calibrated dBm at L1
-    cw_tx.py --freq 1227.6e6 --gain 60 --rf on         # relative gain at L2
+    cw_tx.py --freq 1575.42 --power -30 --rf on        # calibrated dBm at L1 (MHz)
+    cw_tx.py --freq 1227.6 --gain 60 --rf on           # relative gain at L2
     cw_tx.py --describe-params  # paramkit JSON schema for the GUI
 """
 from __future__ import annotations
@@ -91,18 +91,20 @@ def power_map() -> PowerMap:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
+# Named GNSS carriers in MHz — the unit --freq is declared in (the GUI shows/enters MHz, like
+# the PRN scripts' -Center-frequency); main() scales to Hz once at the boundary.
 FREQUENCIES = {
-    "GPS L1 / Galileo E1 / BeiDou B1C (1575.42 MHz)": 1575.42e6,
-    "GPS L2 (1227.60 MHz)": 1227.60e6,
-    "GPS L5 / Galileo E5a (1176.45 MHz)": 1176.45e6,
-    "Galileo E5b / BeiDou B2b (1207.14 MHz)": 1207.14e6,
-    "Galileo E5 centre (1191.795 MHz)": 1191.795e6,
-    "Galileo E6 (1278.75 MHz)": 1278.75e6,
-    "BeiDou B1I (1561.098 MHz)": 1561.098e6,
-    "BeiDou B3I (1268.52 MHz)": 1268.52e6,
-    "GLONASS L1 (1602.0 MHz)": 1602.0e6,
-    "GLONASS L2 (1246.0 MHz)": 1246.0e6,
-    "Iridium (1621.25 MHz)": 1621.25e6,
+    "GPS L1 / Galileo E1 / BeiDou B1C (1575.42 MHz)": 1575.42,
+    "GPS L2 (1227.60 MHz)": 1227.60,
+    "GPS L5 / Galileo E5a (1176.45 MHz)": 1176.45,
+    "Galileo E5b / BeiDou B2b (1207.14 MHz)": 1207.14,
+    "Galileo E5 centre (1191.795 MHz)": 1191.795,
+    "Galileo E6 (1278.75 MHz)": 1278.75,
+    "BeiDou B1I (1561.098 MHz)": 1561.098,
+    "BeiDou B3I (1268.52 MHz)": 1268.52,
+    "GLONASS L1 (1602.0 MHz)": 1602.0,
+    "GLONASS L2 (1246.0 MHz)": 1246.0,
+    "Iridium (1621.25 MHz)": 1621.25,
 }
 
 
@@ -153,10 +155,10 @@ def build_script() -> Script:
                "modulation, no drift). Level is set in dBm via the unit's calibration, or a "
                "relative gain uncalibrated. For a drifting tone use cw_drift_tx.py. Transmit "
                "only into an authorised, shielded setup.")
-        .number("-Frequency", "--freq", unit="Hz", min=70e6, max=6e9,
-                presets=FREQUENCIES, default=1575.42e6, required=True, live=True,
-                help="Tone frequency. Presets are GNSS carriers; any value allowed. --power "
-                     "is calibrated here. Live.")
+        .number("-Frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=1575.42, required=True, live=True,
+                help="Tone frequency in MHz. Presets are GNSS carriers; any value allowed. "
+                     "--power is calibrated here. Live.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=True, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Bounds track the unit's "
@@ -183,7 +185,7 @@ def main() -> int:
     script = build_script()
     args = script.parse()
 
-    freq = float(args.freq)
+    freq = float(args.freq) * 1e6                   # --freq is MHz; everything below is Hz
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
     # else it runs uncalibrated — a relative gain only (no baked behaviour).
     pmap = power_map()
@@ -238,12 +240,14 @@ def main() -> int:
 
     def apply_change(name, value):
         if name == "freq":
-            # A live retune re-tunes the LO and, on a frequency-dependent chain, re-maps the
-            # held target power at the new frequency so delivered power stays as requested.
-            hz = float(value)
+            # A live retune (MHz, the param's unit) re-tunes the LO and, on a frequency-
+            # dependent chain, re-maps the held target power at the new frequency so
+            # delivered power stays as requested.
+            mhz = float(value)
+            hz = mhz * 1e6
             tb.set_center_frequency(hz)
             state["freq"] = hz
-            ctrl.report("freq", hz)
+            ctrl.report("freq", mhz)
             if state.get("power") is not None:
                 state["gain"] = pmap.gain_for_power(state["power"], freq=hz)
                 if state["rf_on"]:

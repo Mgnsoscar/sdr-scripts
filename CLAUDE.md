@@ -35,6 +35,26 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — the CW scripts take their frequencies in MHz: COMPLETE (branch `claude/cw-drift-wide`, cross-repo seed)
+Owner ask: the CW scripts' frequency parameters in MHz (they were the only RPi calibrated signals
+still in Hz; the PRN/chirp scripts' `-Center-frequency` is MHz). `cw_tx.py` `--freq`, `cw_drift_tx.py`
+`--freq` + `--freq_end`, and the mock `mock_cw_tx.py` `--freq` now declare `unit="MHz"`, `min=70`,
+`max=6000`, defaults `1575.42` (/ `1575.43`), and the `FREQUENCIES` preset dict is MHz. Each `main()`
+scales ONCE at the boundary (`× 1e6`) — the fold, the planner math (`plan_lo`/`hop_count`/…, all Hz)
+and the radio are untouched; a live `--freq` tune scales the same way and reports back in MHz. The
+agent needs no change: its carrier derivation (`tune_log.freq_hz_of`, 1.27.2) scales by the DECLARED
+unit, so the attenuator / export / `SDR_CAL_FREQ_HZ` follow automatically. Cross-repo: the agent's
+sample seed (`sdr-agent/deploy/make_sample_sequences.py` → `sequences.json`) launches `mock_cw` with
+`--freq 1575.42` (was `1575420000`, which the MHz schema would refuse as > 6000). Existing saved tasks
+/ sequences that launch a CW script with a Hz value must be re-entered in MHz (the schema refuses
+the old value loudly rather than silently mis-tuning). The X410 `cw_channel.py` and the other RPi
+`Other Signals` scripts (noise/comb/mock_sdr) still take Hz — untouched. Tests: `tests/test_mock_cw.py`
+(`--freq 1300` vs `1600` on a biased chain differ by the flatness → the mock scales MHz→Hz before
+folding; the surface guard pins unit/min/max/default/presets), `tests/test_cw_drift.py` (schema in
+MHz; a fake `gnuradio` package lets the REAL `cw_drift_tx.py` / `cw_tx.py` `main()` run to their
+banner, which prints the Hz the MHz args became — `1600.000000 → 1300.000000 MHz`, 214 hops). Suite
+67 → 69.
+
 ## Current state — CW drift over hundreds of MHz / days (`cw_drift_tx.py` rewrite): COMPLETE (branch `claude/cw-drift-wide`, scripts-only)
 Owner ask: a CW that drifts hundreds of MHz over a very long time; one script for the plain single
 tone and one for the drift. The split already existed (`Other Signals/cw_tx.py` = the pure tone,
