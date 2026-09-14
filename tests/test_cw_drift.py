@@ -227,7 +227,10 @@ def test_schema_surface_and_shared_calibration_signal():
     by = {p["dest"]: p for p in drift["params"]}
     assert set(by) >= {"freq", "freq_end", "duration", "drift", "sample_rate", "hop_blank",
                        "power", "rf", "restart", "gain"}
-    assert by["duration"]["max"] == 7 * 86400 and by["duration"]["unit"] == "s"
+    # --duration is entered in MINUTES (7 days = 10080), default 10 min; the drift law runs in
+    # seconds behind the boundary (the banner test below proves the ×60).
+    assert by["duration"]["unit"] == "min" and by["duration"]["max"] == 7 * 24 * 60
+    assert by["duration"]["default"] == 10.0 and by["duration"]["min"] == 0.1
     # Both carriers are entered in MHz (like the PRN scripts' -Center-frequency); the planner
     # works in Hz behind the boundary. Presets + defaults are MHz too, on both scripts.
     for dest in ("freq", "freq_end"):
@@ -306,13 +309,16 @@ def _banner(tmp_path, script, args):
 
 def test_the_tone_scripts_take_mhz_and_run_in_hz(tmp_path):
     out = _banner(tmp_path, _DRIFT, ["--freq", "1600", "--freq_end", "1300", "--duration",
-                                     "10800", "--sample_rate", "2", "--power", "-30",
+                                     "180", "--sample_rate", "2", "--power", "-30",
                                      "--gain", "60", "--rf", "on"])
-    assert "1600.000000 → 1300.000000 MHz" in out and "WIDE — 300.000 MHz" in out
+    assert "1600.000000 → 1300.000000 MHz over 180 min" in out and "WIDE — 300.000 MHz" in out
     assert "214 analog-LO hops per pass" in out                 # the planner saw a 300 MHz span
+    # --duration is MINUTES: 300 MHz over 180 min = 3 h → −27.78 kHz/s (an unscaled 180 s would
+    # read −1.667 MHz/s).
+    assert "-27.78 kHz/s (-100 MHz/h)" in out
     out = _banner(tmp_path, _DRIFT, ["--freq", "1575.42", "--freq_end", "1575.43", "--duration",
-                                     "600", "--sample_rate", "2", "--power", "-30", "--gain", "60"])
-    assert "1575.420000 → 1575.430000 MHz" in out and "narrow" in out
+                                     "10", "--sample_rate", "2", "--power", "-30", "--gain", "60"])
+    assert "1575.420000 → 1575.430000 MHz over 10 min" in out and "narrow" in out
     out = _banner(tmp_path, _TONE, ["--freq", "1227.6", "--power", "-30", "--gain", "60"])
     assert "tone           : 1227.600000 MHz" in out
 

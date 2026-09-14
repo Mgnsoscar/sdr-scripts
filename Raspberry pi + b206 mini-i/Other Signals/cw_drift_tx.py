@@ -54,8 +54,8 @@ fire --restart to re-run the ramp from the start frequency.
 
 CLI
 ───
-    cw_drift_tx.py --freq 1575.42 --freq_end 1575.43 --duration 1200 --power -30 --rf on   # 10 kHz / 20 min (MHz)
-    cw_drift_tx.py --freq 1600 --freq_end 1300 --duration 10800 --power -30 --rf on       # 300 MHz / 3 h
+    cw_drift_tx.py --freq 1575.42 --freq_end 1575.43 --duration 20 --power -30 --rf on   # 10 kHz / 20 min (MHz, min)
+    cw_drift_tx.py --freq 1600 --freq_end 1300 --duration 180 --power -30 --rf on       # 300 MHz / 3 h
     cw_drift_tx.py --freq 1227.6 --freq_end 1228.6 --drift pingpong --gain 60 --rf on
     cw_drift_tx.py --self-test        # drift + LO-hop planner math, no hardware
     cw_drift_tx.py --describe-params  # paramkit JSON schema for the GUI
@@ -142,7 +142,8 @@ FREQUENCIES = {
 }
 SAMPLE_RATES_MHZ = {"1 MHz (narrow drift)": 1.0, "2 MHz (default)": 2.0, "5 MHz": 5.0,
                     "10 MHz (wide drift, fewer hops)": 10.0, "20 MHz": 20.0}
-MAX_DURATION_S = 7 * 86400.0     # 7 days — a "very long" drift is the point of this script
+MAX_DURATION_MIN = 7 * 24 * 60.0  # 7 days, in the MINUTES --duration is entered in — a "very long"
+                                  # drift is the point of this script; main() scales to seconds once
 DEFAULT_HOP_BLANK_MS = 20.0      # mute around each analog-LO hop (its synth relock settle)
 
 # Fraction of the sample rate the baseband tone may span before the LO hops. Keeps the tone
@@ -339,10 +340,11 @@ def build_script() -> Script:
                      "MHz included (a span wider than the baseband window is swept window by "
                      "window with blanked LO hops). Equal to --freq gives a static tone — "
                      "but use cw_tx.py for that.")
-        .number("-Duration", "--duration", unit="s", min=1.0, max=MAX_DURATION_S,
-                default=600.0,
-                help="Seconds to drift start→end — up to 7 days. The drift rate is "
-                     "(end − start) / duration; a 'once' drift then holds at the end.")
+        .number("-Duration", "--duration", unit="min", min=0.1, max=MAX_DURATION_MIN,
+                default=10.0,
+                help="Minutes to drift start→end — from a few seconds (0.1 = 6 s) up to 7 days "
+                     "(10080). The drift rate is (end − start) / duration; a 'once' drift then "
+                     "holds at the end.")
         .choice("-Drift", "--drift", options=["once", "loop", "pingpong"],
                 default="once",
                 help="once = ramp then hold at the end; loop = repeat start→end; pingpong = "
@@ -445,6 +447,7 @@ def main() -> int:
     start = float(args.freq) * 1e6
     end = float(args.freq_end) * 1e6 if args.freq_end and args.freq_end > 0 else start
     drifting = end != start
+    duration_s = float(args.duration) * 60.0    # --duration is MINUTES; the drift law runs in seconds
     span = abs(end - start)
     samp_rate = float(args.sample_rate) * 1e6
     half = half_window_hz(samp_rate)
@@ -493,11 +496,11 @@ def main() -> int:
         tb.set_gain(0.0)
         tb.set_amplitude(0.0)
 
-    rate = (end - start) / float(args.duration) if drifting else 0.0
+    rate = (end - start) / duration_s if drifting else 0.0
     print("── CW drift TX ─────────────────────────────────────────────")
     if drifting:
         print(f"  drift          : {start/1e6:.6f} → {end/1e6:.6f} MHz over "
-              f"{args.duration:g} s ({args.drift}) · {fmt_rate(rate)}")
+              f"{args.duration:g} min ({args.drift}) · {fmt_rate(rate)}")
         if wide:
             print(f"  sweep mode     : WIDE — {span/1e6:.3f} MHz in ±{half/1e6:.3f} MHz windows, "
                   f"{hops_per_pass} analog-LO hop{'s' if hops_per_pass != 1 else ''} per pass"
@@ -632,7 +635,7 @@ def main() -> int:
             t0 = nonlocal_t0[0]
             if t0 is not None and drifting:
                 now = time.monotonic()
-                emit(drift_freq(now - t0, start, end, float(args.duration), args.drift))
+                emit(drift_freq(now - t0, start, end, duration_s, args.drift))
                 if now >= next_progress:
                     next_progress = now + PROGRESS_EVERY_S
                     pct = 100.0 * abs(state["freq"] - start) / span if span else 0.0

@@ -35,6 +35,16 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — `cw_drift_tx.py --duration` in MINUTES: COMPLETE (branch `claude/cw-drift-wide`, scripts-only)
+Owner ask (after the MHz change): the drift's duration in minutes, not seconds. `--duration` now declares
+`unit="min"`, `min=0.1` (6 s), `max=MAX_DURATION_MIN` (7 days = 10080), `default=10.0` (was 600 s);
+`main()` scales once (`duration_s = args.duration × 60`) and the drift law / rate / progress line keep
+running in seconds (`drift_freq`, `fmt_rate` untouched; the banner reads `over 180 min · −27.78 kHz/s
+(−100 MHz/h)`). No agent/client change (a plain numeric field with a `min` unit label). A saved task
+that still passes the old seconds value drifts 60× too slowly — re-enter it in minutes. Test:
+`tests/test_cw_drift.py` (schema unit/range/default; the fake-`gnuradio` banner test asserts the
+rate, which only comes out right if the minutes were scaled). Suite unchanged at 69.
+
 ## Current state — the CW scripts take their frequencies in MHz: COMPLETE (branch `claude/cw-drift-wide`, cross-repo seed)
 Owner ask: the CW scripts' frequency parameters in MHz (they were the only RPi calibrated signals
 still in Hz; the PRN/chirp scripts' `-Center-frequency` is MHz). `cw_tx.py` `--freq`, `cw_drift_tx.py`
