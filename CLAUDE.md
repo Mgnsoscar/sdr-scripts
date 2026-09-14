@@ -56,6 +56,19 @@ static `argspec` reads the new schema as-is):
   start, end)` samples the sweep at start and the banner names each stretch where the ceiling sits below
   the request (`⚠ POWER … can't be delivered over X–Y MHz`; the gain clamps there — safe). A progress
   line every 5 min (`drift @ … MHz (N % of the span) · gain · LO hops so far`).
+- **The SDR/attenuator split is PINNED across the drift** (needs `sdr-agent` ≥ 1.27.2 on the unit —
+  `PowerMap.pinned_applied` / `gain_for_power(..., applied_db=)`). The agent positions a programmable
+  attenuator ONCE, at the launch carrier (the start frequency, from `CAL_FREQ_PARAM`); as the tone
+  moves the script folds only the SDR gain with that attenuation pinned (`state["applied"]`), never
+  re-realizing — re-picking the split at every new frequency would hop the ASSUMED attenuation by
+  whole steps while the physical attenuator stayed put (a 14.25 → 12.75 dB walk over a 300 MHz drift
+  on a frequency-dependent chain, i.e. up to 1.5 dB of power error). A live `--power` tune re-picks
+  the split at the START frequency (where the agent repositions the attenuator for it) and folds the
+  SDR gain at the live frequency with it pinned; `coverage_gaps(..., applied_db=)` checks the sweep
+  the same way; the banner names the pinned attenuation. No attenuator ⇒ `applied` is None, the plain
+  fold. Test: `tests/test_cw_drift.py::test_the_attenuator_split_is_pinned_across_the_drift` (an
+  engaged −4.5 dB-insertion attenuator: the pinned fold holds −100 dBm within 0.13 dB over the sweep
+  while the per-frequency realization would pick a different attenuation). Suite 66 → 67.
 - **Shared calibration signal** — `CAL_SIGNAL_ID` `"cw_drift"` → **`"cw_tone"`** (same as `cw_tx.py`): at
   any instant the drift IS a pure CW at one frequency at the same `AMPLITUDE`, so the same measured
   curve applies and one calibration serves both; the unit's source-flatness / cable tables supply the

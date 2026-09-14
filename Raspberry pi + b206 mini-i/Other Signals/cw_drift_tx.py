@@ -32,9 +32,13 @@ whole sweep. Where a frequency-dependent ceiling sits below the request the gain
 clamped at the ceiling (safe), and the script says so at start (the stretches affected).
 The drift shares the pure tone's calibration signal ("cw_tone"): at any instant it IS a
 pure CW at one frequency, at the same amplitude, so the same measured curve applies —
-the unit's frequency tables supply the rest. (With a programmable attenuator in the
-chain, the attenuator keeps the setting the agent commanded at launch; only the SDR gain
-is re-folded, which is exact while the SDR alone realises the level.)
+the unit's frequency tables supply the rest. With a programmable attenuator in the chain
+the SDR/attenuator SPLIT is chosen ONCE, at the drift's start frequency — the carrier the
+agent positions the attenuator at — and PINNED for the whole drift: as the tone moves only
+the SDR gain re-folds (PowerMap.gain_for_power(..., applied_db=…)), never the attenuation
+the agent set. (Re-realizing at every new frequency would hop the assumed attenuation by
+whole steps while the physical attenuator stayed put.) A live --power change re-picks the
+split at the start frequency — exactly where the agent repositions the attenuator for it.
 
 The drift runs on its own timeline from the moment the script starts — independent of
 RF. --rf on/off is a pure mute/unmute and does NOT start, stop, or restart the sweep;
@@ -220,11 +224,13 @@ def needs_refold(f_hz: float, folded_at_hz: float, step_hz: float = REFOLD_STEP_
 
 
 def coverage_gaps(pmap, power_dbm: float, start: float, end: float, samples: int = 41,
-                  tol_db: float = 0.3):
+                  tol_db: float = 0.3, applied_db=None):
     """Stretches of the sweep where `power_dbm` can't be delivered — the calibration's
     ceiling (a frequency-dependent limit / the flatness) sits below the request, so the gain
     clamps there. Samples the sweep and returns [(f_lo_hz, f_hi_hz, worst_dbm), …] (empty when
-    the whole sweep delivers the request within tol_db, or uncalibrated)."""
+    the whole sweep delivers the request within tol_db, or uncalibrated). `applied_db` is the
+    pinned attenuator setting the drift runs with (see main), so the check folds the SDR gain
+    exactly as the drift will."""
     if not getattr(pmap, "has_absolute", False) or samples < 2:
         return []
     lo, hi = (start, end) if start <= end else (end, start)
@@ -232,7 +238,8 @@ def coverage_gaps(pmap, power_dbm: float, start: float, end: float, samples: int
     for i in range(samples):
         f = lo + (hi - lo) * i / (samples - 1)
         try:
-            got = pmap.power_for_gain(pmap.gain_for_power(power_dbm, freq=f), freq=f)
+            g = pmap.gain_for_power(power_dbm, freq=f, applied_db=applied_db)
+            got = pmap.power_for_gain(g, freq=f, applied_db=applied_db)
         except Exception:                                   # noqa: BLE001 — skip the sample
             continue
         if power_dbm - got > tol_db:
@@ -447,11 +454,16 @@ def main() -> int:
     amplitude = pmap.amplitude
     # A raw --gain (relative / calibration knob) overrides the dBm mapping when present.
     gain_cal = getattr(args, "gain", None)          # explicit --gain: a hard bench override
+    applied = None                                  # the chain's pinned attenuator setting (dB)
     if gain_cal is not None:
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(gain_cal)))
     elif pmap.has_absolute:                         # calibrated: the authored absolute --power
-        # Fold the calibration at the drift START; the loop re-folds it as the tone moves.
-        gain_db = pmap.gain_for_power(args.power, freq=start)
+        # Fold the calibration at the drift START — the carrier the agent realizes the chain's
+        # active components (an attenuator) at. That SPLIT is pinned for the whole drift: as the
+        # tone moves only the SDR gain re-folds (refold below), never the attenuation the agent
+        # physically set. None (no active component) folds the SDR alone.
+        applied = pmap.pinned_applied(args.power, freq=start)
+        gain_db = pmap.gain_for_power(args.power, freq=start, applied_db=applied)
     else:                                           # uncalibrated: a persisted fallback gain, or refuse
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -469,6 +481,7 @@ def main() -> int:
     # `fold_f` is the frequency the gain was last folded at.
     state = {"rf_on": getattr(args, "rf", "off") == "on", "gain": gain_db,
              "power": args.power if (pmap.has_absolute and gain_cal is None) else None,
+             "applied": applied,
              "freq": start, "lo": lo0, "fold_f": start,
              "blank_s": float(getattr(args, "hop_blank", DEFAULT_HOP_BLANK_MS)) / 1e3,
              "hops": 0}
@@ -494,15 +507,18 @@ def main() -> int:
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})"
               + (" — re-folded along the sweep" if drifting and gain_cal is None else ""))
-        print(f"  power (achieved on grid): {pmap.power_for_gain(gain_db, freq=start):.2f} dBm "
-              f"at {start/1e6:.3f} MHz")
+        print(f"  power (achieved on grid): "
+              f"{pmap.power_for_gain(gain_db, freq=start, applied_db=applied):.2f} dBm "
+              f"at {start/1e6:.3f} MHz"
+              + (f" (attenuator pinned at {-applied:g} dB)" if applied else ""))
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.describe()}")
     if pmap.warning:                       # e.g. calibration amplitude != this
         print(f"  ⚠ CALIBRATION  : {pmap.warning}")   # script's fixed amplitude
     if drifting and state["power"] is not None:
-        for f_lo, f_hi, worst in coverage_gaps(pmap, state["power"], start, end):
+        for f_lo, f_hi, worst in coverage_gaps(pmap, state["power"], start, end,
+                                               applied_db=state["applied"]):
             print(f"  ⚠ POWER        : {state['power']:g} dBm can't be delivered over "
                   f"{f_lo/1e6:.1f}–{f_hi/1e6:.1f} MHz (ceiling there ≈ {worst:.1f} dBm) — "
                   f"the tone is clamped to the ceiling in that stretch")
@@ -530,7 +546,7 @@ def main() -> int:
         if not force and not needs_refold(f, state["fold_f"]):
             return
         state["fold_f"] = f
-        g = pmap.gain_for_power(state["power"], freq=f)
+        g = pmap.gain_for_power(state["power"], freq=f, applied_db=state["applied"])
         if abs(g - state["gain"]) > 1e-9:
             apply_gain(g)
 
@@ -558,13 +574,18 @@ def main() -> int:
 
     def apply_change(name, value):
         if name == "power":
-            # dBm → gain via the calibration folded at the LIVE frequency; staged, applied
-            # only when RF is on.
+            # A new level re-picks the SDR/attenuator split at the START frequency — exactly
+            # where the agent repositions the attenuator for this tune — then folds the SDR
+            # gain at the LIVE frequency with that split pinned. Staged, applied only when RF
+            # is on.
             state["power"] = float(value)
             state["fold_f"] = state["freq"]
-            apply_gain(pmap.gain_for_power(state["power"], freq=state["freq"]))
+            state["applied"] = pmap.pinned_applied(state["power"], freq=start)
+            apply_gain(pmap.gain_for_power(state["power"], freq=state["freq"],
+                                           applied_db=state["applied"]))
             g = tb.actual_gain() if state["rf_on"] else state["gain"]
-            ctrl.report("power", round(pmap.power_for_gain(g, freq=state["freq"]), 2))
+            ctrl.report("power", round(pmap.power_for_gain(g, freq=state["freq"],
+                                                           applied_db=state["applied"]), 2))
         elif name == "gain":
             # Calibration knob: raw TX gain (dB), bypassing the dBm mapping (and the refold).
             state["power"] = None

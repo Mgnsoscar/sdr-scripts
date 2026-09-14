@@ -185,6 +185,31 @@ def test_coverage_gaps_name_the_stretch_where_the_ceiling_bites():
     assert cwd.coverage_gaps(PowerMap.uncalibrated(0.0, 80.0, 0.5), -30.0, S, E) == []
 
 
+def test_the_attenuator_split_is_pinned_across_the_drift():
+    # A chain with a programmable attenuator (insertion −4.5 dB, engaged from mid-gain — the
+    # SDR is held at the engagement threshold and the attenuator absorbs the rest, so the split
+    # it picks follows the flatness): the agent positions it at the START carrier; the drift
+    # must fold only the SDR gain from there on (PowerMap pinned fold), never re-pick the split
+    # — and the coverage check folds the same way.
+    d = _doc(bias=[(1.3e9, -3.0), (1.6e9, 3.0)])
+    d["chain"]["planes"]["atten_out"] = {
+        "type": "derived", "from": "sdr_output", "delta_db": -4.5,
+        "control": {"task": "atten_set", "param": "attenuation", "sense": "attenuation",
+                    "min_db": 0.0, "max_db": 95.0, "step_db": 0.25, "engage_pct": 50.0}}
+    d["chain"]["operating_plane"] = "atten_out"
+    pm = _pmap(d)
+    pin = pm.pinned_applied(-100.0, freq=S)
+    assert pin is not None and pin < 0.0                  # engaged: a real attenuation
+    for f in (S, 1500e6, 1400e6, E):
+        g = pm.gain_for_power(-100.0, freq=f, applied_db=pin)
+        assert abs(pm.power_for_gain(g, freq=f, applied_db=pin) - (-100.0)) <= 0.13
+    assert cwd.coverage_gaps(pm, -100.0, S, E, applied_db=pin) == []
+    # Without the pin the realization hops to another attenuation along the sweep (the SDR
+    # stays at the threshold, so the flatness lands in the attenuator) — the very mismatch
+    # pinning prevents.
+    assert any(pm.pinned_applied(-100.0, freq=f) != pin for f in (1500e6, 1400e6, E))
+
+
 def test_fmt_rate_reads_in_the_right_units():
     assert cwd.fmt_rate(-300e6 / 10800.0) == "-27.78 kHz/s (-100 MHz/h)"
     assert cwd.fmt_rate(10e3 / 1200.0) == "8.333 Hz/s (30 kHz/h)"
