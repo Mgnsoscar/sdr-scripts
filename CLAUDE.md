@@ -35,6 +35,86 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — `cw_drift_tx.py --duration` in MINUTES: COMPLETE (branch `claude/cw-drift-wide`, scripts-only)
+Owner ask (after the MHz change): the drift's duration in minutes, not seconds. `--duration` now declares
+`unit="min"`, `min=0.1` (6 s), `max=MAX_DURATION_MIN` (7 days = 10080), `default=10.0` (was 600 s);
+`main()` scales once (`duration_s = args.duration × 60`) and the drift law / rate / progress line keep
+running in seconds (`drift_freq`, `fmt_rate` untouched; the banner reads `over 180 min · −27.78 kHz/s
+(−100 MHz/h)`). No agent/client change (a plain numeric field with a `min` unit label). A saved task
+that still passes the old seconds value drifts 60× too slowly — re-enter it in minutes. Test:
+`tests/test_cw_drift.py` (schema unit/range/default; the fake-`gnuradio` banner test asserts the
+rate, which only comes out right if the minutes were scaled). Suite unchanged at 69.
+
+## Current state — the CW scripts take their frequencies in MHz: COMPLETE (branch `claude/cw-drift-wide`, cross-repo seed)
+Owner ask: the CW scripts' frequency parameters in MHz (they were the only RPi calibrated signals
+still in Hz; the PRN/chirp scripts' `-Center-frequency` is MHz). `cw_tx.py` `--freq`, `cw_drift_tx.py`
+`--freq` + `--freq_end`, and the mock `mock_cw_tx.py` `--freq` now declare `unit="MHz"`, `min=70`,
+`max=6000`, defaults `1575.42` (/ `1575.43`), and the `FREQUENCIES` preset dict is MHz. Each `main()`
+scales ONCE at the boundary (`× 1e6`) — the fold, the planner math (`plan_lo`/`hop_count`/…, all Hz)
+and the radio are untouched; a live `--freq` tune scales the same way and reports back in MHz. The
+agent needs no change: its carrier derivation (`tune_log.freq_hz_of`, 1.27.2) scales by the DECLARED
+unit, so the attenuator / export / `SDR_CAL_FREQ_HZ` follow automatically. Cross-repo: the agent's
+sample seed (`sdr-agent/deploy/make_sample_sequences.py` → `sequences.json`) launches `mock_cw` with
+`--freq 1575.42` (was `1575420000`, which the MHz schema would refuse as > 6000). Existing saved tasks
+/ sequences that launch a CW script with a Hz value must be re-entered in MHz (the schema refuses
+the old value loudly rather than silently mis-tuning). The X410 `cw_channel.py` and the other RPi
+`Other Signals` scripts (noise/comb/mock_sdr) still take Hz — untouched. Tests: `tests/test_mock_cw.py`
+(`--freq 1300` vs `1600` on a biased chain differ by the flatness → the mock scales MHz→Hz before
+folding; the surface guard pins unit/min/max/default/presets), `tests/test_cw_drift.py` (schema in
+MHz; a fake `gnuradio` package lets the REAL `cw_drift_tx.py` / `cw_tx.py` `main()` run to their
+banner, which prints the Hz the MHz args became — `1600.000000 → 1300.000000 MHz`, 214 hops). Suite
+67 → 69.
+
+## Current state — CW drift over hundreds of MHz / days (`cw_drift_tx.py` rewrite): COMPLETE (branch `claude/cw-drift-wide`, scripts-only)
+Owner ask: a CW that drifts hundreds of MHz over a very long time; one script for the plain single
+tone and one for the drift. The split already existed (`Other Signals/cw_tx.py` = the pure tone,
+`cw_drift_tx.py` = the drift), but the drift script capped the duration at 20 min, REFUSED any span
+wider than the baseband window (`drift range >= samp_rate` → error, so a few MHz on a Pi) and folded
+`--power` at the START frequency only. Rewritten (scripts-only; no agent/client change — the agent's
+static `argspec` reads the new schema as-is):
+- **Wide sweeps via LO hops** — the X410 `cw_channel.py` planner ported (`plan_lo`, `SWEEP_MARGIN` 0.7):
+  the software NCO carries the tone within a window of `0.7·sample_rate`; at a window edge the analog LO
+  hops one window and the NCO wraps, BLANKED (`--hop_blank`, 20 ms default, live) to hide the synth
+  relock. `half_window_hz` / `is_wide` / `initial_lo` (a window grid centred on the sweep) /
+  `hop_count` (closed form) are pure helpers. 300 MHz at 2 MHz = 214 hops (one 20 ms blank per ~50 s of
+  a 3 h drift); at 10 MHz = 42. A narrow drift (span ≤ one window) is unchanged: LO fixed at the centre,
+  fully continuous. `--duration` max 20 min → **7 days** (`MAX_DURATION_S`); sample-rate presets 1/2/5/
+  10/20 MHz (the 40 MHz preset dropped — a Pi can't stream it; the hardware max 61.44 stays accepted).
+- **Calibrated power tracks the drift** — the held `--power` is re-folded through the calibration at the
+  LIVE frequency every `REFOLD_STEP_HZ` (250 kHz) of movement (`needs_refold` → `gain_for_power(freq=f)`,
+  the gain applied only when it changes; raw `--gain` is never re-folded). `coverage_gaps(pmap, power,
+  start, end)` samples the sweep at start and the banner names each stretch where the ceiling sits below
+  the request (`⚠ POWER … can't be delivered over X–Y MHz`; the gain clamps there — safe). A progress
+  line every 5 min (`drift @ … MHz (N % of the span) · gain · LO hops so far`).
+- **The SDR/attenuator split is PINNED across the drift** (needs `sdr-agent` ≥ 1.27.2 on the unit —
+  `PowerMap.pinned_applied` / `gain_for_power(..., applied_db=)`). The agent positions a programmable
+  attenuator ONCE, at the launch carrier (the start frequency, from `CAL_FREQ_PARAM`); as the tone
+  moves the script folds only the SDR gain with that attenuation pinned (`state["applied"]`), never
+  re-realizing — re-picking the split at every new frequency would hop the ASSUMED attenuation by
+  whole steps while the physical attenuator stayed put (a 14.25 → 12.75 dB walk over a 300 MHz drift
+  on a frequency-dependent chain, i.e. up to 1.5 dB of power error). A live `--power` tune re-picks
+  the split at the START frequency (where the agent repositions the attenuator for it) and folds the
+  SDR gain at the live frequency with it pinned; `coverage_gaps(..., applied_db=)` checks the sweep
+  the same way; the banner names the pinned attenuation. No attenuator ⇒ `applied` is None, the plain
+  fold. Test: `tests/test_cw_drift.py::test_the_attenuator_split_is_pinned_across_the_drift` (an
+  engaged −4.5 dB-insertion attenuator: the pinned fold holds −100 dBm within 0.13 dB over the sweep
+  while the per-frequency realization would pick a different attenuation). Suite 66 → 67.
+- **Shared calibration signal** — `CAL_SIGNAL_ID` `"cw_drift"` → **`"cw_tone"`** (same as `cw_tx.py`): at
+  any instant the drift IS a pure CW at one frequency at the same `AMPLITUDE`, so the same measured
+  curve applies and one calibration serves both; the unit's source-flatness / cable tables supply the
+  frequency dependence. A unit that had a separate `cw_drift` signal calibrated keeps it unused.
+  `CAL_FREQ_PARAM` stays `freq` (the client folds the shown range at the start; the script re-folds).
+- `--rf` is marked `is_rf=True` on BOTH real CW scripts (the mock already had it), so the client's RF
+  auto-gating / run-log muting recognise the gate by the marker, not only the on/off convention.
+- `--self-test` re-derives the planner over a 300 MHz sweep at 2 + 10 MHz (offset within ±half, hop
+  count == `hop_count`). Tests: `tests/test_cw_drift.py` (drift modes; wide-sweep walk at 2/10 MHz — NCO
+  never leaves the window, hops per window, symmetric grid, up == down; narrow never hops; loop/pingpong
+  wraps; refold cadence + a 6 dB flatness rise moves the gain 6 dB; coverage gaps name a 15 dB dip and
+  stay silent for a deliverable level / uncalibrated; `fmt_rate`; the argspec surface incl. the shared
+  signal id, 7-day max, presets; `--self-test` + `--describe-params` subprocesses). Suite 55 → 66.
+  Not verified on hardware (no radio here): the hop path is the proven `set_center_freq` + `set_tone`
+  sequence, mute-wrapped.
+
 ## Current state — mock PRN + CW for the headless test unit: COMPLETE (branch `claude/hold-step-phase-0-wwwxf7`, cross-repo)
 Two new NO-HARDWARE mock transmitters so the local, headless integration unit (sdr-agent
 `deploy/run_local.sh`) has one armable mock per signal family — a **PRN**, a **chirp** and a **CW** —

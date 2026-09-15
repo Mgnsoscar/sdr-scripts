@@ -24,10 +24,10 @@ relative --gain. Three ways to supply one:
 
 CLI
 ───
-    mock_cw_tx.py --calibration cal.json --freq 1575.42e6 --power -30 --once
+    mock_cw_tx.py --calibration cal.json --freq 1575.42 --power -30 --once   # --freq in MHz
     mock_cw_tx.py --gain 60 --once            # raw-gain override
     PYTHONPATH=/path/to/sdr-agent mock_cw_tx.py --make-sample-calibration cal.json
-    mock_cw_tx.py --freq 1575.42e6 --power -30 --rf on   # run like a task (no hardware)
+    mock_cw_tx.py --freq 1575.42 --power -30 --rf on     # run like a task (no hardware)
     mock_cw_tx.py --self-test                 # exercise the dBm→gain math, no loop
     mock_cw_tx.py --describe-params           # paramkit JSON schema for the GUI
 """
@@ -61,19 +61,20 @@ GAIN_AT_MAX_DB = 89.75              # gain ceiling: never command a gain above t
 HW_MAX_GAIN_DB = 89.75             # B200-mini physical TX-gain ceiling
 AMPLITUDE = 0.5                    # the amplitude the calibration is measured at
 
-# Named GNSS carriers (Hz), same preset list as the real tone so the form matches.
+# Named GNSS carriers in MHz (the unit --freq is declared in), same preset list as the real tone
+# so the form matches; main() scales to Hz once at the boundary.
 FREQUENCIES = {
-    "GPS L1 / Galileo E1 / BeiDou B1C (1575.42 MHz)": 1575.42e6,
-    "GPS L2 (1227.60 MHz)": 1227.60e6,
-    "GPS L5 / Galileo E5a (1176.45 MHz)": 1176.45e6,
-    "Galileo E5b / BeiDou B2b (1207.14 MHz)": 1207.14e6,
-    "Galileo E5 centre (1191.795 MHz)": 1191.795e6,
-    "Galileo E6 (1278.75 MHz)": 1278.75e6,
-    "BeiDou B1I (1561.098 MHz)": 1561.098e6,
-    "BeiDou B3I (1268.52 MHz)": 1268.52e6,
-    "GLONASS L1 (1602.0 MHz)": 1602.0e6,
-    "GLONASS L2 (1246.0 MHz)": 1246.0e6,
-    "Iridium (1621.25 MHz)": 1621.25e6,
+    "GPS L1 / Galileo E1 / BeiDou B1C (1575.42 MHz)": 1575.42,
+    "GPS L2 (1227.60 MHz)": 1227.60,
+    "GPS L5 / Galileo E5a (1176.45 MHz)": 1176.45,
+    "Galileo E5b / BeiDou B2b (1207.14 MHz)": 1207.14,
+    "Galileo E5 centre (1191.795 MHz)": 1191.795,
+    "Galileo E6 (1278.75 MHz)": 1278.75,
+    "BeiDou B1I (1561.098 MHz)": 1561.098,
+    "BeiDou B3I (1268.52 MHz)": 1268.52,
+    "GLONASS L1 (1602.0 MHz)": 1602.0,
+    "GLONASS L2 (1246.0 MHz)": 1246.0,
+    "Iridium (1621.25 MHz)": 1621.25,
 }
 
 log = logging.getLogger("mock_cw_tx")
@@ -127,10 +128,10 @@ def build_script() -> Script:
                "(a single steady tone, calibrated dBm --power), but logs the SDR gain it would "
                "command instead of transmitting. Level is set in dBm via the unit's calibration; "
                "uncalibrated it runs on a relative gain.")
-        .number("-Frequency", "--freq", unit="Hz", min=70e6, max=6e9,
-                presets=FREQUENCIES, default=1575.42e6, required=True, live=True,
-                help="Tone frequency. Presets are GNSS carriers; any value allowed. --power "
-                     "is calibrated here. Live.")
+        .number("-Frequency", "--freq", unit="MHz", min=70.0, max=6000.0,
+                presets=FREQUENCIES, default=1575.42, required=True, live=True,
+                help="Tone frequency in MHz. Presets are GNSS carriers; any value allowed. "
+                     "--power is calibrated here. Live.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=True, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -181,7 +182,7 @@ def _make_sample_calibration(out_path: str) -> int:
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(artifact, fh, indent=2)
     print(f"wrote sample {CAL_SIGNAL_ID} calibration → {out_path}")
-    print("run e.g.:  mock_cw_tx.py --calibration %s --freq 1575.42e6 --power -30 --once"
+    print("run e.g.:  mock_cw_tx.py --calibration %s --freq 1575.42 --power -30 --once"
           % out_path)
     return 0
 
@@ -247,7 +248,7 @@ def main() -> int:
 
     script = build_script()
     args = script.parse()
-    freq = float(args.freq)
+    freq = float(args.freq) * 1e6                    # --freq is MHz; the fold + radio take Hz
 
     pmap = power_map()
     amplitude = pmap.amplitude
@@ -291,10 +292,11 @@ def main() -> int:
 
     def apply_change(name, value):
         if name == "freq":
-            hz = float(value)
+            mhz = float(value)                       # the param's unit; reported back as such
+            hz = mhz * 1e6
             radio.set_center_frequency(hz)
             state["freq"] = hz
-            ctrl.report("freq", hz)
+            ctrl.report("freq", mhz)
             if state.get("power") is not None:
                 state["gain"] = pmap.gain_for_power(state["power"], freq=hz)
                 if state["rf_on"]:
