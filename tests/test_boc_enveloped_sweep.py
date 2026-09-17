@@ -93,22 +93,49 @@ def test_argspec_surface_and_reuse():
     assert by["inner_sidelobes"]["max"] == bs.MAX_INNER_SIDELOBES and by["inner_sidelobes"]["default"] == 0
     assert by["rf"].get("is_rf") is True
     assert by["main_lobe_frac"]["hidden"] is True
+    assert by["deliver_frac"]["hidden"] is True            # full-power notch key (hidden derived)
 
     laws = {l["id"]: l for l in spec["calibration_power_laws"]}
     assert set(laws) == {"full_power", "main_lobe_power"}
+    assert laws["full_power"]["param"] == "deliver_frac"   # full power tracks the inner notch
 
 
 def test_power_laws_evaluate():
     from paramkit.power_law import parse_law
     import math
     laws = {l["id"]: l for l in extract_params(_BOC.read_text(encoding="utf-8"))["calibration_power_laws"]}
-    assert parse_law(laws["full_power"]).delta_db({}) == pytest.approx(70.0)
+    full = parse_law(laws["full_power"])
+    # centre kept (deliver_frac 1.0) → the bandwidth-invariant constant-envelope total, density + 70
+    assert full.delta_db({"deliver_frac": bs.deliver_frac(0)}) == pytest.approx(70.0)
     main = parse_law(laws["main_lobe_power"])
     d0 = main.delta_db({"main_lobe_frac": bs.main_lobe_frac(0)})
     assert d0 == pytest.approx(70.0 + 10 * math.log10(bs.main_lobe_frac(0)))
-    assert d0 < 70.0                                        # main lobes below the full signal
-    # the M-code note: full(0) sits ~0.39 dB above the main lobes (the ±15.345 band passes the gap)
+    assert d0 < 70.0                                        # main lobes below the un-notched full signal
+    # the M-code note: un-notched full(0) sits ~0.39 dB above the main lobes (the ±15.345 band
+    # passes the low-power centre gap)
     assert 70.0 - d0 == pytest.approx(0.39, abs=0.05)
+
+
+def test_full_power_is_exact_under_the_inner_notch():
+    """With --inner-sidelobes notching the centre gap, Full-signal power reports the DELIVERED
+    total (the discarded gap is subtracted via `deliver_frac`); at 0 sidelobes the notched signal
+    IS the two main lobes, so full == main-lobes exactly."""
+    from paramkit.power_law import parse_law
+    import math
+    laws = {l["id"]: l for l in extract_params(_BOC.read_text(encoding="utf-8"))["calibration_power_laws"]}
+    full = parse_law(laws["full_power"])
+    main = parse_law(laws["main_lobe_power"])
+    assert bs.deliver_frac(0) == 1.0                       # centre kept → nothing lost
+    assert bs.deliver_frac(1) < 1.0                        # notched → the centre gap is discarded
+    # notched full = density + 70 + 10·log10(deliver_frac) — the centre gap is accounted for
+    dn = full.delta_db({"deliver_frac": bs.deliver_frac(1)})
+    assert dn == pytest.approx(70.0 + 10 * math.log10(bs.deliver_frac(1)))
+    assert dn < 70.0                                        # delivered below the un-notched total
+    # at 0 sidelobes the notched signal IS the two main lobes → full == main-lobes exactly
+    d_main0 = main.delta_db({"main_lobe_frac": bs.main_lobe_frac(0)})
+    assert dn == pytest.approx(d_main0, abs=1e-6)
+    # the ~0.4 dB discarded gap is the same order as the un-notched full-vs-lobes gap
+    assert -0.45 < 10 * math.log10(bs.deliver_frac(1)) < -0.30
 
 
 def test_main_lobe_frac_matches_the_boc_integral():

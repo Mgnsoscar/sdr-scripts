@@ -35,10 +35,12 @@ notches away the low-power gap between the two lobes (±5.115 MHz), leaving a cl
 Calibration REUSES the regular sweep's ("Chirp/Sweep"). Constant-envelope at the same amplitude,
 so at a given gain it delivers the IDENTICAL total power — the flat-sweep calibration already
 contains it. Offers FULL signal power (dBm) and MAIN-LOBES power (both split lobes; that minus a
-fixed BOC offset that tracks --sidelobes). MAIN-LOBES power is EXACT whether or not the centre is
-notched (the notch never touches the lobes) — so set --power in Main-lobes power when using
---inner-sidelobes; FULL signal power counts the pre-notch total (the notch discards the ~0.4 dB
-inner gap). Uncalibrated it runs on a relative --gain.
+fixed BOC offset that tracks --sidelobes). Both account for --inner-sidelobes: MAIN-LOBES power
+is notch-independent (the notch never touches the lobes), and FULL signal power reports the
+DELIVERED total — a hidden `deliver_frac` keyed on --inner-sidelobes subtracts the notched-out
+centre gap, so full power is EXACT at --sidelobes 0 (where the notched signal IS the two lobes,
+so full == main-lobes) and within ~0.02 dB at higher counts. Set --power in either whether or
+not the centre is notched. Uncalibrated it runs on a relative --gain.
 
 ⚠  RF SAFETY / LEGAL: many presets are live GNSS bands. Transmit ONLY into a shielded /
    conducted setup (cable + attenuators) you are LICENSED / AUTHORISED to use.
@@ -102,14 +104,41 @@ def main_lobe_frac(sidelobes: int) -> float:
     return _MAIN_LOBE_FRAC[n]
 
 
+# When --inner-sidelobes 1 NOTCHES the low-power gap between the two split lobes, the FILTER
+# discards that centre power, so the DELIVERED total is less than the constant-envelope total.
+# `deliver_frac` is the fraction of the in-band power that SURVIVES the notch: 1.0 with the centre
+# kept, else 1 − (centre-gap power / total in-band power), so the delivered full power is
+#   density + 70 + 10·log10(deliver_frac).
+# The centre-gap fraction of the total barely moves with --sidelobes (0.0854 → 0.0810 across
+# 0..3 sidelobes — a 0.02 dB spread), and at --sidelobes 0 the notched signal IS EXACTLY the two
+# main lobes, so deliver_frac(notch, 0 sidelobes) == main_lobe_frac(0). Keying it on
+# --inner-sidelobes ALONE (a plain `table` over an existing field, like main_lobe_frac) keeps it
+# a no-version-gate power law that works on any agent/client, EXACT at --sidelobes 0 and within
+# ~0.02 dB (« the 0.25 dB gain grid) at higher counts. --self-test re-derives the notch value
+# from the BOC integral so the baked constant can't drift. (True per-sidelobe exactness would need
+# a 2-parameter fold — a cross-repo eval_formula extension — for a ≤0.02 dB gain: not worth it.)
+_NOTCH_DELIVER_FRAC = 0.914610          # = main_lobe_frac(0): the notched sl-0 signal is the lobes
+_DELIVER_FRAC_ARGS = ["inner_sidelobes", 1.0, _NOTCH_DELIVER_FRAC]   # centre kept → 1.0; notched → this
+
+
+def deliver_frac(inner_sidelobes: int) -> float:
+    """Fraction of the in-band power delivered after the inner notch (1.0 when the centre gap is
+    kept; the gap is discarded when --inner-sidelobes notches it)."""
+    frac = _DELIVER_FRAC_ARGS[1:]
+    return frac[max(0, min(len(frac) - 1, int(inner_sidelobes)))]
+
+
 # Power-quantity conversion laws (ride through the static argspec to the client; the runtime folds
 # --power in the base density exactly like the chirp). k = 70 = 60 + 10·log10(CAL_MEAS_BW_MHZ).
-# Full signal power is the bandwidth-invariant total (= the flat sweep's total at this gain);
-# main-lobes power is that minus the fixed BOC offset, KEYED on --sidelobes via the hidden
-# `main_lobe_frac` derived field. `rep` = the value at the default sidelobe count.
+# Full signal power is the DELIVERED total — the constant-envelope total (= the flat sweep's total
+# at this gain) times the `deliver_frac` that survives the inner notch (1.0 with the centre kept),
+# KEYED on --inner-sidelobes; main-lobes power is that total minus the fixed BOC offset, KEYED on
+# --sidelobes via the hidden `main_lobe_frac` derived field. `rep` = the value at the default
+# (no-notch / default sidelobe) count.
 CAL_POWER_LAWS = [
     {"id": "full_power", "name": "Full signal power", "unit": "dBm",
-     "in": "density", "out": "abs", "k": 70.0},
+     "in": "density", "out": "abs", "k": 70.0,
+     "param": "deliver_frac", "coeff": 10.0, "ref": 1.0, "rep": 1.0},
     {"id": "main_lobe_power", "name": "Main-lobes power (both split lobes)", "unit": "dBm",
      "in": "density", "out": "abs", "k": 70.0,
      "param": "main_lobe_frac", "coeff": 10.0, "ref": 1.0, "rep": 0.914610},
@@ -377,6 +406,19 @@ def _self_test() -> int:
     print(f"inner notch  : centre {centre:+.1f}→{centre_n:+.1f} dB, main lobe {lobe_n:+.1f} dB "
           f"[{'OK' if notch_ok else 'FAIL'}]")
 
+    # 7) the baked deliver_frac (full power under the notch) matches the BOC integral: at 0
+    #    sidelobes the notched signal IS the two main lobes, so it must equal main_lobe_frac(0)
+    gap = np.sum(G[np.abs(grid) < BOC_NULL_HZ])                       # the notched-out centre gap
+    tot0 = np.sum(G[np.abs(grid) < MAIN_LOBE_NULLS * BOC_NULL_HZ])    # total in band at 0 sidelobes
+    notch0 = (tot0 - gap) / tot0                                      # what survives the notch @ sl 0
+    deliver_ok = (abs(deliver_frac(1) - notch0) < 5e-3               # baked ≡ BOC integral
+                  and deliver_frac(0) == 1.0                          # no notch → nothing lost
+                  and abs(deliver_frac(1) - main_lobe_frac(0)) < 5e-3)  # notched sl-0 == the lobes
+    ok = ok and deliver_ok
+    print(f"deliver frac : notch keeps {deliver_frac(1):.4f} "
+          f"({10 * np.log10(deliver_frac(1)):+.3f} dB) ≡ the two lobes at 0 sl "
+          f"[{'OK' if deliver_ok else 'FAIL'}]")
+
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
@@ -483,6 +525,11 @@ def build_script() -> Script:
                  formula={"table": _MAIN_LOBE_FRAC_ARGS},
                  help="Fraction of the BOC power inside the two main lobes at the current sidelobe "
                       "count. Feeds the main-lobes-power calibration law; not shown.")
+        .derived("-Deliver-fraction", name="deliver_frac", hidden=True,
+                 formula={"table": _DELIVER_FRAC_ARGS},
+                 help="Fraction of the in-band power delivered after the inner notch (1.0 with the "
+                      "centre gap kept; less when --inner-sidelobes notches it). Feeds the "
+                      "full-signal-power calibration law; not shown.")
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 is_rf=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
@@ -514,8 +561,10 @@ def main() -> int:
 
     def pwr_params() -> dict:
         """Live keyed-parameter values the calibration's power laws read: the BOC main-lobes
-        fraction at the current sidelobe count. Harmless when the calibration doesn't key on it."""
-        return {"main_lobe_frac": main_lobe_frac(shape["sidelobes"])}
+        fraction at the current sidelobe count and the delivered fraction at the current inner
+        notch. Harmless when the calibration doesn't key on them."""
+        return {"main_lobe_frac": main_lobe_frac(shape["sidelobes"]),
+                "deliver_frac": deliver_frac(shape["inner"])}
 
     pmap = power_map()
     amplitude = pmap.amplitude
@@ -582,8 +631,11 @@ def main() -> int:
     print(f"  filter         : on (always) — passband ±{finfo['edge_hz']/1e6:.2f} MHz "
           f"(= occupied band), {FILTER_TRANSITION_MHZ:g} MHz transition, {finfo['taps']} taps")
     if finfo.get("inner_hz", 0.0) > 0:
+        import math as _math
+        _drop_db = 10.0 * _math.log10(deliver_frac(inner))     # ≤ 0: the notched-out centre gap
         print(f"  inner notch    : centre gap dropped below ±{finfo['inner_hz']/1e6:.3f} MHz "
-              f"(clean split spectrum — set --power in Main-lobes power)")
+              f"(clean split spectrum; Full-signal power reports the delivered total, "
+              f"{_drop_db:+.2f} dB vs the un-notched total)")
     print(f"  otw            : {OTW_FORMAT}")
     print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     if gain_cal is not None:
@@ -654,8 +706,11 @@ def main() -> int:
                     ctrl.report("power", round(pmap.power_for_gain(
                         tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
         elif name == "inner_sidelobes":
-            # Only the FILTER changes (a notch of the centre gap); the trajectory, the main-lobes
-            # fraction and the gain are all unaffected — so just rebuild + swap, no power re-map.
+            # Only the FILTER changes (a notch of the centre gap); the trajectory, the lobes and
+            # the SDR gain are all unaffected (the constant-envelope power at this gain is the same
+            # — the notch just removes the low-power gap). So just rebuild + swap: no gain re-map.
+            # `deliver_frac` (fed to the full-signal-power reading) does move with the notch, so
+            # the client's full-power read-out re-folds; the delivered lobes are untouched.
             shape["inner"] = max(0, min(MAX_INNER_SIDELOBES, int(value)))
             regenerate()
             ctrl.report(name, value)
