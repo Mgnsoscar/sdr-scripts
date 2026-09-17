@@ -71,12 +71,11 @@ def _at(f, P, fq):
 
 def test_argspec_surface():
     spec = extract_params(_SWEEP.read_text(encoding="utf-8"))
-    assert spec["calibration_signal"] == "Enveloped Sweep"
+    assert spec["calibration_signal"] == "Chirp/Sweep"     # reuses the regular sweep's calibration
     assert spec["calibration_freq_param"] == "freq"
-    assert not spec.get("calibration_power_laws")          # single dBm quantity, no laws (v1)
 
     by = {p["dest"]: p for p in spec["params"]}
-    assert set(by) == {"power", "gain", "freq", "chip_rate", "sidelobes", "rf"}
+    assert {"power", "gain", "freq", "chip_rate", "sidelobes", "rf"} <= set(by)
     assert by["chip_rate"]["unit"] == "Mcps"
     assert by["chip_rate"]["default"] == pytest.approx(1.023)
     assert by["chip_rate"]["min"] == pytest.approx(es.CHIP_RATE_MIN_MCPS)
@@ -84,9 +83,47 @@ def test_argspec_surface():
     assert by["sidelobes"]["default"] == es.SIDELOBES_DEFAULT
     assert by["sidelobes"]["max"] == es.SIDELOBES_MAX
     assert by["freq"]["unit"] == "MHz"
-    # every knob is live; rf is flagged as the RF gate
-    assert all(by[d]["live"] for d in by)
+    # rf is flagged as the RF gate; the main-lobe law's key is a hidden derived field
     assert by["rf"].get("is_rf") is True
+    assert by["main_lobe_frac"]["hidden"] is True
+
+
+# ── calibration reuses the flat sweep + the full / main-lobe power laws ───────────
+
+def test_reuses_chirp_sweep_calibration_and_offers_full_and_main_lobe():
+    spec = extract_params(_SWEEP.read_text(encoding="utf-8"))
+    laws = {l["id"]: l for l in spec["calibration_power_laws"]}
+    assert set(laws) == {"full_power", "main_lobe_power"}
+    assert laws["full_power"]["unit"] == "dBm" and laws["main_lobe_power"]["unit"] == "dBm"
+
+
+def test_power_laws_evaluate():
+    from paramkit.power_law import parse_law
+    import math
+    laws = {l["id"]: l for l in extract_params(_SWEEP.read_text(encoding="utf-8"))["calibration_power_laws"]}
+    # full signal power = measured density + 70 (the constant-envelope total = the flat sweep's)
+    assert parse_law(laws["full_power"]).delta_db({}) == pytest.approx(70.0)
+    # main-lobe power = full + 10·log10(main_lobe_frac): 0 dB at 0 sidelobes, below full otherwise
+    main = parse_law(laws["main_lobe_power"])
+    assert main.delta_db({"main_lobe_frac": es.main_lobe_frac(0)}) == pytest.approx(70.0)
+    d3 = main.delta_db({"main_lobe_frac": es.main_lobe_frac(3)})
+    assert d3 == pytest.approx(70.0 + 10 * math.log10(es.main_lobe_frac(3)))
+    assert d3 < 70.0                                        # main lobe is below the full signal
+
+
+def test_main_lobe_frac_matches_the_sinc2_integral():
+    xx = np.linspace(-9, 9, 400001); s = np.sinc(xx) ** 2
+    ml = np.sum(s[np.abs(xx) < 1])
+    for sl in range(0, es.SIDELOBES_MAX + 1):
+        derived = ml / np.sum(s[np.abs(xx) < (sl + 1)])
+        assert es.main_lobe_frac(sl) == pytest.approx(derived, abs=1e-3)
+
+
+def test_sweep_stays_inside_the_occupied_band():
+    # the dwell trajectory never leaves ±roam → no time wasted outside the filter passband
+    for cr, sl in [(1.023e6, 3), (2.0e6, 1), (0.5e6, 8)]:
+        f = es._sinc2_dwell_freq(cr, sl, es.BUFFER_SAMPS)
+        assert float(np.max(np.abs(f))) <= es.roam_hz(cr, sl) + 1.0
 
 
 # ── constant envelope + seamless loop (dwell shaping, not amplitude) ──────────────

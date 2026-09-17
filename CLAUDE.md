@@ -35,6 +35,47 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — Enveloped Sweep (sinc² dwell-shaped constant-envelope sweep): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
+New `Other Signals/enveloped_sweep_tx.py`. A SEQUENTIAL swept tone whose TIME-AVERAGED PSD is
+shaped like a sinc² — energy concentrated at the centre — realised purely by DWELL TIME, not an
+amplitude envelope. Constant-envelope (full amplitude every instant, ~0 dB PAPR), so it delivers
+full power; the shaping redistributes WHERE the power lands, raising the centre PSD above a flat
+sweep at the same gain (owner-verified reasoning: at max gain amplitude² is already maxed, so
+only dwell time is free — `PSD(f) ∝ dwell(f)`). Design conversation settled: sequential (not a
+simultaneous multitone — that pays 11–23 dB crest factor for the same bell); dwell shaping (not
+an amplitude taper — that only lowers the edges and wastes power); sinc² only for v1.
+- **Mechanism** — `_sinc2_dwell_freq` drives the instantaneous frequency through the INVERSE CDF
+  of `S(f)=sinc²(f/chip_rate)`, so the tone dwells ∝ S(f). Swept symmetrically (out-and-back) so
+  the looped buffer closes with no reset (`--self-test` seam err ~6e-11); a tiny `DWELL_FLOOR`
+  lets the tone creep through the nulls (soft nulls ~-22 dB, leakage-limited — deeper needs a
+  longer buffer + lower floor, diminishing ~1 dB/doubling; owner chose to keep the 2 MB buffer).
+  Reuses the `fm_chirp` precompute-and-loop + always-on unity passband filter + `vector_source_c`
+  hot-swap. **The sweep is CONFINED to ±roam by construction** (the inverse-CDF maps all time into
+  the occupied band), so it never dwells outside the filter passband — `--self-test` asserts
+  `max|f| ≤ roam`.
+- **Params** — `--chip-rate` (Mcps ≡ MHz): the FIRST sinc² null sits at ±chip-rate (BPSK/PRN
+  convention); `--sidelobes` truncates the band to ±(sidelobes+1)·chip-rate; `--freq`/`--power`/
+  `--gain`/`--rf` + both shape knobs are live (a shape change rebuilds one sweep + swaps under the
+  top-block lock). Occupied band guarded to ≤ ±27 MHz (`check_roam`).
+- **Calibration REUSES the flat sweep's** — `CAL_SIGNAL_ID = "Chirp/Sweep"`. Both signals are
+  constant-envelope at amplitude 0.5, so at a given gain they deliver the IDENTICAL total power
+  (verified within 0.002 dB) — the unit's flat-sweep calibration already contains this signal's
+  power vs gain, no separate measurement. `CAL_POWER_LAWS` offer **`full_power`** (k=70, = the
+  flat sweep's bandwidth-invariant total = `fm_chirp`'s `fbw_power`) and **`main_lobe_power`**
+  (full + a fixed sinc² offset KEYED on `--sidelobes` via a hidden `main_lobe_frac` derived-field
+  table — −0.22 dB at 1 sl … −0.40 dB at 8 sl; frac(0)=1). So the flat sweep's passband PSD at a
+  gain gives this signal's full and main-lobe power at that gain. Runtime folds `--power` in the
+  base density exactly like the chirp (`pwr_params()` supplies the live `main_lobe_frac`). The
+  `main_lobe_frac` table is a baked literal (static AST reader) re-derived from the sinc² integral
+  in `--self-test` so it can't drift.
+- `argspec`/`ramp` untouched (drift guard intact); no agent/client change (laws + hidden key ride
+  through `argspec`; the client renders the same power card as the GPS density signals). NOT yet
+  wired into `run_local.sh`/the sample unit and no mock stand-in (candidates for a follow-up).
+  Tests: `tests/test_enveloped_sweep.py` (argspec surface + reuse; constant envelope + seam;
+  sinc² shape incl. −13.3 dB 1st sidelobe; chip-rate sets the null; sidelobes set the band;
+  confinement to ±roam; the full/main-lobe laws evaluate; main_lobe_frac ≡ sinc² integral;
+  `--self-test`/`--describe-params` subprocesses). Suite 69 → 83.
+
 ## Current state — `cw_drift_tx.py --duration` in MINUTES: COMPLETE (branch `claude/cw-drift-wide`, scripts-only)
 Owner ask (after the MHz change): the drift's duration in minutes, not seconds. `--duration` now declares
 `unit="min"`, `min=0.1` (6 s), `max=MAX_DURATION_MIN` (7 days = 10080), `default=10.0` (was 600 s);

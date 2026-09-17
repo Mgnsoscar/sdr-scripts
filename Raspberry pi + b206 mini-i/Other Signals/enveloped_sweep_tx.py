@@ -51,10 +51,14 @@ Live tuning (retune while transmitting, via paramkit.live)
     chip_rate  → rebuild buffer + swap    ┐ shape changes: regenerate one sweep in RAM and
     sidelobes  → rebuild buffer + swap    ┘ set_data() it under the top-block lock.
 
-Calibration: this is a CONSTANT-ENVELOPE signal, so its total delivered power maps to gain
-exactly like a CW tone — level is set in dBm via the unit's calibration (folded at the
-carrier), or a relative --gain uncalibrated. First iteration offers the single dBm quantity
-(no power-quantity laws); the shape decides where that power lands, not how much there is.
+Calibration REUSES the regular sweep's ("Chirp/Sweep"). Both are constant-envelope at the same
+amplitude, so at a given gain they deliver the IDENTICAL total power — the unit's flat-sweep
+calibration already contains this signal's power vs gain, no separate measurement. Two power
+quantities are offered: FULL signal power (= the flat sweep's total, dBm) and MAIN-LOBE power
+(that minus a fixed sinc² offset that tracks --sidelobes). So knowing the flat sweep's passband
+PSD at a gain gives this signal's full and main-lobe power at that gain. --power is set in dBm
+via the calibration (folded at the carrier), or a relative --gain uncalibrated. The shape
+decides WHERE the power lands, not how much there is.
 
 ⚠  RF SAFETY / LEGAL: many presets are live GNSS bands. Transmit ONLY into a shielded /
    conducted setup (cable + attenuators) you are LICENSED / AUTHORISED to use.
@@ -82,17 +86,63 @@ os.environ.setdefault("GR_DONT_LOAD_PREFS", "1")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from paramkit import Script, PowerMap
 
-# Stable calibration signal id. When a task sets SDR_CAL_SIGNAL_ID to this value the agent
-# injects this unit's resolved calibration (SDR_CALIBRATION_FILE); calkit reads it and
-# --power maps through the unit's MEASURED curve at its real operating plane. Absent it, the
-# script runs uncalibrated (relative gain only). Because the sweep is constant-envelope, the
-# same "delivered power vs gain" reference a CW tone gives applies here.
-CAL_SIGNAL_ID = "Enveloped Sweep"
+# Stable calibration signal id — the SAME as fm_chirp_tx.py's "Chirp/Sweep". A regular
+# (flat) sweep and this Enveloped Sweep are BOTH constant-envelope at the same baseband
+# amplitude, so at a given SDR gain they deliver the IDENTICAL total power (verified: within
+# 0.002 dB). The unit's flat-sweep calibration therefore already contains this signal's power
+# vs gain — no separate measurement. The agent injects the unit's resolved "Chirp/Sweep"
+# calibration (SDR_CALIBRATION_FILE); calkit folds --power through its MEASURED density curve
+# exactly as the chirp does. Absent it, the script runs uncalibrated (relative gain only).
+CAL_SIGNAL_ID = "Chirp/Sweep"
 
 # Which parameter carries the transmit frequency. A frequency-dependent calibration chain
 # has a --power scale that MOVES with frequency, so the map is folded at THIS param's value —
 # and it is live, so retuning the centre re-scales --power on the fly.
 CAL_FREQ_PARAM = "freq"
+
+# The sweep bandwidth (MHz) the shared "Chirp/Sweep" density is MEASURED at (matches
+# fm_chirp_tx.py). It fixes the constant that turns the measured peak density (dBm/Hz) into
+# the total signal power: full_dBm = density + 10·log10(CAL_MEAS_BW_MHZ·1e6) = density + 70.
+CAL_MEAS_BW_MHZ = 10.0
+
+# Fraction of a sinc²'s power inside the MAIN LOBE (±chip_rate) relative to the total kept out
+# to (sidelobes+1) nulls: main_lobe_dBm = full_dBm + 10·log10(frac). A pure geometric constant
+# of the sinc² shape and the sidelobe truncation — needs no measurement. Index by sidelobe
+# count 0..SIDELOBES_MAX; the 0-sidelobe case keeps only the main lobe, so frac = 1 (main lobe
+# IS the whole kept signal). Baked literal (the client's schema reader is a static AST reader);
+# --self-test re-derives it from the sinc² integral so the two can never silently drift.
+# The hidden `main_lobe_frac` derived field's table (a nearest-int lookup on --sidelobes). The
+# first element names the source field; the rest are the fractions for 0..SIDELOBES_MAX. Kept a
+# pure LITERAL so the client's static AST reader can extract it; --self-test re-derives it from
+# the sinc² integral so it can never silently drift.
+_MAIN_LOBE_FRAC_ARGS = [
+    "sidelobes",
+    1.000000, 0.950401, 0.934203, 0.926212, 0.921459, 0.918309, 0.916069, 0.914395, 0.913096,
+]
+_MAIN_LOBE_FRAC = _MAIN_LOBE_FRAC_ARGS[1:]     # the fractions alone, for the runtime lookup
+
+
+def main_lobe_frac(sidelobes: int) -> float:
+    """The main-lobe power fraction for `sidelobes` sidelobes kept (nearest, clamped)."""
+    n = max(0, min(len(_MAIN_LOBE_FRAC) - 1, int(sidelobes)))
+    return _MAIN_LOBE_FRAC[n]
+
+
+# Power-quantity conversion laws this signal OFFERS the calibration editor (they ride through
+# the static argspec to the client; the runtime folds --power in the base density exactly like
+# the chirp). Both convert the shared measured spectral density (dBm/Hz) to an absolute power
+# (dBm). Constants are LITERAL (read statically): k = 70 = 60 + 10·log10(CAL_MEAS_BW_MHZ). Full
+# signal power is the bandwidth-invariant total (same as the flat sweep's total at this gain);
+# main-lobe power is that minus the fixed sinc² offset, KEYED on --sidelobes via the hidden
+# `main_lobe_frac` derived field so it tracks the truncation. `rep` = the value at the default
+# sidelobe count, for range read-outs shown before a live --sidelobes is known.
+CAL_POWER_LAWS = [
+    {"id": "full_power", "name": "Full signal power", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 70.0},
+    {"id": "main_lobe_power", "name": "Main-lobe power", "unit": "dBm",
+     "in": "density", "out": "abs", "k": 70.0,
+     "param": "main_lobe_frac", "coeff": 10.0, "ref": 1.0, "rep": 0.926212},
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -309,6 +359,25 @@ def _self_test() -> int:
     print(f"sinc² shape  : main {main:+.1f} dB, 1st sidelobe {side1:+.1f} dB (ideal -13.3), "
           f"1st null {null1:+.1f} dB [{'OK' if shape_ok else 'FAIL'}]")
 
+    # 4) the sweep stays INSIDE the occupied band ±roam — it never dwells outside the filter
+    #    passband (the roam confines the trajectory by construction, so no time is wasted).
+    r = roam_hz(chip_rate_hz, sidelobes)
+    excess = float(np.max(np.abs(f))) - r
+    conf_ok = excess <= 1.0                       # within 1 Hz of the edge (sub-Hz mean residual)
+    ok = ok and conf_ok
+    print(f"confined     : max|f|={np.max(np.abs(f))/1e6:.4f} MHz vs roam {r/1e6:.4f} MHz "
+          f"(excess {excess:+.2e} Hz) [{'OK' if conf_ok else 'FAIL'}]")
+
+    # 5) the baked main-lobe-fraction table matches the sinc² integral (can't silently drift)
+    grid = np.linspace(-9, 9, 400001); s2 = np.sinc(grid) ** 2
+    ml = np.sum(s2[np.abs(grid) < 1])
+    frac_ok = True
+    for n, baked in enumerate(_MAIN_LOBE_FRAC):
+        derived = ml / np.sum(s2[np.abs(grid) < (n + 1)])
+        frac_ok = frac_ok and abs(derived - baked) < 1e-3
+    ok = ok and frac_ok
+    print(f"main-lobe tbl: baked ≡ sinc² integral (≤1e-3) [{'OK' if frac_ok else 'FAIL'}]")
+
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
@@ -387,9 +456,10 @@ def build_script() -> Script:
         Script("Enveloped Sweep transmitter — a CONSTANT-ENVELOPE swept tone whose averaged "
                "spectrum is shaped like a sinc² (energy concentrated at the centre), by dwell "
                "time only (no amplitude taper, no crest-factor penalty). Fixed 61.38 MHz / sc8, "
-               "looped buffer, always-on unity passband filter. Level is set in dBm via the "
-               "unit's calibration; uncalibrated it runs on a relative gain. Authorised, "
-               "shielded setups only.")
+               "looped buffer, always-on unity passband filter. Reuses the regular sweep's "
+               "(\"Chirp/Sweep\") calibration — same total power at a given gain — and offers "
+               "full-signal and main-lobe power (dBm). Uncalibrated it runs on a relative gain. "
+               "Authorised, shielded setups only.")
         .number("-Power", "--power", unit="dBm",
                 **power_map().power_field_kwargs(), required=False, live=True,
                 help="ABSOLUTE power at the delivered plane (dBm). Maps through the unit's "
@@ -412,6 +482,10 @@ def build_script() -> Script:
                 default=SIDELOBES_DEFAULT, required=False, live=True,
                 help="How many sinc² sidelobes to keep each side (0 = the main lobe only). "
                      "The occupied band is ±(sidelobes+1)·chip-rate. Live (regenerates).")
+        .derived("-Main-lobe-fraction", name="main_lobe_frac", hidden=True,
+                 formula={"table": _MAIN_LOBE_FRAC_ARGS},
+                 help="Fraction of the sinc² power inside the main lobe at the current sidelobe "
+                      "count. Feeds the main-lobe-power calibration law; not shown.")
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 is_rf=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
@@ -437,6 +511,16 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # Current "shape" (the regeneration-requiring params) — mutated by live changes. Defined
+    # before the gain fold so the calibration's main-lobe-power law can read the live fraction.
+    shape = {"chip_rate_hz": chip_rate_hz, "sidelobes": sidelobes}
+
+    def pwr_params() -> dict:
+        """Live keyed-parameter values the calibration's power laws read: the sinc² main-lobe
+        fraction at the current sidelobe count, so a main-lobe-power reading / cap tracks
+        --sidelobes. Harmless when the calibration doesn't key on it (the map ignores it)."""
+        return {"main_lobe_frac": main_lobe_frac(shape["sidelobes"])}
+
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
     # else it runs uncalibrated — a relative gain only.
     pmap = power_map()
@@ -445,7 +529,7 @@ def main() -> int:
     if gain_cal is not None:
         gain_db = float(gain_cal)
     elif pmap.has_absolute:                         # calibrated: the authored absolute --power
-        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz)
+        gain_db = pmap.gain_for_power(args.power, freq=center_freq_hz, params=pwr_params())
     else:                                           # uncalibrated: a persisted fallback gain, or refuse
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -454,9 +538,6 @@ def main() -> int:
                   file=sys.stderr)
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
-
-    # Current "shape" (the regeneration-requiring params) — mutated by live changes.
-    shape = {"chip_rate_hz": chip_rate_hz, "sidelobes": sidelobes}
 
     def make_current():
         """The buffer for the current shape: the sinc²-dwell sweep, band-limited to the
@@ -498,7 +579,7 @@ def main() -> int:
     if pmap.has_absolute:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})")
         print(f"  power (achieved on grid): "
-              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz):.2f} dBm")
+              f"{pmap.power_for_gain(gain_db, freq=center_freq_hz, params=pwr_params()):.2f} dBm")
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
     print(f"  calibration    : {pmap.describe()}")
@@ -523,23 +604,23 @@ def main() -> int:
             ctrl.report("freq", tb.actual_freq() / 1e6)
             # A frequency-dependent calibration re-scales --power with frequency.
             if state.get("power") is not None:
-                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"])
+                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"], params=pwr_params())
                 if state["rf_on"]:
                     tb.set_gain(state["gain"])
                     ctrl.report("power",
-                                round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"]), 2))
+                                round(pmap.power_for_gain(tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
                 else:
                     ctrl.report("power",
-                                round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
+                                round(pmap.power_for_gain(state["gain"], freq=state["freq"], params=pwr_params()), 2))
         elif name == "power":
             state["power"] = float(value)
-            state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"])
+            state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"], params=pwr_params())
             if state["rf_on"]:
                 tb.set_gain(state["gain"])
                 ctrl.report("power", round(pmap.power_for_gain(
-                    tb.actual_gain(), freq=state["freq"]), 2))
+                    tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
             else:
-                ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=state["freq"]), 2))
+                ctrl.report("power", round(pmap.power_for_gain(state["gain"], freq=state["freq"], params=pwr_params()), 2))
         elif name == "gain":
             state["power"] = None
             state["gain"] = max(0.0, min(HW_MAX_GAIN_DB, float(value)))
@@ -572,6 +653,14 @@ def main() -> int:
             shape["sidelobes"] = new_sl
             regenerate()
             ctrl.report(name, value)
+            # A --sidelobes change moves the main-lobe fraction, so re-map a held --power in case
+            # the calibration's cap keys on it (a no-op for a total-power cap — constant envelope).
+            if name == "sidelobes" and state.get("power") is not None:
+                state["gain"] = pmap.gain_for_power(state["power"], freq=state["freq"], params=pwr_params())
+                if state["rf_on"]:
+                    tb.set_gain(state["gain"])
+                    ctrl.report("power", round(pmap.power_for_gain(
+                        tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
