@@ -28,10 +28,17 @@ dwell floor lets the tone creep through the nulls and the centre gap (soft, leak
 Fixed radio setup + always-on unity passband filter + precompute-and-loop, exactly as
 enveloped_sweep_tx.py / fm_chirp_tx.py.
 
+The passband is set by TWO knobs (both snap to BOC nulls): --sidelobes extends the OUTER edge (n
+null-steps beyond the main lobes), and --inner-sidelobes drops the INNER edge — a bandpass that
+notches away the low-power gap between the two lobes (±5.115 MHz), leaving a clean split spectrum.
+
 Calibration REUSES the regular sweep's ("Chirp/Sweep"). Constant-envelope at the same amplitude,
 so at a given gain it delivers the IDENTICAL total power — the flat-sweep calibration already
 contains it. Offers FULL signal power (dBm) and MAIN-LOBES power (both split lobes; that minus a
-fixed BOC offset that tracks --sidelobes). Uncalibrated it runs on a relative --gain.
+fixed BOC offset that tracks --sidelobes). MAIN-LOBES power is EXACT whether or not the centre is
+notched (the notch never touches the lobes) — so set --power in Main-lobes power when using
+--inner-sidelobes; FULL signal power counts the pre-notch total (the notch discards the ~0.4 dB
+inner gap). Uncalibrated it runs on a relative --gain.
 
 ⚠  RF SAFETY / LEGAL: many presets are live GNSS bands. Transmit ONLY into a shielded /
    conducted setup (cable + attenuators) you are LICENSED / AUTHORISED to use.
@@ -39,6 +46,7 @@ fixed BOC offset that tracks --sidelobes). Uncalibrated it runs on a relative --
 CLI
 ───
     boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 0 --power -30
+    boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 0 --inner-sidelobes 1 --power -30  # clean split
     boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 2 --gain 60      # raw-gain override
     boc_enveloped_sweep_tx.py --self-test        # verify seam closure + BOC shape, no hardware
     boc_enveloped_sweep_tx.py --describe-params  # paramkit JSON schema for the GUI
@@ -143,6 +151,10 @@ MAIN_LOBE_NULLS = 3          # the two main lobes end at the 3rd null (±15.345 
 MAX_SIDELOBES = 3            # (3+3)·5.115 = 30.69 MHz = Fs/2 — the whole representable signal
 DEFAULT_SIDELOBES = 0        # main lobes only (±15.345 MHz)
 MAX_ROAM_MHZ = 30.69         # ±(sidelobes+3)·5.115 must stay within ±Nyquist (Fs/2)
+# The centre gap between the two split lobes is one inner null-step ([0, 5.115] MHz). Notching it
+# (a bandpass instead of a lowpass) leaves a clean split spectrum. 0 = keep it, 1 = notch it.
+MAX_INNER_SIDELOBES = 1
+DEFAULT_INNER_SIDELOBES = 0
 
 # One whole sweep is precomputed into this many samples and looped (the fm_chirp floor, ~2 MB).
 BUFFER_SAMPS = 1 << 18
@@ -192,6 +204,12 @@ def boc_psd(f_hz):
 def roam_hz(sidelobes: int) -> float:
     """The occupied half-width: the outermost BOC null kept = ±(sidelobes+3)·code_rate."""
     return (int(sidelobes) + MAIN_LOBE_NULLS) * BOC_NULL_HZ
+
+
+def inner_edge_hz(inner_sidelobes: int) -> float:
+    """The passband's INNER edge: 0 (a plain lowpass, centre kept) or ±code_rate (the centre gap
+    notched, leaving a clean split spectrum). Snaps to the BOC null at ±5.115 MHz."""
+    return max(0, min(MAX_INNER_SIDELOBES, int(inner_sidelobes))) * BOC_NULL_HZ
 
 
 def check_roam(sidelobes: int) -> None:
@@ -253,16 +271,21 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
-def filter_buffer(base_iq, width_hz: float, trans_hz: float):
-    """Circularly filter the looped sweep to a `width_hz`-wide passband (passes ±width/2). Circular
-    convolution keeps the loop seamless; unity passband gain leaves the in-band shape unchanged.
-    Returns (filtered_iq, n_taps, passband_edge_hz)."""
+def filter_buffer(base_iq, width_hz: float, trans_hz: float, inner_hz: float = 0.0):
+    """Circularly filter the looped sweep to the passband [inner_hz, width_hz/2] on each side: a
+    plain lowpass when `inner_hz == 0`, or a BANDPASS when `inner_hz > 0` that also notches away
+    the low-power centre gap between the two BOC lobes (|f| < inner_hz). Built as
+    lowpass(outer) − lowpass(inner), so the passband is unity and both edges snap to BOC nulls;
+    circular convolution keeps the loop seamless. Returns (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
     fp = float(width_hz) / 2.0
-    fc = fp + trans_hz / 2.0
     n = len(base_iq)
-    h, m = _design_lowpass(fc, trans_hz, n // 2)
-    filtered = np.fft.ifft(np.fft.fft(base_iq) * np.fft.fft(h, n)).astype(np.complex64)
+    h_out, m = _design_lowpass(fp + trans_hz / 2.0, trans_hz, n // 2)
+    H = np.fft.fft(h_out, n)
+    if inner_hz > 0.0:                              # bandpass = lp(outer) − lp(inner) → notch the centre
+        h_in, _ = _design_lowpass(float(inner_hz), trans_hz, n // 2)
+        H = H - np.fft.fft(h_in, n)
+    filtered = np.fft.ifft(np.fft.fft(base_iq) * H).astype(np.complex64)
     return filtered, m, fp
 
 
@@ -340,6 +363,19 @@ def _self_test() -> int:
         frac_ok = frac_ok and abs(ml / tot - baked) < 5e-3
     ok = ok and frac_ok
     print(f"main-lobe tbl: baked ≡ BOC integral (≤5e-3) [{'OK' if frac_ok else 'FAIL'}]")
+
+    # 6) the inner notch (--inner-sidelobes 1) drops the centre gap while keeping the main lobes
+    filt_n, _t, _fp = filter_buffer(
+        build_boc_sweep_buffer(0)[0], 2 * roam_hz(0), FILTER_TRANSITION_HZ, inner_hz=inner_edge_hz(1))
+    Xn = np.abs(np.fft.fftshift(np.fft.fft(filt_n))) ** 2
+    smn = np.convolve(Xn, np.ones(31) / 31, "same")
+    smn = 10 * np.log10(smn / smn.max() + 1e-30)
+    centre_n = float(smn[np.argmin(np.abs(ff))])                     # centre after the notch
+    lobe_n = float(np.max(smn[(np.abs(ff) >= 5.115e6) & (np.abs(ff) < 15.345e6)]))
+    notch_ok = (centre_n < centre - 10.0) and (lobe_n > -1.0)        # centre far deeper, lobes intact
+    ok = ok and notch_ok
+    print(f"inner notch  : centre {centre:+.1f}→{centre_n:+.1f} dB, main lobe {lobe_n:+.1f} dB "
+          f"[{'OK' if notch_ok else 'FAIL'}]")
 
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
@@ -437,6 +473,12 @@ def build_script() -> Script:
                 help="How many BOC null-steps to keep beyond the two main lobes (0 = the main "
                      "lobes only, ±15.345 MHz). The occupied band is ±(sidelobes+3)·5.115 MHz; "
                      "3 = ±30.69 MHz (Fs/2). Live (regenerates the sweep).")
+        .number("-Inner-sidelobes", "--inner-sidelobes", min=0, max=MAX_INNER_SIDELOBES, step=1,
+                default=DEFAULT_INNER_SIDELOBES, required=False, live=True,
+                help="Notch away the low-power gap BETWEEN the two main lobes (a bandpass instead "
+                     "of a lowpass): 0 = keep the centre; 1 = a clean split spectrum (passband "
+                     "starts at ±5.115 MHz). Set --power in Main-lobes power when notching — "
+                     "Full-signal power counts the discarded centre. Live (regenerates).")
         .derived("-Main-lobe-fraction", name="main_lobe_frac", hidden=True,
                  formula={"table": _MAIN_LOBE_FRAC_ARGS},
                  help="Fraction of the BOC power inside the two main lobes at the current sidelobe "
@@ -459,6 +501,7 @@ def main() -> int:
 
     center_freq_hz = float(args.freq) * 1e6
     sidelobes = int(args.sidelobes)
+    inner = int(getattr(args, "inner_sidelobes", DEFAULT_INNER_SIDELOBES) or 0)
     try:
         check_roam(sidelobes)
     except ValueError as exc:
@@ -467,7 +510,7 @@ def main() -> int:
 
     # Current "shape" — mutated by live changes. Defined before the gain fold so the calibration's
     # main-lobes-power law can read the live fraction.
-    shape = {"sidelobes": sidelobes}
+    shape = {"sidelobes": sidelobes, "inner": inner}
 
     def pwr_params() -> dict:
         """Live keyed-parameter values the calibration's power laws read: the BOC main-lobes
@@ -492,11 +535,13 @@ def main() -> int:
 
     def make_current():
         """The buffer for the current shape: the BOC-dwell sweep, band-limited to the occupied
-        band ±(sidelobes+3)·5.115 MHz. Returns (iq, finfo)."""
+        band ±(sidelobes+3)·5.115 MHz — and, when --inner-sidelobes is set, notched below the
+        inner edge (±5.115 MHz) to drop the centre gap. Returns (iq, finfo)."""
         base, _f = build_boc_sweep_buffer(shape["sidelobes"])
         r = roam_hz(shape["sidelobes"])
-        filt, taps, fp = filter_buffer(base, 2 * r, FILTER_TRANSITION_HZ)
-        return filt, {"taps": taps, "edge_hz": fp, "roam_hz": r}
+        inner_hz = inner_edge_hz(shape["inner"])
+        filt, taps, fp = filter_buffer(base, 2 * r, FILTER_TRANSITION_HZ, inner_hz=inner_hz)
+        return filt, {"taps": taps, "edge_hz": fp, "roam_hz": r, "inner_hz": inner_hz}
 
     iq, finfo = make_current()
 
@@ -536,6 +581,9 @@ def main() -> int:
         print(f"  ⚠ CALIBRATION  : {pmap.warning}")
     print(f"  filter         : on (always) — passband ±{finfo['edge_hz']/1e6:.2f} MHz "
           f"(= occupied band), {FILTER_TRANSITION_MHZ:g} MHz transition, {finfo['taps']} taps")
+    if finfo.get("inner_hz", 0.0) > 0:
+        print(f"  inner notch    : centre gap dropped below ±{finfo['inner_hz']/1e6:.3f} MHz "
+              f"(clean split spectrum — set --power in Main-lobes power)")
     print(f"  otw            : {OTW_FORMAT}")
     print(f"  RF             : {'ON' if state['rf_on'] else 'OFF (muted)'}")
     if gain_cal is not None:
@@ -605,6 +653,12 @@ def main() -> int:
                     tb.set_gain(state["gain"])
                     ctrl.report("power", round(pmap.power_for_gain(
                         tb.actual_gain(), freq=state["freq"], params=pwr_params()), 2))
+        elif name == "inner_sidelobes":
+            # Only the FILTER changes (a notch of the centre gap); the trajectory, the main-lobes
+            # fraction and the gain are all unaffected — so just rebuild + swap, no power re-map.
+            shape["inner"] = max(0, min(MAX_INNER_SIDELOBES, int(value)))
+            regenerate()
+            ctrl.report(name, value)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

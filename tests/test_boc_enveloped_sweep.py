@@ -87,9 +87,10 @@ def test_argspec_surface_and_reuse():
     assert spec["calibration_freq_param"] == "freq"
 
     by = {p["dest"]: p for p in spec["params"]}
-    assert {"power", "gain", "freq", "sidelobes", "rf"} <= set(by)
+    assert {"power", "gain", "freq", "sidelobes", "inner_sidelobes", "rf"} <= set(by)
     assert "chip_rate" not in by                            # BOC(10,5) rates are fixed
     assert by["sidelobes"]["max"] == bs.MAX_SIDELOBES
+    assert by["inner_sidelobes"]["max"] == bs.MAX_INNER_SIDELOBES and by["inner_sidelobes"]["default"] == 0
     assert by["rf"].get("is_rf") is True
     assert by["main_lobe_frac"]["hidden"] is True
 
@@ -156,6 +157,39 @@ def test_sweep_stays_inside_the_occupied_band():
     for sl in (0, 1, 3):
         f = bs._boc_dwell_freq(sl, bs.BUFFER_SAMPS)
         assert float(np.max(np.abs(f))) <= bs.roam_hz(sl) + 1.0
+
+
+# ── the inner notch (a bandpass that drops the centre gap) ───────────────────────
+
+def _psd_db_filtered(base, width_hz, inner_hz):
+    filt, _t, _fp = bs.filter_buffer(base, width_hz, bs.FILTER_TRANSITION_HZ, inner_hz=inner_hz)
+    X = np.abs(np.fft.fftshift(np.fft.fft(filt))) ** 2
+    f = np.fft.fftshift(np.fft.fftfreq(len(filt), 1.0 / bs.SAMP_RATE_HZ))
+    X = np.convolve(X, np.ones(31) / 31, "same")
+    return f, 10 * np.log10(X / X.max() + 1e-30)
+
+
+def test_inner_edge_snaps_to_the_code_rate_null():
+    assert bs.inner_edge_hz(0) == 0.0                       # no notch — a plain lowpass
+    assert bs.inner_edge_hz(1) == pytest.approx(5.115e6)    # notch below the 1st null
+
+
+def test_inner_notch_drops_the_centre_gap_but_keeps_the_lobes():
+    base = bs.build_boc_sweep_buffer(0)[0]
+    width = 2 * bs.roam_hz(0)
+    f0, P0 = _psd_db_filtered(base, width, 0.0)                       # lowpass: centre kept
+    f1, P1 = _psd_db_filtered(base, width, bs.inner_edge_hz(1))       # bandpass: centre notched
+    c0 = float(P0[np.argmin(np.abs(f0))])
+    c1 = float(P1[np.argmin(np.abs(f1))])
+    assert c1 < c0 - 20.0                                             # centre far deeper after the notch
+    # the two main lobes are untouched
+    m = (np.abs(f1) >= 5.115e6) & (np.abs(f1) < 15.345e6)
+    assert float(np.max(P1[m])) > -1.0
+
+
+def test_main_lobe_frac_is_notch_independent():
+    # the notch never touches the main lobes, so main_lobe_power (keyed on --sidelobes) is unchanged
+    assert bs.main_lobe_frac(0) == pytest.approx(0.914610, abs=1e-6)
 
 
 # ── subprocess smoke ──────────────────────────────────────────────────────────────

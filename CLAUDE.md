@@ -50,17 +50,31 @@ subcarrier fsub 10.23 MHz, code rate fc 5.115 MHz.
   null-steps → ±(sidelobes+3)·5.115 MHz (0 → ±15.345, 3 → ±30.69 = Fs/2), matching MCode's null
   snapping. **Confined to ±roam** by construction (`--self-test` asserts `max|f| ≤ roam`; measured
   it stops just inside the outermost null). No `--chip-rate` (BOC rates are fixed); params are
-  `--freq`/`--power`/`--gain`/`--sidelobes`/`--rf`, all live.
+  `--freq`/`--power`/`--gain`/`--sidelobes`/`--inner-sidelobes`/`--rf`, all live.
+- **`--inner-sidelobes` (0..1) — the INNER filter (owner ask "filter away the inner sidelobes").**
+  The passband gets an inner edge as well as the outer one: `filter_buffer(inner_hz=)` becomes a
+  BANDPASS (`lowpass(outer) − lowpass(inner)`) that notches the low-power centre GAP between the two
+  split lobes (|f| < ±5.115 MHz), leaving a clean split spectrum (`--self-test`: centre −25 → −163 dB,
+  lobes intact). 0 = keep the centre (a plain lowpass); 1 = notch it (the 1 inner null-step; the main
+  lobe starts at ±5.115 so ≥2 would eat it). Only the FILTER changes — the trajectory, the main-lobes
+  fraction and the gain are all untouched, so a live change just rebuilds + swaps (no power re-map).
+  **Calibration under the notch:** `main_lobe_power` (the two lobes) is EXACT and notch-independent —
+  set `--power` in it when notching. `full_power` stays the pre-notch constant-envelope total (the
+  notch discards the ~0.4 dB inner gap, so delivered < full). A 2-param (sidelobes × notch) fold of
+  `full_power` on the CLIENT isn't expressible — `state/power_fold.resolve_keyed_values` evaluates a
+  derived field's formula over the RAW `{dest: value}` state (no chained derived fields) — hence the
+  "use main-lobes power" guidance rather than re-keying `full_power`.
 - **Calibration** — reuses `"Chirp/Sweep"` (constant-envelope → identical total power) with the same
   `full_power` (k=70) + `main_lobe_power` laws; the `main_lobe_frac` table is the BOTH-main-lobes
   fraction (|f|∈[5.115,15.345] MHz) of the BOC integral, keyed on `--sidelobes`: frac(0)=0.9146
   (−0.39 dB — the ±15.345 band also passes the low-power centre gap, exactly MCode's note), down to
   frac(3)=0.867. Baked literal re-derived from the BOC PSD in `--self-test`.
 - `argspec`/`ramp` untouched (drift guard intact); no agent/client change. Tests:
-  `tests/test_boc_enveloped_sweep.py` (BOC PSD split spectrum + finite peaks; argspec + reuse;
-  laws evaluate incl. the 0.39 dB full-vs-main gap; main_lobe_frac ≡ BOC integral; constant
-  envelope + seam; realised split spectrum; sidelobes set the band; roam guard; confinement;
-  `--self-test`/`--describe-params`). Suite 83 → 94.
+  `tests/test_boc_enveloped_sweep.py` (BOC PSD split spectrum + finite peaks; argspec + reuse +
+  the `--inner-sidelobes` param; laws evaluate incl. the 0.39 dB full-vs-main gap; main_lobe_frac ≡
+  BOC integral + notch-independent; constant envelope + seam; realised split spectrum; sidelobes set
+  the band; the inner notch drops the centre gap but keeps the lobes; roam guard; confinement;
+  `--self-test`/`--describe-params`). Suite 83 → 97.
 
 ## Current state — Enveloped Sweep (sinc² dwell-shaped constant-envelope sweep): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 New `Other Signals/enveloped_sweep_tx.py`. A SEQUENTIAL swept tone whose TIME-AVERAGED PSD is
