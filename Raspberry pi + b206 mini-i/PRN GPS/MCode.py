@@ -59,8 +59,13 @@ THOSE NULLS: the two main lobes span |f| ∈ [5.115, 15.345] MHz (subcarrier ± 
                                 0 = the main lobes only (±15.345 MHz); 3 = the whole
                                 representable signal (±30.69 = ±Fs/2, incl. the 3rd-harmonic
                                 lobes).
+  • --inner-sidelobes <0|1>     inner sidelobes KEPT below the two lobes. 0 NOTCHES the low-power
+                                centre gap between them (the passband becomes a BANDPASS starting
+                                at ±5.115 MHz — a clean split spectrum); 1 keeps it (a plain
+                                lowpass, the full signal). The main lobes begin at ±5.115 MHz, so
+                                the one-null-step notch never touches them (live).
 The skirt transition width is FIXED at 0.5 MHz (not a knob), so the emitted power stays a
-well-defined function of the sidelobe count alone. --sidelobes is LIVE: changing it rebuilds
+well-defined function of the sidelobe count alone. Both knobs are LIVE: changing either rebuilds
 the (circularly-)filtered loop and swaps it into the running source; the flowgraph never stops.
 
 Spectral-density calibration (dBm/Hz at the main-lobe peak → power quantities)
@@ -73,8 +78,9 @@ absolute-power quantities the operator can pick between for --power (see CAL_POW
 
 CLI
 ───
-    MCode.py --prn 5 --freq 1575.42 --power -30              # calibrated dBm (main lobes only)
-    MCode.py --prn 5 --gain 60 --sidelobes 3               # relative gain, full ±30.69 MHz
+    MCode.py --prn 5 --freq 1575.42 --power -30                     # calibrated dBm (main lobes; centre notched by default)
+    MCode.py --prn 5 --freq 1575.42 --power -30 --inner-sidelobes 1 # keep the low-power centre gap (full signal)
+    MCode.py --prn 5 --gain 60 --sidelobes 3                      # relative gain, full ±30.69 MHz
     MCode.py --self-test
     MCode.py --describe-params
 """
@@ -128,6 +134,15 @@ BOC_NULL_HZ = CODE_RATE_HZ          # null spacing == the code rate
 MAIN_LOBE_NULLS = 3                 # both main lobes end at the 3rd null (±15.345 MHz)
 MAX_SIDELOBES = 3                   # (3+3)·5.115 = 30.69 MHz = Fs/2 — the whole representable signal
 DEFAULT_SIDELOBES = 0               # main lobes only (±15.345 MHz)
+
+# The low-power centre GAP between the two split lobes (|f| < the code rate, ±5.115 MHz) is BOC's
+# one INNER sidelobe. --inner-sidelobes counts how many inner sidelobes to KEEP: 0 NOTCHES the
+# centre (the passband becomes a BANDPASS starting at ±5.115 MHz — a clean split spectrum), 1 keeps
+# it (a plain lowpass). The two main lobes begin at ±5.115 MHz, so the notch (one null-step) never
+# touches them. This mirrors boc_enveloped_sweep_tx.py.
+BOC_INNER_NULL_HZ = CODE_RATE_HZ    # the inner notch edge snaps to the first null (±5.115 MHz)
+MAX_INNER_SIDELOBES = 1
+DEFAULT_INNER_SIDELOBES = 0         # 0 = notch the centre gap (clean split); 1 = keep the centre
 
 FREQUENCIES = {
     "GPS L1 (1575.42 MHz)": L1_HZ / 1e6,
@@ -207,6 +222,33 @@ def enbw_mhz(sidelobes: int) -> float:
     return float(_ENBW_TABLE_ARGS[1 + n])
 
 
+def inner_edge_hz(inner_sidelobes: int) -> float:
+    """The passband's INNER edge (Hz): ±code_rate (±5.115 MHz — the centre gap NOTCHED, a clean
+    split spectrum) when NO inner sidelobe is kept, else 0 (a plain lowpass, the centre kept).
+    Snaps to the first BOC null. --inner-sidelobes counts inner sidelobes KEPT: 0 → notch, 1 → keep."""
+    kept = max(0, min(MAX_INNER_SIDELOBES, int(inner_sidelobes)))
+    return (MAX_INNER_SIDELOBES - kept) * BOC_INNER_NULL_HZ
+
+
+# When --inner-sidelobes 0 notches the low-power centre GAP, the filter discards that power, so the
+# DELIVERED full power drops by it: full_dBm = peak_dBm/Hz + 10·log10(enbw_mhz) + 10·log10(deliver_frac).
+# `deliver_frac` is the passband-power fraction that SURVIVES the notch: 1.0 with the centre kept,
+# else 1 − centre-gap/passband. At 0 sidelobes the notched signal IS exactly the two main lobes, so
+# deliver_frac(notch) == main_lobe_power/full(0) == 0.914610 (−0.388 dB, MCode's "DC gap" note). It
+# barely moves with --sidelobes (~0.02 dB « the 0.25 dB gain grid), so it is keyed on --inner-sidelobes
+# ALONE — a plain table over an existing field, no version gate — exactly like boc_enveloped_sweep_tx.py.
+# --self-test re-derives the notch value from the BOC PSD so the baked constant can't drift.
+_NOTCH_DELIVER_FRAC = 0.914610
+_DELIVER_FRAC_ARGS = ["inner_sidelobes", _NOTCH_DELIVER_FRAC, 1.0]   # inner 0 → notched; 1 → centre kept
+
+
+def deliver_frac(inner_sidelobes: int) -> float:
+    """Fraction of the passband power delivered after the inner notch (1.0 when the centre gap is
+    kept; less when --inner-sidelobes 0 notches it)."""
+    frac = _DELIVER_FRAC_ARGS[1:]
+    return frac[max(0, min(len(frac) - 1, int(inner_sidelobes)))]
+
+
 # The power-quantity conversion laws this signal OFFERS the calibration editor. Both convert the
 # measured spectral density (dBm/Hz at the peak) to an absolute power (dBm). Constants are LITERAL
 # (the agent reads CAL_POWER_LAWS statically): 60 = 10·log10(1 MHz / 1 Hz); the full-power term
@@ -214,8 +256,13 @@ def enbw_mhz(sidelobes: int) -> float:
 # = enbw_mhz(DEFAULT_SIDELOBES) for the range read-outs shown before a live --sidelobes is known.
 CAL_POWER_LAWS = [
     {"id": "full_power", "name": "Full signal power (filter passband)", "unit": "dBm",
-     "in": "density", "out": "abs",
-     "k": 60.0, "param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 9.760986},
+     "in": "density", "out": "abs", "k": 60.0,
+     "terms": [
+         # tracks --sidelobes (the equivalent-noise bandwidth the lowpass passes) …
+         {"param": "enbw_mhz", "coeff": 10.0, "ref": 1.0, "rep": 9.760986},
+         # … and --inner-sidelobes (the fraction surviving the centre notch; 1.0 with it kept).
+         {"param": "deliver_frac", "coeff": 10.0, "ref": 1.0, "rep": 1.0},
+     ]},
     {"id": "main_lobe_power", "name": "Main-lobes integrated power (both lobes)", "unit": "dBm",
      "in": "density", "out": "abs", "k": 69.5073},     # 10·log10(∫G over ±[5.115,15.345] MHz / G_peak)
 ]
@@ -300,22 +347,28 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
     return h.astype(np.float64), m
 
 
-def filter_buffer(base_iq, sidelobes: int, trans_hz: float, base_fft=None):
-    """Circularly filter the looped BOC buffer to keep the main lobes + `sidelobes` further
-    null-steps (a ±(n+3)·5.115 MHz lowpass). Circular convolution (multiply the buffer's DFT by
-    the filter's) keeps the result exactly periodic, so the filtered loop has no seam; unity
-    passband gain leaves the kept lobes' power unchanged. Pass `base_fft` (= np.fft.fft(base_iq))
-    to reuse it across live filter changes — the base loop is fixed per run, so its DFT need only
-    be computed once, which cuts the per-change CPU spike (and the underflows it can cause).
-    Returns (filtered_iq, n_taps, passband_edge_hz)."""
+def filter_buffer(base_iq, sidelobes: int, trans_hz: float, inner_hz: float = 0.0, base_fft=None):
+    """Circularly filter the looped BOC buffer to the passband [inner_hz, (n+3)·5.115 MHz] on each
+    side: a plain ±(n+3)·5.115 MHz LOWPASS when `inner_hz == 0`, or a BANDPASS when `inner_hz > 0`
+    that ALSO notches away the low-power centre gap between the two split lobes (|f| < inner_hz).
+    Built as lowpass(outer) − lowpass(inner), so both edges snap to BOC nulls and the passband stays
+    unity gain. Circular convolution (multiply the buffer's DFT by the filter's) keeps the result
+    exactly periodic, so the filtered loop has no seam. Pass `base_fft` (= np.fft.fft(base_iq)) to
+    reuse it across live filter changes — the base loop is fixed per run, so its DFT need only be
+    computed once, which cuts the per-change CPU spike (and the underflows it can cause). Returns
+    (filtered_iq, n_taps, passband_edge_hz)."""
     import numpy as np
     fp = (int(sidelobes) + MAIN_LOBE_NULLS) * BOC_NULL_HZ   # flat passband edge (kept up to here)
     fc = fp + trans_hz / 2.0                                 # −6 dB cutoff = edge + half transition
     n = len(base_iq)
     h, m = _design_lowpass(fc, trans_hz, n // 2)
+    H = np.fft.fft(h, n)
+    if inner_hz > 0.0:                                       # bandpass = lp(outer) − lp(inner): notch the centre
+        h_in, _ = _design_lowpass(float(inner_hz), trans_hz, n // 2)
+        H = H - np.fft.fft(h_in, n)
     if base_fft is None:
         base_fft = np.fft.fft(base_iq)
-    filtered = np.fft.ifft(base_fft * np.fft.fft(h, n)).astype(np.complex64)
+    filtered = np.fft.ifft(base_fft * H).astype(np.complex64)
     return filtered, m, fp
 
 
@@ -392,8 +445,10 @@ def _self_test() -> int:
     laws = {l["id"]: l for l in CAL_POWER_LAWS}
     # Main-lobes power is the fixed integral over the two main lobes.
     ml_ok = abs(laws["main_lobe_power"]["k"] - ml_k) < 0.02
-    # full_power is KEYED on enbw_mhz; the enbw table must match ∫G over ±(n+3)·5.115 MHz / G_peak.
-    tab_ok = (laws["full_power"].get("param") == "enbw_mhz"
+    # full_power keys on enbw_mhz (tracks --sidelobes) AND deliver_frac (the inner notch); the enbw
+    # table must match ∫G over ±(n+3)·5.115 MHz / G_peak.
+    fp_terms = {t["param"]: t for t in laws["full_power"].get("terms", [])}
+    tab_ok = ("enbw_mhz" in fp_terms and "deliver_frac" in fp_terms
               and abs(laws["full_power"]["k"] - 60.0) < 1e-9
               and _ENBW_TABLE_ARGS[0] == "sidelobes"
               and len(_ENBW_TABLE_ARGS) == MAX_SIDELOBES + 2
@@ -401,12 +456,29 @@ def _self_test() -> int:
                           - _ebw(0.0, (n + MAIN_LOBE_NULLS) * BOC_NULL_HZ) / 1e6) < 1e-3
                       for n in range(MAX_SIDELOBES + 1)))
     mono = all(_ENBW_TABLE_ARGS[1 + i] < _ENBW_TABLE_ARGS[2 + i] for i in range(MAX_SIDELOBES))
-    full0 = 60.0 + 10 * math.log10(enbw_mhz(0))     # full power at the main-lobes-only setting
+    full0 = 60.0 + 10 * math.log10(enbw_mhz(0))     # full power at the main-lobes-only setting (centre kept)
     laws_ok = ml_ok and tab_ok and mono and full0 >= ml_k
     print(f"calibration: both-main-lobes k={ml_k:.4f} (law {laws['main_lobe_power']['k']}), "
           f"full(0 sidelobes)={full0:.4f} dB (≥ main), full(max)={60+10*math.log10(enbw_mhz(MAX_SIDELOBES)):.4f} dB, "
           f"enbw table {'matches' if tab_ok else 'DRIFTED'} [{'OK' if laws_ok else 'FAIL'}]")
     ok = ok and laws_ok
+
+    # Inner notch (--inner-sidelobes 0): a bandpass that drops the low-power centre gap while keeping
+    # the two main lobes. deliver_frac(notch) is the surviving passband fraction — at 0 sidelobes the
+    # notched signal IS the two main lobes, so it equals main-lobes / full(0) (re-derived from the PSD).
+    filt_n, _t, _fp = filter_buffer(base, sidelobes=0, trans_hz=TRANS_HZ, inner_hz=inner_edge_hz(0))
+    centre_drop = 10 * np.log10(band(filt_n, 0, 4.5e6) / max(band(filt, 0, 4.5e6), 1e-30))
+    lobes_n = 10 * np.log10(band(filt_n, 5.115e6, 15.345e6) / band(filt, 5.115e6, 15.345e6))
+    notch_frac0 = _ebw(5.115e6, 15.345e6) / _ebw(0.0, 15.345e6)      # what survives the notch @ 0 sl
+    deliver_ok = (centre_drop < -15.0 and abs(lobes_n) < 0.3         # centre dropped, main lobes kept
+                  and abs(deliver_frac(0) - notch_frac0) < 5e-3      # baked ≡ BOC integral
+                  and deliver_frac(1) == 1.0                          # centre kept → nothing lost
+                  and abs(deliver_frac(0) - 10 ** ((ml_k - full0) / 10)) < 5e-3)  # notched full(0)==main
+    ok = ok and deliver_ok
+    print(f"inner notch  : centre {centre_drop:+.1f} dB, main lobes {lobes_n:+.2f} dB, "
+          f"deliver_frac(notch)={deliver_frac(0):.4f} ({10*np.log10(deliver_frac(0)):+.3f} dB) "
+          f"≡ two lobes @ 0 sl [{'OK' if deliver_ok else 'FAIL'}]")
+
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
     return 0 if ok else 1
 
@@ -513,6 +585,14 @@ def build_script() -> Script:
                       "full-power calibration quantity tracks this). Max 3 fills the band to "
                       "±Fs/2 = ±30.69 MHz (the whole representable signal). Live (rebuilds the "
                       "filtered loop).")
+        .integer("-Inner-sidelobes", "--inner-sidelobes", min=0, max=MAX_INNER_SIDELOBES, step=1,
+                 default=DEFAULT_INNER_SIDELOBES, required=False, live=True,
+                 help="Inner sidelobes KEPT below the two split lobes: 0 NOTCHES the low-power "
+                      "centre gap between them (a bandpass — the passband starts at ±5.115 MHz, "
+                      "leaving a clean split spectrum); 1 keeps the centre (a plain lowpass, the "
+                      "full signal). The main lobes begin at ±5.115 MHz, so the notch never touches "
+                      "them. Full-signal power tracks this (the notch discards the ~0.4 dB centre); "
+                      "main-lobes power is unaffected. Live (rebuilds the filtered loop).")
         .derived("-Passband-bandwidth", name="passband_bw_mhz", unit="MHz",
                  formula={"linear": ["sidelobes", 10.23, 30.69],
                           # per-sidelobe-count annotation the GUI appends to the readout
@@ -528,6 +608,11 @@ def build_script() -> Script:
                  formula={"table": _ENBW_TABLE_ARGS},
                  help="Equivalent-noise bandwidth mapping the measured peak density to the full "
                       "in-band power. Feeds the full-power calibration law; not shown.")
+        .derived("-Deliver-fraction", name="deliver_frac", hidden=True,
+                 formula={"table": _DELIVER_FRAC_ARGS},
+                 help="Fraction of the passband power delivered after the inner notch (1.0 with the "
+                      "centre gap kept; less when --inner-sidelobes 0 notches it). Feeds the "
+                      "full-power calibration law; not shown.")
         .choice("-RF", "--rf", options=["on", "off"], default="on", required=False, live=True,
                 help="RF output on/off. OFF mutes the gain AND baseband amplitude to 0; ON "
                      "restores them. Live.")
@@ -552,14 +637,17 @@ def main() -> int:
     # before the gain map so the calibration's power laws can read the current equivalent
     # bandwidth.
     shape = {"sidelobes": int(getattr(args, "sidelobes", DEFAULT_SIDELOBES) or 0),
+             "inner": int(getattr(args, "inner_sidelobes", DEFAULT_INNER_SIDELOBES) or 0),
              "trans_hz": TRANS_HZ}
 
     def pwr_params() -> dict:
         """The live keyed-parameter values the calibration's power laws read: the filter's
-        equivalent-noise bandwidth, so the FULL-power reading and its limiting cap track the
-        sidelobe count (the client folds the --power range at the same value). Harmless when
-        the unit is uncalibrated or its laws don't key on it."""
-        return {"enbw_mhz": enbw_mhz(shape["sidelobes"])}
+        equivalent-noise bandwidth (tracks --sidelobes) and the inner-notch delivered fraction
+        (tracks --inner-sidelobes), so the FULL-power reading and its limiting cap follow the live
+        filter (the client folds the --power range at the same values). Harmless when the unit is
+        uncalibrated or its laws don't key on them."""
+        return {"enbw_mhz": enbw_mhz(shape["sidelobes"]),
+                "deliver_frac": deliver_frac(shape["inner"])}
 
     # Gain precedence: explicit --gain (raw) > calibrated --power > refuse (uncalibrated).
     gain_cal = getattr(args, "gain", None)
@@ -586,10 +674,12 @@ def main() -> int:
         if base_fft["v"] is None:
             import numpy as np
             base_fft["v"] = np.fft.fft(base_iq)
+        inner_hz = inner_edge_hz(shape["inner"])
         filtered, taps, fp = filter_buffer(base_iq, shape["sidelobes"], shape["trans_hz"],
-                                           base_fft=base_fft["v"])
+                                           inner_hz=inner_hz, base_fft=base_fft["v"])
         return filtered, {"on": True, "taps": taps, "edge_hz": fp,
-                          "sidelobes": shape["sidelobes"], "trans_hz": shape["trans_hz"]}
+                          "sidelobes": shape["sidelobes"], "inner": shape["inner"],
+                          "inner_hz": inner_hz, "trans_hz": shape["trans_hz"]}
 
     iq0, finfo = make_current()
 
@@ -618,8 +708,10 @@ def main() -> int:
         tb.set_amplitude(0.0)
 
     def _fmt_band(info):
+        notch = (f", centre gap notched below ±{info['inner_hz']/1e6:.3f} MHz (clean split)"
+                 if info.get("inner_hz", 0.0) > 0 else ", centre kept")
         return (f"on — main lobes + {info['sidelobes']} null-step(s) "
-                f"(±{info['edge_hz']/1e6:.2f} MHz), {info['trans_hz']/1e6:g} MHz transition, "
+                f"(±{info['edge_hz']/1e6:.2f} MHz){notch}, {info['trans_hz']/1e6:g} MHz transition, "
                 f"{info['taps']} taps")
 
     print(f"── {SIGNAL_NAME} TX (surrogate) ─────────────────────────────")
@@ -672,13 +764,16 @@ def main() -> int:
                 tb.set_gain(0.0)
                 tb.set_amplitude(0.0)
             ctrl.report("rf", "on" if on else "off")
-        elif name == "sidelobes":
-            shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
+        elif name in ("sidelobes", "inner_sidelobes"):
+            if name == "sidelobes":
+                shape["sidelobes"] = max(0, min(MAX_SIDELOBES, int(value)))
+            else:
+                shape["inner"] = max(0, min(MAX_INNER_SIDELOBES, int(value)))
             regenerate()
-            # Widening/narrowing the passband changes the equivalent bandwidth, so a held
-            # absolute --power must re-map to keep the delivered power (full-power quantity)
-            # constant; the amp's limiting cap moves with it too. calkit no-ops this for a
-            # bandwidth-independent (main-lobes) or relative target.
+            # Widening/narrowing the passband OR toggling the inner notch changes the delivered
+            # full power (the equivalent bandwidth / the surviving fraction), so a held absolute
+            # --power must re-map to keep it constant; the amp's limiting cap moves with it too.
+            # calkit no-ops this for a bandwidth-independent (main-lobes) or relative target.
             if state["power"] is not None:
                 state["gain"] = pmap.gain_for_power(state["power"], freq=center_freq_hz,
                                                     params=pwr_params())
@@ -686,7 +781,7 @@ def main() -> int:
                     tb.set_gain(state["gain"])
                 ctrl.report("power", round(pmap.power_for_gain(
                     state["gain"], freq=center_freq_hz, params=pwr_params()), 2))
-            ctrl.report("sidelobes", shape["sidelobes"])
+            ctrl.report(name, shape["sidelobes"] if name == "sidelobes" else shape["inner"])
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: stop.set())

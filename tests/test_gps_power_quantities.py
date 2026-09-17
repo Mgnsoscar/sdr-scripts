@@ -68,7 +68,7 @@ CASES = {
     "gps_l2p_tx.py": dict(sig="gps_l2_p",     freq=None,   kind="const",
                           main_k=69.654784, full_k=70.098756),
     "MCode.py":      dict(sig="gps_l1_mcode", freq="freq", kind="keyed",
-                          main_k=69.5073, meets0=False),
+                          main_k=69.5073, meets0=False, inner=True),
     "gps_l1c_tx.py": dict(sig="gps_l1c",      freq="freq", kind="keyed",
                           main_k=62.2246, meets0=True),
 }
@@ -115,20 +115,23 @@ def test_gps_calibration_surface(fname):
 
     full = parse_law(laws["full_power"])
     if c["kind"] == "keyed":
-        # KEYED on the filter's equivalent-noise bandwidth so it tracks --sidelobes live.
-        assert full.params() == ["enbw_mhz"]
+        # KEYED on the filter's equivalent-noise bandwidth so it tracks --sidelobes live; M-code
+        # also keys on deliver_frac (the inner notch — folded here at the centre-KEPT value 1.0).
+        expected_params = ["enbw_mhz"] + (["deliver_frac"] if c.get("inner") else [])
+        assert full.params() == expected_params
         assert laws["full_power"]["k"] == pytest.approx(60.0)     # 10·log10(MHz/Hz)
         tbl = _enbw_table(p)
         assert tbl is not None and len(tbl) >= 2
         assert all(tbl[i] < tbl[i + 1] for i in range(len(tbl) - 1))   # more sidelobes → more BW
-        d0 = full.delta_db({"enbw_mhz": tbl[0]})
+        kept = {"deliver_frac": 1.0} if c.get("inner") else {}         # centre-kept operating point
+        d0 = full.delta_db({"enbw_mhz": tbl[0], **kept})
         if c["meets0"]:      # 0 sidelobes: the passband IS the main lobe(s) → full == main.
             assert d0 == pytest.approx(c["main_k"], abs=2e-3)
         else:                # M-code: the lowpass also passes the DC gap → full just above main.
             assert d0 >= c["main_k"] - 2e-3
             assert d0 - c["main_k"] < 1.5
         # widest passband keeps more than the main lobe(s) → strictly above the main-lobe power.
-        assert full.delta_db({"enbw_mhz": tbl[-1]}) > c["main_k"]
+        assert full.delta_db({"enbw_mhz": tbl[-1], **kept}) > c["main_k"]
     else:
         # A fixed constant (the streamed-BPSK total) — the conservative amp-limit reading.
         assert full.params() == []
@@ -163,7 +166,8 @@ def test_filtered_full_power_tracks_sidelobes():
         p = _extract(fname)
         full = parse_law(_laws(p)["full_power"])
         tbl = _enbw_table(p)
-        deltas = [full.delta_db({"enbw_mhz": v}) for v in tbl]
+        kept = {"deliver_frac": 1.0} if c.get("inner") else {}     # M-code: centre-kept operating point
+        deltas = [full.delta_db({"enbw_mhz": v, **kept}) for v in tbl]
         assert all(deltas[i] < deltas[i + 1] for i in range(len(deltas) - 1)), fname
         assert deltas[0] >= c["main_k"] - 2e-3, fname
         if c["meets0"]:
@@ -171,6 +175,38 @@ def test_filtered_full_power_tracks_sidelobes():
         # the widest reading stays modestly above the main lobe(s) (< 1.5 dB — split spectra keep
         # most power in the main lobe(s)).
         assert deltas[-1] - c["main_k"] < 1.5, fname
+
+
+def test_mcode_inner_notch():
+    """M-code's --inner-sidelobes: 0 NOTCHES the low-power centre gap (a bandpass — a clean split
+    spectrum), 1 keeps it. full_power gains a `deliver_frac` term keyed on it; at 0 sidelobes the
+    notched signal IS the two main lobes, so full == main-lobes exactly."""
+    from agent.tune_log import eval_formula
+    p = _extract("MCode.py")
+    by = {pr.get("dest"): pr for pr in p["params"]}
+    inner = by["inner_sidelobes"]
+    assert inner["kind"] == "integer" and inner.get("live") is True
+    assert inner["min"] == 0 and inner["max"] == 1 and inner["default"] == 0   # 0 = filtered out (clean split)
+    df = by["deliver_frac"]
+    assert df.get("hidden") is True
+    tbl = df["formula"]["table"]
+    assert tbl[0] == "inner_sidelobes"
+    notched, kept = float(tbl[1]), float(tbl[2])        # index 0 → notched; index 1 → kept
+    assert notched < kept == 1.0                          # inner 0 filters the centre out; 1 keeps it
+
+    full = parse_law(_laws(p)["full_power"])
+    assert full.params() == ["enbw_mhz", "deliver_frac"]
+    main_k = CASES["MCode.py"]["main_k"]
+
+    def fold(sl, inn):                                    # end-to-end: resolve both keyed params
+        st = {"sidelobes": sl, "inner_sidelobes": inn}
+        vals = {d: eval_formula(by[d]["formula"], st.get) for d in full.params()}
+        return full.delta_db(vals)
+
+    assert fold(0, 0) == pytest.approx(main_k, abs=2e-3)          # notched @ 0 sl == the two main lobes
+    assert fold(0, 1) - main_k == pytest.approx(0.39, abs=0.05)   # centre kept passes the DC gap (+0.39 dB)
+    for sl in range(0, 4):                                        # the notch drops full power by the gap
+        assert fold(sl, 1) - fold(sl, 0) == pytest.approx(0.39, abs=0.05)
 
 
 def _param(p, dest):

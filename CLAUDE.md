@@ -35,6 +35,39 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — inner-notch filter on the M-code PRN script + `--inner-sidelobes` polarity flip (0 = filtered out): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
+Owner asks: (1) give the REAL **M-code PRN** generator (`PRN GPS/MCode.py`) the same inner-notch
+filter the BOC Enveloped Sweep has; (2) flip `--inner-sidelobes` so **0 = the centre gap FILTERED OUT**
+(clean split), not the reverse.
+- **`MCode.py` inner notch** — `--inner-sidelobes` (0..1, live) added. `filter_buffer(..., inner_hz=)`
+  becomes a BANDPASS (`lp(outer) − lp(inner)`) that notches the low-power centre GAP between the two
+  split lobes (|f| < ±5.115 MHz — the first null; the main lobes start there, so the notch never
+  touches them). `inner_edge_hz(inner)` = `(MAX_INNER_SIDELOBES − kept)·5.115 MHz`. `make_current`/
+  `apply_change`/the banner wire it (a live change rebuilds + swaps; a held `--power` re-maps since
+  full power tracks the notch).
+- **`full_power` becomes a TWO-TERM law** — the calibration reading now folds through BOTH `enbw_mhz`
+  (tracks `--sidelobes`, existing) AND a new hidden `deliver_frac` (tracks `--inner-sidelobes`), so the
+  DELIVERED full power `= density + 60 + 10·log10(enbw_mhz) + 10·log10(deliver_frac)` accounts for the
+  notched-out centre. `deliver_frac` keyed on `--inner-sidelobes` ALONE (a `table`, like the enveloped
+  sweep) = 0.914610 notched / 1.0 kept — EXACT at 0 sidelobes (where the notched signal IS the two main
+  lobes, so full == `main_lobe_power`) and within ~0.02 dB above; no agent/client/version change
+  (`power_law.parse_law` + the client's `resolve_keyed_values` already handle multi-term laws — verified
+  the fold end-to-end on both). `argspec`/`ramp` untouched.
+- **Polarity flip (BOTH scripts)** — `--inner-sidelobes` now counts inner sidelobes KEPT: **0 NOTCHES
+  the centre (clean split), 1 keeps it** (was reversed on the BOC Enveloped Sweep). Flipped
+  `inner_edge_hz` (notch when 0) and `_DELIVER_FRAC_ARGS` (`[…, notched, kept]`). **Default stays 0**, so
+  the default output is now the CLEAN SPLIT for both — consistent with `--sidelobes` (0 = the cleanest
+  signal) and the owner's framing. ⚠ This CHANGES the default signal: the BOC Enveloped Sweep and a
+  MCode task with no `--inner-sidelobes` now transmit the notched (clean split) spectrum, not the
+  centre-kept full signal — pass `--inner-sidelobes 1` for the full centre. (Trivial to make 1 the
+  default if the owner wants centre-kept-by-default.)
+Tests: `tests/test_gps_power_quantities.py::test_mcode_inner_notch` (param surface + default 0; the
+two-term fold: notched@0sl == main lobes, kept@0sl +0.39 dB, the notch drops full power by the gap at
+every sidelobe count) + the existing keyed tests updated to fold at the centre-kept point;
+`tests/test_boc_enveloped_sweep.py` flipped (`inner_edge_hz`/`deliver_frac` polarity). Both `--self-test`s
+extended (MCode: the notch drops the centre 129 dB, keeps the lobes, `deliver_frac(notch)` ≡ the BOC
+integral). Suite 98 → 99.
+
 ## Current state — BOC Enveloped Sweep (BOC(10,5) / M-code shaped): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 New `Other Signals/boc_enveloped_sweep_tx.py` — the Enveloped Sweep with the shape of a sine-phased
 **BOC(10,5)** (GPS M-code) spectrum instead of a sinc². Same dwell-shaping engine, different target
@@ -55,8 +88,9 @@ subcarrier fsub 10.23 MHz, code rate fc 5.115 MHz.
   The passband gets an inner edge as well as the outer one: `filter_buffer(inner_hz=)` becomes a
   BANDPASS (`lowpass(outer) − lowpass(inner)`) that notches the low-power centre GAP between the two
   split lobes (|f| < ±5.115 MHz), leaving a clean split spectrum (`--self-test`: centre −25 → −163 dB,
-  lobes intact). 0 = keep the centre (a plain lowpass); 1 = notch it (the 1 inner null-step; the main
-  lobe starts at ±5.115 so ≥2 would eat it). Only the FILTER + the delivered-total READING change —
+  lobes intact). **0 = notch the centre (clean split; the default), 1 = keep it** (see the polarity-flip
+  note above — was reversed originally). The main lobe starts at ±5.115 so ≥2 would eat it. Only the
+  FILTER + the delivered-total READING change —
   the trajectory, the main-lobes fraction and the SDR gain are all untouched, so a live change just
   rebuilds + swaps (no gain re-map).
   **Calibration under the notch — `full_power` is now EXACT (deliver_frac).** `main_lobe_power` (the

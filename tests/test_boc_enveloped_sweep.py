@@ -105,8 +105,9 @@ def test_power_laws_evaluate():
     import math
     laws = {l["id"]: l for l in extract_params(_BOC.read_text(encoding="utf-8"))["calibration_power_laws"]}
     full = parse_law(laws["full_power"])
-    # centre kept (deliver_frac 1.0) → the bandwidth-invariant constant-envelope total, density + 70
-    assert full.delta_db({"deliver_frac": bs.deliver_frac(0)}) == pytest.approx(70.0)
+    # centre kept (--inner-sidelobes 1, deliver_frac 1.0) → the bandwidth-invariant constant-envelope
+    # total, density + 70
+    assert full.delta_db({"deliver_frac": bs.deliver_frac(1)}) == pytest.approx(70.0)
     main = parse_law(laws["main_lobe_power"])
     d0 = main.delta_db({"main_lobe_frac": bs.main_lobe_frac(0)})
     assert d0 == pytest.approx(70.0 + 10 * math.log10(bs.main_lobe_frac(0)))
@@ -117,25 +118,25 @@ def test_power_laws_evaluate():
 
 
 def test_full_power_is_exact_under_the_inner_notch():
-    """With --inner-sidelobes notching the centre gap, Full-signal power reports the DELIVERED
-    total (the discarded gap is subtracted via `deliver_frac`); at 0 sidelobes the notched signal
-    IS the two main lobes, so full == main-lobes exactly."""
+    """--inner-sidelobes 0 notches the centre gap; Full-signal power reports the DELIVERED total
+    (the discarded gap is subtracted via `deliver_frac`); at 0 sidelobes the notched signal IS the
+    two main lobes, so full == main-lobes exactly. --inner-sidelobes 1 keeps the centre (frac 1.0)."""
     from paramkit.power_law import parse_law
     import math
     laws = {l["id"]: l for l in extract_params(_BOC.read_text(encoding="utf-8"))["calibration_power_laws"]}
     full = parse_law(laws["full_power"])
     main = parse_law(laws["main_lobe_power"])
-    assert bs.deliver_frac(0) == 1.0                       # centre kept → nothing lost
-    assert bs.deliver_frac(1) < 1.0                        # notched → the centre gap is discarded
+    assert bs.deliver_frac(1) == 1.0                       # inner 1 → centre kept → nothing lost
+    assert bs.deliver_frac(0) < 1.0                        # inner 0 → notched → the centre gap discarded
     # notched full = density + 70 + 10·log10(deliver_frac) — the centre gap is accounted for
-    dn = full.delta_db({"deliver_frac": bs.deliver_frac(1)})
-    assert dn == pytest.approx(70.0 + 10 * math.log10(bs.deliver_frac(1)))
+    dn = full.delta_db({"deliver_frac": bs.deliver_frac(0)})
+    assert dn == pytest.approx(70.0 + 10 * math.log10(bs.deliver_frac(0)))
     assert dn < 70.0                                        # delivered below the un-notched total
     # at 0 sidelobes the notched signal IS the two main lobes → full == main-lobes exactly
     d_main0 = main.delta_db({"main_lobe_frac": bs.main_lobe_frac(0)})
     assert dn == pytest.approx(d_main0, abs=1e-6)
     # the ~0.4 dB discarded gap is the same order as the un-notched full-vs-lobes gap
-    assert -0.45 < 10 * math.log10(bs.deliver_frac(1)) < -0.30
+    assert -0.45 < 10 * math.log10(bs.deliver_frac(0)) < -0.30
 
 
 def test_main_lobe_frac_matches_the_boc_integral():
@@ -197,15 +198,15 @@ def _psd_db_filtered(base, width_hz, inner_hz):
 
 
 def test_inner_edge_snaps_to_the_code_rate_null():
-    assert bs.inner_edge_hz(0) == 0.0                       # no notch — a plain lowpass
-    assert bs.inner_edge_hz(1) == pytest.approx(5.115e6)    # notch below the 1st null
+    assert bs.inner_edge_hz(0) == pytest.approx(5.115e6)    # inner 0 → notch below the 1st null
+    assert bs.inner_edge_hz(1) == 0.0                       # inner 1 → no notch — a plain lowpass
 
 
 def test_inner_notch_drops_the_centre_gap_but_keeps_the_lobes():
     base = bs.build_boc_sweep_buffer(0)[0]
     width = 2 * bs.roam_hz(0)
     f0, P0 = _psd_db_filtered(base, width, 0.0)                       # lowpass: centre kept
-    f1, P1 = _psd_db_filtered(base, width, bs.inner_edge_hz(1))       # bandpass: centre notched
+    f1, P1 = _psd_db_filtered(base, width, bs.inner_edge_hz(0))       # bandpass (inner 0): centre notched
     c0 = float(P0[np.argmin(np.abs(f0))])
     c1 = float(P1[np.argmin(np.abs(f1))])
     assert c1 < c0 - 20.0                                             # centre far deeper after the notch

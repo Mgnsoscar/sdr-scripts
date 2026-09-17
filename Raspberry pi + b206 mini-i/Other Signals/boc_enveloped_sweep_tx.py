@@ -47,8 +47,8 @@ not the centre is notched. Uncalibrated it runs on a relative --gain.
 
 CLI
 ───
-    boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 0 --power -30
-    boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 0 --inner-sidelobes 1 --power -30  # clean split
+    boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 0 --power -30                       # clean split (centre notched, default)
+    boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 0 --inner-sidelobes 1 --power -30   # keep the low-power centre gap
     boc_enveloped_sweep_tx.py --freq 1575.42 --sidelobes 2 --gain 60      # raw-gain override
     boc_enveloped_sweep_tx.py --self-test        # verify seam closure + BOC shape, no hardware
     boc_enveloped_sweep_tx.py --describe-params  # paramkit JSON schema for the GUI
@@ -104,11 +104,11 @@ def main_lobe_frac(sidelobes: int) -> float:
     return _MAIN_LOBE_FRAC[n]
 
 
-# When --inner-sidelobes 1 NOTCHES the low-power gap between the two split lobes, the FILTER
-# discards that centre power, so the DELIVERED total is less than the constant-envelope total.
-# `deliver_frac` is the fraction of the in-band power that SURVIVES the notch: 1.0 with the centre
-# kept, else 1 − (centre-gap power / total in-band power), so the delivered full power is
-#   density + 70 + 10·log10(deliver_frac).
+# --inner-sidelobes counts the inner sidelobes KEPT: 0 NOTCHES the low-power gap between the two
+# split lobes (the filter discards that centre power), 1 keeps it. When notched, the DELIVERED total
+# is less than the constant-envelope total. `deliver_frac` is the fraction of the in-band power that
+# SURVIVES the notch: 1.0 with the centre kept, else 1 − (centre-gap power / total in-band power), so
+# the delivered full power is  density + 70 + 10·log10(deliver_frac).
 # The centre-gap fraction of the total barely moves with --sidelobes (0.0854 → 0.0810 across
 # 0..3 sidelobes — a 0.02 dB spread), and at --sidelobes 0 the notched signal IS EXACTLY the two
 # main lobes, so deliver_frac(notch, 0 sidelobes) == main_lobe_frac(0). Keying it on
@@ -118,12 +118,12 @@ def main_lobe_frac(sidelobes: int) -> float:
 # from the BOC integral so the baked constant can't drift. (True per-sidelobe exactness would need
 # a 2-parameter fold — a cross-repo eval_formula extension — for a ≤0.02 dB gain: not worth it.)
 _NOTCH_DELIVER_FRAC = 0.914610          # = main_lobe_frac(0): the notched sl-0 signal is the lobes
-_DELIVER_FRAC_ARGS = ["inner_sidelobes", 1.0, _NOTCH_DELIVER_FRAC]   # centre kept → 1.0; notched → this
+_DELIVER_FRAC_ARGS = ["inner_sidelobes", _NOTCH_DELIVER_FRAC, 1.0]   # inner 0 → notched; 1 → centre kept
 
 
 def deliver_frac(inner_sidelobes: int) -> float:
     """Fraction of the in-band power delivered after the inner notch (1.0 when the centre gap is
-    kept; the gap is discarded when --inner-sidelobes notches it)."""
+    kept; less when --inner-sidelobes 0 notches it)."""
     frac = _DELIVER_FRAC_ARGS[1:]
     return frac[max(0, min(len(frac) - 1, int(inner_sidelobes)))]
 
@@ -180,8 +180,9 @@ MAIN_LOBE_NULLS = 3          # the two main lobes end at the 3rd null (±15.345 
 MAX_SIDELOBES = 3            # (3+3)·5.115 = 30.69 MHz = Fs/2 — the whole representable signal
 DEFAULT_SIDELOBES = 0        # main lobes only (±15.345 MHz)
 MAX_ROAM_MHZ = 30.69         # ±(sidelobes+3)·5.115 must stay within ±Nyquist (Fs/2)
-# The centre gap between the two split lobes is one inner null-step ([0, 5.115] MHz). Notching it
-# (a bandpass instead of a lowpass) leaves a clean split spectrum. 0 = keep it, 1 = notch it.
+# The centre gap between the two split lobes is one inner null-step ([0, 5.115] MHz). --inner-sidelobes
+# counts inner sidelobes KEPT: 0 NOTCHES the gap (a bandpass instead of a lowpass → a clean split
+# spectrum), 1 keeps it. Default 0 = the clean split (matches --sidelobes: 0 = the cleanest signal).
 MAX_INNER_SIDELOBES = 1
 DEFAULT_INNER_SIDELOBES = 0
 
@@ -236,9 +237,11 @@ def roam_hz(sidelobes: int) -> float:
 
 
 def inner_edge_hz(inner_sidelobes: int) -> float:
-    """The passband's INNER edge: 0 (a plain lowpass, centre kept) or ±code_rate (the centre gap
-    notched, leaving a clean split spectrum). Snaps to the BOC null at ±5.115 MHz."""
-    return max(0, min(MAX_INNER_SIDELOBES, int(inner_sidelobes))) * BOC_NULL_HZ
+    """The passband's INNER edge: ±code_rate (±5.115 MHz — the centre gap NOTCHED, a clean split
+    spectrum) when NO inner sidelobe is kept, else 0 (a plain lowpass, centre kept). Snaps to the
+    BOC null at ±5.115 MHz. --inner-sidelobes counts inner sidelobes KEPT: 0 → notch, 1 → keep."""
+    kept = max(0, min(MAX_INNER_SIDELOBES, int(inner_sidelobes)))
+    return (MAX_INNER_SIDELOBES - kept) * BOC_NULL_HZ
 
 
 def check_roam(sidelobes: int) -> None:
@@ -393,9 +396,9 @@ def _self_test() -> int:
     ok = ok and frac_ok
     print(f"main-lobe tbl: baked ≡ BOC integral (≤5e-3) [{'OK' if frac_ok else 'FAIL'}]")
 
-    # 6) the inner notch (--inner-sidelobes 1) drops the centre gap while keeping the main lobes
+    # 6) the inner notch (--inner-sidelobes 0) drops the centre gap while keeping the main lobes
     filt_n, _t, _fp = filter_buffer(
-        build_boc_sweep_buffer(0)[0], 2 * roam_hz(0), FILTER_TRANSITION_HZ, inner_hz=inner_edge_hz(1))
+        build_boc_sweep_buffer(0)[0], 2 * roam_hz(0), FILTER_TRANSITION_HZ, inner_hz=inner_edge_hz(0))
     Xn = np.abs(np.fft.fftshift(np.fft.fft(filt_n))) ** 2
     smn = np.convolve(Xn, np.ones(31) / 31, "same")
     smn = 10 * np.log10(smn / smn.max() + 1e-30)
@@ -411,12 +414,12 @@ def _self_test() -> int:
     gap = np.sum(G[np.abs(grid) < BOC_NULL_HZ])                       # the notched-out centre gap
     tot0 = np.sum(G[np.abs(grid) < MAIN_LOBE_NULLS * BOC_NULL_HZ])    # total in band at 0 sidelobes
     notch0 = (tot0 - gap) / tot0                                      # what survives the notch @ sl 0
-    deliver_ok = (abs(deliver_frac(1) - notch0) < 5e-3               # baked ≡ BOC integral
-                  and deliver_frac(0) == 1.0                          # no notch → nothing lost
-                  and abs(deliver_frac(1) - main_lobe_frac(0)) < 5e-3)  # notched sl-0 == the lobes
+    deliver_ok = (abs(deliver_frac(0) - notch0) < 5e-3               # baked ≡ BOC integral (inner 0 = notch)
+                  and deliver_frac(1) == 1.0                          # centre kept → nothing lost
+                  and abs(deliver_frac(0) - main_lobe_frac(0)) < 5e-3)  # notched sl-0 == the lobes
     ok = ok and deliver_ok
-    print(f"deliver frac : notch keeps {deliver_frac(1):.4f} "
-          f"({10 * np.log10(deliver_frac(1)):+.3f} dB) ≡ the two lobes at 0 sl "
+    print(f"deliver frac : notch keeps {deliver_frac(0):.4f} "
+          f"({10 * np.log10(deliver_frac(0)):+.3f} dB) ≡ the two lobes at 0 sl "
           f"[{'OK' if deliver_ok else 'FAIL'}]")
 
     print("SELF-TEST OK" if ok else "SELF-TEST FAILED")
@@ -517,10 +520,11 @@ def build_script() -> Script:
                      "3 = ±30.69 MHz (Fs/2). Live (regenerates the sweep).")
         .number("-Inner-sidelobes", "--inner-sidelobes", min=0, max=MAX_INNER_SIDELOBES, step=1,
                 default=DEFAULT_INNER_SIDELOBES, required=False, live=True,
-                help="Notch away the low-power gap BETWEEN the two main lobes (a bandpass instead "
-                     "of a lowpass): 0 = keep the centre; 1 = a clean split spectrum (passband "
-                     "starts at ±5.115 MHz). Set --power in Main-lobes power when notching — "
-                     "Full-signal power counts the discarded centre. Live (regenerates).")
+                help="Inner sidelobes KEPT below the two main lobes: 0 NOTCHES away the low-power "
+                     "gap BETWEEN them (a bandpass instead of a lowpass — passband starts at "
+                     "±5.115 MHz, a clean split spectrum); 1 keeps the centre. Full-signal power "
+                     "tracks this (it reports the delivered total, gap excluded); main-lobes power "
+                     "is unaffected. Live (regenerates).")
         .derived("-Main-lobe-fraction", name="main_lobe_frac", hidden=True,
                  formula={"table": _MAIN_LOBE_FRAC_ARGS},
                  help="Fraction of the BOC power inside the two main lobes at the current sidelobe "
