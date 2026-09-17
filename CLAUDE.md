@@ -35,6 +35,33 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — BOC Enveloped Sweep (BOC(10,5) / M-code shaped): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
+New `Other Signals/boc_enveloped_sweep_tx.py` — the Enveloped Sweep with the shape of a sine-phased
+**BOC(10,5)** (GPS M-code) spectrum instead of a sinc². Same dwell-shaping engine, different target
+`S(f)`: a constant-envelope swept tone whose averaged PSD reproduces M-code's SPLIT spectrum — two
+lobes at ±10.23 MHz with a gap at the centre — by dwell time (the tone lingers on the two main
+lobes, rushes through the nulls + centre gap). Fixed BOC(10,5) rates (like `PRN GPS/MCode.py`):
+subcarrier fsub 10.23 MHz, code rate fc 5.115 MHz.
+- **`boc_psd(f)`** — the sine-BOC(10,5) PSD `∝ [sin(4a)sin(a)/(πf·cos(a))]²`, a=πf/(2·fsub), made
+  singularity-free via `sin(4a)/cos(a)=4·sin(a)(1−2sin²a)` so the lobe peaks (0/0 at ±fsub) are
+  finite; a null at DC. Verified: peak ±10.23, deep nulls at 5.115 / 15.345, gap at 0.
+- **`_boc_dwell_freq`** — inverse-CDF of `boc_psd` (out-and-back, zero-mean → seamless loop), the
+  same core as the sinc² script. `--sidelobes` 0..3 keeps the two main lobes + n further BOC
+  null-steps → ±(sidelobes+3)·5.115 MHz (0 → ±15.345, 3 → ±30.69 = Fs/2), matching MCode's null
+  snapping. **Confined to ±roam** by construction (`--self-test` asserts `max|f| ≤ roam`; measured
+  it stops just inside the outermost null). No `--chip-rate` (BOC rates are fixed); params are
+  `--freq`/`--power`/`--gain`/`--sidelobes`/`--rf`, all live.
+- **Calibration** — reuses `"Chirp/Sweep"` (constant-envelope → identical total power) with the same
+  `full_power` (k=70) + `main_lobe_power` laws; the `main_lobe_frac` table is the BOTH-main-lobes
+  fraction (|f|∈[5.115,15.345] MHz) of the BOC integral, keyed on `--sidelobes`: frac(0)=0.9146
+  (−0.39 dB — the ±15.345 band also passes the low-power centre gap, exactly MCode's note), down to
+  frac(3)=0.867. Baked literal re-derived from the BOC PSD in `--self-test`.
+- `argspec`/`ramp` untouched (drift guard intact); no agent/client change. Tests:
+  `tests/test_boc_enveloped_sweep.py` (BOC PSD split spectrum + finite peaks; argspec + reuse;
+  laws evaluate incl. the 0.39 dB full-vs-main gap; main_lobe_frac ≡ BOC integral; constant
+  envelope + seam; realised split spectrum; sidelobes set the band; roam guard; confinement;
+  `--self-test`/`--describe-params`). Suite 83 → 94.
+
 ## Current state — Enveloped Sweep (sinc² dwell-shaped constant-envelope sweep): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 New `Other Signals/enveloped_sweep_tx.py`. A SEQUENTIAL swept tone whose TIME-AVERAGED PSD is
 shaped like a sinc² — energy concentrated at the centre — realised purely by DWELL TIME, not an
