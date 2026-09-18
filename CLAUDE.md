@@ -35,6 +35,37 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — clean-set scripts adopt the `txhealth` done-watcher (RF-fault Phase 1): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Part of the agent's RF-fault DETECTION (`sdr-agent` 1.28.0, capability `task-rf-health`,
+`docs/rf-fault-recovery.md` §5.1/§14b). The field incident was a GNU Radio flowgraph that HALTED at
+startup (a `vmcircbuf` buffer error) but did NOT exit, so the agent showed the task RUNNING while the
+SDR sent nothing. GR does NOT re-raise a halted flowgraph to Python, so **`tb.wait()` RETURNING with
+the stop flag still UNSET IS the fault signal**. The 30 CLEAN-set RPi scripts now turn that silent halt
+into a NON-ZERO EXIT the agent sees:
+```python
+from paramkit.txhealth import watch_flowgraph
+...
+tb.start()
+_health = watch_flowgraph(tb, stop)   # daemon thread; joins tb.wait(); prints HEALTH state=faulted on a silent halt
+...
+return 1 if _health.faulted else 0
+```
+`watch_flowgraph` (in `sdr-agent/paramkit/txhealth.py`) also prints a `HEALTH state=faulted` marker
+(flushed whole) so the agent's ~2 s log-scan watchdog catches the same fault for the true-wedge case.
+- **CLEAN set = repeat=True / continuous scripts** (Galileo/GLONASS/BeiDou/GPS-vector/PRN, the
+  enveloped/BOC sweeps, the CW/drift/noise/comb, `fm_chirp` incl. the fixed-bw variants, iridium — 30
+  files): a running graph only ends `tb.wait()` on a REAL halt, so the done-watcher is safe + correct.
+- **FIFO caution-set — EXCLUDED** (`gps_l1p_tx.py`/`gps_l2p_tx.py`/`white_noise_tx.py`/
+  `gaussian_noise_tx.py`, repeat=False): a producer-fed FIFO + a `--duration` deadline means a NORMAL
+  end-of-stream ALSO returns `tb.wait()` with `stop` unset — that would read as a FALSE fault, so they
+  do NOT adopt the watcher and rely on the agent's Layer-2 log-scan watchdog instead.
+- **Mocks** (`mock_*`) run no GNU Radio top block → no `tb.wait()` to watch → untouched.
+No calibration/param/argspec change (a `stop` flag + a daemon thread; the process just exits non-zero
+on a silent halt). Tests: `tests/test_txhealth_adoption.py` (30 clean adopters wire the import + call +
+gated return; the 4 FIFO scripts do NOT; the mocks do NOT). Suite 99 → 102. `tests/test_cw_drift.py`'s
+fake-`gnuradio` stub was updated so `wait()` BLOCKS until `stop()` (models a real flowgraph, so the
+watcher doesn't read the instant return as a false fault).
+
 ## Current state — /dev/shm stagers use the tagged `txstage.staging_dir` (RF-fault Phase 0): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Part of the agent's RF-fault PREVENTION work (`sdr-agent` 1.27.4, `docs/rf-fault-recovery.md` §3.5/§14a).
 The scripts that stage IQ into `/dev/shm` (a 32–49 MB loop-file, or a FIFO) previously used
