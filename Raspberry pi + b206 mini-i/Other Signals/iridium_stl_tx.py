@@ -302,9 +302,8 @@ def main() -> int:
         samp_rate, args.preamble_symbols, args.payload_symbols, args.burst_period,
         args.frames, args.rolloff, seed=1)
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="iridium_stl_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    from paramkit import txstage as _txstage
+    tmpdir = _txstage.staging_dir("iridium_stl")   # tagged /dev/shm dir the agent sweeps after a hard kill (rf-fault-recovery §3.5)
     iq_file = os.path.join(tmpdir, "burst.fc32")
     iq.tofile(iq_file)
 

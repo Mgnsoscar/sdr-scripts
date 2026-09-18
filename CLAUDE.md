@@ -35,6 +35,25 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — /dev/shm stagers use the tagged `txstage.staging_dir` (RF-fault Phase 0): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo)
+Part of the agent's RF-fault PREVENTION work (`sdr-agent` 1.27.4, `docs/rf-fault-recovery.md` §3.5/§14a).
+The scripts that stage IQ into `/dev/shm` (a 32–49 MB loop-file, or a FIFO) previously used
+`tempfile.mkdtemp(prefix="<signal>_", dir=/dev/shm)` with an ad-hoc, PID-less prefix and cleaned up
+only via `atexit`/a `finally` — both SKIPPED on `SIGKILL` / a wedged `tb.wait()` the agent then
+SIGKILLs, orphaning the file (cumulative `/dev/shm` pressure). They now stage via the shared
+**`paramkit/txstage.py` `staging_dir(signal)`** → `/dev/shm/sdrtx-<pid>-<signal>-…`, a TAGGED,
+PID-bearing name the **agent** can sweep safely (`txstage.sweep_orphans()` removes only dead-PID
+`sdrtx-*` entries — at boot, before each launch, and after each task ends). The tag is the contract;
+the agent-side dead-PID sweep supersedes a per-script SIGTERM handler (it also catches SIGKILL/crash).
+Migrated (17 RPi scripts): the loop-file family — **Galileo** `gal_e1/gal_e5/gal_e5_altboc/gal_e6/gal_prs`,
+**GLONASS** `glonass_of/glonass_sf`, **BeiDou** `bds_b1c/bds_b1i/bds_b2a/bds_b2b/bds_b3i`,
+**Other** `iridium_stl`; and the FIFO family — **GPS** `gps_l1p/gps_l2p`, **Other**
+`white_noise/gaussian_noise`. Fixed two copy-paste prefix bugs in passing (`gps_l1p` was `gps_l2p_`;
+`glonass_of` was `glonass_`). `fm_chirp_tx.py` (the incident script) and the GPS `vector_source`
+scripts stage NOTHING in `/dev/shm` → untouched. No calibration/param/argspec change (staging only);
+all 17 byte-compile and the suite stays green (99). **NOT migrated (deferred):** the x410 `*_channel.py`
+stagers (bare `mkstemp`, delete-after-load, tiny exposure).
+
 ## Current state — inner-notch filter on the M-code PRN script + `--inner-sidelobes` polarity flip (0 = filtered out): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 Owner asks: (1) give the REAL **M-code PRN** generator (`PRN GPS/MCode.py`) the same inner-notch
 filter the BOC Enveloped Sweep has; (2) flip `--inner-sidelobes` so **0 = the centre gap FILTERED OUT**

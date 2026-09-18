@@ -385,9 +385,8 @@ def main() -> int:
 
     base_iq, nsamp = build_b1i_buffer(args.prn)
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="bds_b1i_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    from paramkit import txstage as _txstage
+    tmpdir = _txstage.staging_dir("bds_b1i")   # tagged /dev/shm dir the agent sweeps after a hard kill (rf-fault-recovery §3.5)
 
     def write_buffer(iq) -> str:
         fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)

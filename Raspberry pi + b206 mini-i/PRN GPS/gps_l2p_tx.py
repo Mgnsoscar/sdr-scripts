@@ -418,7 +418,8 @@ def main() -> int:
     import tempfile
     from gnuradio import gr, blocks, uhd
 
-    tmpdir = tempfile.mkdtemp(prefix="gps_l2p_", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+    from paramkit import txstage as _txstage
+    tmpdir = _txstage.staging_dir("gps_l2p")   # tagged /dev/shm dir the agent sweeps after a hard kill (rf-fault-recovery §3.5)
     fifo_path = os.path.join(tmpdir, "iq.fifo")
     os.mkfifo(fifo_path)
 

@@ -638,9 +638,8 @@ def main() -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="gal_e5ab_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    from paramkit import txstage as _txstage
+    tmpdir = _txstage.staging_dir("gal_e5ab")   # tagged /dev/shm dir the agent sweeps after a hard kill (rf-fault-recovery §3.5)
 
     def write_buffer(iq) -> str:
         fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)

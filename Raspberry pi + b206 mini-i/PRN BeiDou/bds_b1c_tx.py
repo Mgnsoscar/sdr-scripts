@@ -508,9 +508,8 @@ def main() -> int:
     want_data = args.component in ("both", "data")
     want_pilot = args.component in ("both", "pilot")
 
-    shm = "/dev/shm" if os.path.isdir("/dev/shm") else None
-    tmpdir = tempfile.mkdtemp(prefix="bds_b1c_", dir=shm)
-    atexit.register(lambda: shutil.rmtree(tmpdir, ignore_errors=True))
+    from paramkit import txstage as _txstage
+    tmpdir = _txstage.staging_dir("bds_b1c")   # tagged /dev/shm dir the agent sweeps after a hard kill (rf-fault-recovery §3.5)
 
     def write_buffer(iq) -> str:
         fd, path = tempfile.mkstemp(suffix=".fc32", dir=tmpdir)
