@@ -704,6 +704,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     tb.start()
+    from paramkit.txhealth import watch_flowgraph
+    _health = watch_flowgraph(tb, stop)   # RF-fault: a silent GR halt -> non-zero exit (rf-fault-recovery.md §5.1)
     try:
         while not stop.is_set():
             for change in ctrl.drain():
@@ -713,7 +715,7 @@ def main() -> int:
         ctrl.close()
         tb.stop()
         tb.wait()
-    return 0
+    return 1 if _health.faulted else 0
 
 
 if __name__ == "__main__":

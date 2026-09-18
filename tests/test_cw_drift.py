@@ -265,12 +265,15 @@ class _Mod:
         if name.isupper(): return name
         return _Obj
 
+import threading as _threading
 class _TopBlock:
-    def __init__(self, *a, **k): pass
+    # wait() BLOCKS until stop() — modelling a real flowgraph (it returns when the graph halts or is
+    # stopped), so paramkit.txhealth.watch_flowgraph doesn't read an instant return as a false halt.
+    def __init__(self, *a, **k): self._done = _threading.Event()
     def connect(self, *a): pass
     def start(self): pass
-    def stop(self): pass
-    def wait(self): pass
+    def stop(self): self._done.set()
+    def wait(self): self._done.wait()
 
 gr = _Mod(); gr.top_block = _TopBlock
 analog = _Mod(); blocks = _Mod(); uhd = _Mod()

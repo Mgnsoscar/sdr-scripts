@@ -668,10 +668,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     signal.signal(signal.SIGINT, lambda *_: stop.set())
 
-    # No watchdog: the in-RAM vector_source_c has no file to short-read, so the "fread error"
-    # that silently killed the source (and needed a self-heal restart) can't happen. The graph
-    # runs until stopped; live changes retune or swap the loop buffer in place.
+    # The in-RAM vector_source_c has no file to short-read, so the "fread error" that silently
+    # killed a file_source (and needed a self-heal restart) can't happen — but a GR flowgraph can
+    # still HALT on its own (e.g. a vmcircbuf buffer fault), so watch_flowgraph below turns that
+    # silent halt into a non-zero exit (rf-fault-recovery.md §5.1). The graph otherwise runs until
+    # stopped; live changes retune or swap the loop buffer in place.
     tb.start()
+    from paramkit.txhealth import watch_flowgraph
+    _health = watch_flowgraph(tb, stop)   # RF-fault: a silent GR halt -> non-zero exit (rf-fault-recovery.md §5.1)
     try:
         while not stop.is_set():
             for change in ctrl.drain():
@@ -681,7 +685,7 @@ def main() -> int:
         ctrl.close()
         tb.stop()
         tb.wait()
-    return 0
+    return 1 if _health.faulted else 0
 
 
 if __name__ == "__main__":
