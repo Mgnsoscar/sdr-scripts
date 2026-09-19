@@ -35,6 +35,35 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — `gps_l2c_tx.py` full-CL warm-up ~2× faster (RF-fault Phase 3b — fast-warm, in place): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
+The Phase-3b "fast-warm" half of the RF-fault recovery design (`../sdr-agent/docs/rf-fault-recovery.md`
+§8), done as an IN-PLACE speed-up instead of a disk cache. **Measurement first (owner-approved pivot):**
+the design assumed "L1C/L2C ~30 s IQ generation," but the current numpy-vectorized generators are fast —
+**L1C ~0.5 s, L2C `--loop cm` ~0.3 s** — so a cache there is pointless. Only **L2C `--loop full`** (the
+DEFAULT — the bit-exact 1.5 s CL loop) is slow: **~14 s here** (build 7 + filter 7), a **736 MB** buffer,
+likely ~30-60 s on a Pi. A 736 MB disk cache (per PRN×sidelobes) was rejected (SD footprint + read ≈ the
+build); instead the generation itself was sped up, which helps EVERY launch with no disk cost.
+- **`build_l2c_buffer` returns REAL float32** (was complex64). The base IS real BPSK (±1, Q=0), so
+  complex64 doubled the 736→368 MB memory traffic — the dominant build cost — for nothing. **6.9 s → 3.2 s.**
+  It feeds ONLY `filter_buffer` (+ the `--self-test` `band()`), never the top block, so the dtype change
+  is internal (the FILTERED loop the flowgraph streams stays complex64).
+- **`_circular_convolve` gained a real fast path** (`np.isrealobj(x)`): a real-FFT (`rfft`/`irfft`)
+  overlap-add that accumulates each block straight into the REAL slots of a preallocated complex64 output
+  (`out.real`, imag stays 0) — no separate complex accumulator, no float→complex copy pass. Filter
+  **6.8 s → ~2-3 s**. The `m ≥ n` tiny-loop branch got a real sub-branch too. The COMPLEX path is kept
+  unchanged for any complex input. Peak RAM also DROPS (368 + 736 MB vs the old 736 + 736 MB) — a win on a
+  Pi. Net full-loop build+filter **~13.6 s → ~5.9 s (~2.3×)**; on a slower Pi the FFT/arithmetic savings
+  compound.
+- **Numerically identical:** the new filtered output matches the old complex-path output to **max|diff|
+  1.2e-7** (≈ −138 dB) across (prn, loop, sidelobes) incl. the full 92 M-sample loop, and `filt.imag` is
+  EXACTLY 0 (a real signal through a real filter). The `--self-test` spectral check is unchanged (main
+  lobe +0.000 dB, kept +0.000, far −135 dB). No calibration/param/argspec change; `argspec`/`ramp`
+  untouched (drift guard intact). No agent/client change. **L5/CA share the copy but aren't slow (small
+  loops), so they're left on the complex path** (the pattern is there if the owner wants it applied).
+Tests: `tests/test_l2c_fast_filter.py` (base real float32 + BPSK ±1; filtered complex64 with imag == 0;
+the real fast path == the original complex path to float rounding; the `m ≥ n` tiny branch == complex ==
+a monolithic reference; the circular seam holds). Suite 102 → 106.
+
 ## Current state — clean-set scripts adopt the `txhealth` done-watcher (RF-fault Phase 1): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Part of the agent's RF-fault DETECTION (`sdr-agent` 1.28.0, capability `task-rf-health`,
 `docs/rf-fault-recovery.md` §5.1/§14b). The field incident was a GNU Radio flowgraph that HALTED at
