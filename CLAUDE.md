@@ -35,6 +35,24 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — `cw_drift_tx.py --elapsed`: the script-declared resume point (RF-fault restart at the right time): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo with agent 1.32.0)
+Owner ask: a time-dependent script must declare something that lets the agent restart it at the CORRECT
+time, so a crashed drift continues from the right point with the right parameters. The drift's clock is
+`now − t0` from launch, so the agent could only ever restart it from the START frequency. Now
+`cw_drift_tx.py` declares **`--elapsed`** (`-Elapsed`, seconds, min 0, default 0, paramkit
+**`is_elapsed=True`** — the new marker, extracted by the agent's static `argspec`): `t0 = monotonic() −
+elapsed`, and the tone is BORN at that point — `f0 = drift_freq(elapsed, …)`, the top block built in f0's
+LO window (`plan_lo`) at f0's NCO offset with the SDR gain folded THERE (the attenuator split stays pinned at
+the START carrier, where the agent positions it from `--freq`), so nothing is emitted at the start frequency
+first. The banner adds `resumed at : N s into the drift → f MHz`. `--restart` (live) still re-runs from the
+start. The agent (`sdr-agent` 1.32.0, `docs/rf-fault-recovery.md` §14g) bakes `--elapsed` = the launch's
+value + the seconds the crashed run had drifted on BOTH restart paths (a run's resync/replay restart, the
+standalone auto-restart) and via `build_resume_request` for an arm-time resume offset. An operator can also
+set it by hand to begin part-way. Tests: `tests/test_cw_drift.py` (schema: exactly one `is_elapsed` param;
+the banner at 5400 s of a 1600→1300/180 min drift reads 1450 MHz; the REAL `main()` driven in-process with a
+fake gnuradio: born at the resume point inside its LO window, the drift clock continues from 5400 s). Suite
+110 → 112. The FIFO `--duration` stagers could declare the marker later (not done).
+
 ## Current state — adopters set `stop` before `tb.stop()` (review fix #7) + L2C `m >= n` branch refuses (review fix #22): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 Two verified review findings on the RF-fault Phase-1 adoption + the L2C fast filter. Suite 106 → 110.
 - **#7 (MEDIUM) — an ordinary crash was misreported as an RF fault.** `txhealth.watch_flowgraph`

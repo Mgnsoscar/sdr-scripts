@@ -349,6 +349,13 @@ def build_script() -> Script:
                 default="once",
                 help="once = ramp then hold at the end; loop = repeat start→end; pingpong = "
                      "start→end→start…")
+        .number("-Elapsed", "--elapsed", unit="s", min=0.0, default=0.0, is_elapsed=True,
+                help="Start this many SECONDS into the drift instead of at the start frequency "
+                     "(0 = from the start). The drift's clock is shifted by it, so the tone "
+                     "begins where it would have been after that long and continues from there. "
+                     "The agent sets it on an RF-fault restart (the seconds the crashed run had "
+                     "drifted) so the sweep resumes at the right point; you can also set it by "
+                     "hand to begin part-way through.")
         .number("-Sample-rate", "--sample_rate", unit="MHz", min=0.2, max=61.44,
                 presets=SAMPLE_RATES_MHZ, default=2.0, required=True,
                 help="Host/DAC sample rate. A drift wider than 70 % of it is swept window by "
@@ -454,6 +461,15 @@ def main() -> int:
     wide = drifting and is_wide(start, end, samp_rate)
     lo0 = initial_lo(start, end, samp_rate) if drifting else start
     hops_per_pass = hop_count(start, end, samp_rate)
+    # --elapsed: begin this many seconds INTO the drift (an RF-fault restart resumes here; 0 = the
+    # start). The drift's clock is shifted by it and the tone is born at that point's frequency —
+    # the LO window it falls in, its NCO offset and the SDR gain folded THERE — so nothing is
+    # emitted at the start frequency first. The attenuator split stays pinned at the START
+    # frequency (where the agent positions it from --freq), exactly as for an unshifted launch.
+    elapsed0 = max(0.0, float(getattr(args, "elapsed", 0.0) or 0.0)) if drifting else 0.0
+    f0 = drift_freq(elapsed0, start, end, duration_s, args.drift) if elapsed0 > 0 else start
+    if wide and f0 != start:
+        lo0 = plan_lo(f0, lo0, half)
 
     # Power map: the unit's injected calibration curve if present (SDR_CALIBRATION_FILE),
     # else it runs uncalibrated — a relative gain only (no baked behaviour).
@@ -470,7 +486,7 @@ def main() -> int:
         # tone moves only the SDR gain re-folds (refold below), never the attenuation the agent
         # physically set. None (no active component) folds the SDR alone.
         applied = pmap.pinned_applied(args.power, freq=start)
-        gain_db = pmap.gain_for_power(args.power, freq=start, applied_db=applied)
+        gain_db = pmap.gain_for_power(args.power, freq=f0, applied_db=applied)
     else:                                           # uncalibrated: a persisted fallback gain, or refuse
         _fb = os.environ.get("SDR_CAL_FALLBACK_GAIN")
         if _fb is None:
@@ -480,7 +496,7 @@ def main() -> int:
             return 2
         gain_db = max(0.0, min(HW_MAX_GAIN_DB, float(_fb)))
 
-    tb = _build_top_block(lo0, samp_rate, start - lo0, gain_db, amplitude, extra_args="")
+    tb = _build_top_block(lo0, samp_rate, f0 - lo0, gain_db, amplitude, extra_args="")
 
     # RF on/off state + the gain RF-on applies. Defaults to --rf off so it starts muted;
     # RF is a pure mute/unmute and does NOT touch the sweep. Power/gain edits made while
@@ -489,7 +505,7 @@ def main() -> int:
     state = {"rf_on": getattr(args, "rf", "off") == "on", "gain": gain_db,
              "power": args.power if (pmap.has_absolute and gain_cal is None) else None,
              "applied": applied,
-             "freq": start, "lo": lo0, "fold_f": start,
+             "freq": f0, "lo": lo0, "fold_f": f0,
              "blank_s": float(getattr(args, "hop_blank", DEFAULT_HOP_BLANK_MS)) / 1e3,
              "hops": 0}
     if not state["rf_on"]:
@@ -508,6 +524,9 @@ def main() -> int:
         else:
             print(f"  sweep mode     : narrow — LO fixed at {lo0/1e6:.6f} MHz, the whole "
                   f"±{span/2e6:g} MHz on the baseband NCO (fully continuous)")
+        if elapsed0 > 0:
+            print(f"  resumed at     : {elapsed0:g} s into the drift → {f0/1e6:.6f} MHz "
+                  f"(the clock continues from there)")
     else:
         print(f"  tone           : {start/1e6:.6f} MHz (start == end — static; use cw_tx.py)")
     print(f"  sample rate    : {args.sample_rate:g} MHz")
@@ -515,8 +534,8 @@ def main() -> int:
         print(f"  power (target) : {args.power:g} dBm  ({pmap.label})"
               + (" — re-folded along the sweep" if drifting and gain_cal is None else ""))
         print(f"  power (achieved on grid): "
-              f"{pmap.power_for_gain(gain_db, freq=start, applied_db=applied):.2f} dBm "
-              f"at {start/1e6:.3f} MHz"
+              f"{pmap.power_for_gain(gain_db, freq=f0, applied_db=applied):.2f} dBm "
+              f"at {f0/1e6:.3f} MHz"
               + (f" (attenuator pinned at {-applied:g} dB)" if applied else ""))
     print(f"  → gain         : {gain_db:.2f} dB (max {pmap.max_gain_db:g}), "
           f"amplitude {amplitude:g}")
@@ -619,8 +638,9 @@ def main() -> int:
             ctrl.report("restart", True)
 
     # The drift runs on its own timeline from start — independent of RF. RF on/off is
-    # a pure mute; only --restart re-runs the sweep from the start frequency.
-    nonlocal_t0 = [time.monotonic() if drifting else None]
+    # a pure mute; only --restart re-runs the sweep from the start frequency. --elapsed shifts
+    # the clock so the sweep is already that far along (a restart resumes where it left off).
+    nonlocal_t0 = [time.monotonic() - elapsed0 if drifting else None]
     next_progress = time.monotonic() + PROGRESS_EVERY_S
 
     stop = threading.Event()

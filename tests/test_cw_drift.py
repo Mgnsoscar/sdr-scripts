@@ -242,6 +242,12 @@ def test_schema_surface_and_shared_calibration_signal():
     assert {p["dest"]: p for p in tone["params"]}["freq"]["unit"] == "MHz"
     assert by["hop_blank"]["live"] and by["hop_blank"]["unit"] == "ms"
     assert by["rf"]["is_rf"] and by["rf"]["live"]
+    # --elapsed: the script-declared ELAPSED-TIME parameter (paramkit is_elapsed) the agent bakes on
+    # an RF-fault restart so the drift resumes at the right point; seconds, default 0 (from start).
+    assert by["elapsed"]["is_elapsed"] is True and by["elapsed"]["unit"] == "s"
+    assert by["elapsed"]["default"] == 0.0 and by["elapsed"]["min"] == 0.0
+    assert not by["elapsed"]["live"]                     # a launch parameter, not a live knob
+    assert [d for d, p in by.items() if p.get("is_elapsed")] == ["elapsed"]   # exactly one
     assert by["power"]["live"] and by["power"]["unit"] == "dBm"
     vals = [p.get("value") if isinstance(p, dict) else (p[1] if isinstance(p, (list, tuple)) else p)
             for p in by["sample_rate"]["presets"]]
@@ -338,3 +344,77 @@ def test_self_test_and_describe_params_run_without_a_radio():
     assert out.returncode == 0, out.stderr
     names = {p.get("name") or p.get("dest") for p in json.loads(out.stdout)["params"]}
     assert {"freq", "freq_end", "duration", "hop_blank", "restart"} <= names
+
+
+def test_elapsed_resumes_the_drift_part_way_in_the_banner(tmp_path):
+    """--elapsed 5400 on a 1600→1300 MHz / 180 min drift: the banner reports the resume point and
+    the frequency the timeline has reached there (half-way: 1450 MHz); the rest is unchanged."""
+    out = _banner(tmp_path, _DRIFT, ["--freq", "1600", "--freq_end", "1300", "--duration", "180",
+                                     "--sample_rate", "2", "--power", "-30", "--gain", "60",
+                                     "--rf", "on", "--elapsed", "5400"])
+    assert "resumed at     : 5400 s into the drift → 1450.000000 MHz" in out
+    assert "1600.000000 → 1300.000000 MHz over 180 min" in out and "214 analog-LO hops" in out
+    out = _banner(tmp_path, _DRIFT, ["--freq", "1600", "--freq_end", "1300", "--duration", "180",
+                                     "--sample_rate", "2", "--power", "-30", "--gain", "60"])
+    assert "resumed at" not in out                       # default 0: from the start, as before
+
+
+def test_elapsed_shifts_the_drift_clock_and_births_the_tone_at_that_point(monkeypatch, tmp_path):
+    """Drive the REAL cw_drift_tx.py main() in-process (fake gnuradio, no radio) with --elapsed:
+    the top block is BUILT at the resume frequency (its LO window + NCO offset — nothing is emitted
+    at the start frequency first) and the loop's drift clock reads elapsed + the time run, not
+    the time since launch — i.e. the sweep continues from where the crashed run had drifted."""
+    import types
+    import paramkit.live as live
+    mod = _load()
+    monkeypatch.setitem(sys.modules, "gnuradio", _fake_gnuradio())
+    monkeypatch.delenv("SDR_CTRL_SOCK", raising=False)
+    monkeypatch.delenv("SDR_CALIBRATION_FILE", raising=False)
+    monkeypatch.setattr(sys, "argv", [str(_DRIFT), "--freq", "1600", "--freq_end", "1300",
+                                      "--duration", "180", "--sample_rate", "2", "--power", "-30",
+                                      "--gain", "60", "--rf", "on", "--elapsed", "5400"])
+    monkeypatch.setattr(mod, "signal", types.SimpleNamespace(
+        SIGTERM=15, SIGINT=2, signal=lambda *a, **k: None))
+    built = {}
+    real_build = mod._build_top_block
+
+    def spy_build(center, samp, tone, *a, **k):
+        built.update(center=center, tone=tone)
+        return real_build(center, samp, tone, *a, **k)
+    monkeypatch.setattr(mod, "_build_top_block", spy_build)
+    clock = []                                           # every elapsed the loop folds the law at
+    real_law = mod.drift_freq
+
+    def spy_law(elapsed, *a):
+        clock.append(elapsed)
+        return real_law(elapsed, *a)
+    monkeypatch.setattr(mod, "drift_freq", spy_law)
+    ticks = {"n": 0}
+
+    def drain(self):                                     # let the loop run a few ticks, then end it
+        ticks["n"] += 1
+        if ticks["n"] > 4:
+            raise RuntimeError("test: stop the loop")
+        return []
+    monkeypatch.setattr(live.LiveControl, "drain", drain)
+    monkeypatch.setattr(mod, "TICK_S", 0.01)
+    with pytest.raises(RuntimeError, match="stop the loop"):
+        mod.main()
+    f0 = real_law(5400.0, S, E, D, "once")
+    assert f0 == 1450e6
+    half = mod.half_window_hz(2e6)
+    assert built["center"] + built["tone"] == f0        # born AT the resume point …
+    assert abs(built["tone"]) <= half                    # … inside its LO window
+    assert clock[0] == 5400.0                            # the setup fold at --elapsed
+    loop = clock[1:]
+    assert len(loop) >= 3
+    assert all(5400.0 <= t < 5400.0 + 5.0 for t in loop) # the clock CONTINUES from 5400 s
+    assert loop == sorted(loop)                          # … and advances
+
+
+def _fake_gnuradio():
+    """The stand-in `gnuradio` package above, as an importable module (for the in-process run)."""
+    import types
+    mod = types.ModuleType("gnuradio")
+    exec(_FAKE_GNURADIO, mod.__dict__)
+    return mod
