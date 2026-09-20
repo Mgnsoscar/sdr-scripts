@@ -7,7 +7,9 @@ NO change to the transmitted samples. These tests pin that contract without a ra
 
   • the base is real float32; the filtered loop is complex64 with an EXACTLY-zero imaginary part;
   • the real fast path reproduces the original complex path bit-for-bit (to float rounding);
-  • the tiny-loop (m >= n) branch and a direct monolithic circular convolution agree too.
+  • a filter at least as long as the loop (m >= n) is REFUSED, never silently truncated (review
+    fix #22), and filter_buffer's tap budget (max_taps = n // 2) keeps every shipped configuration
+    (loop 'cm' / 'full', every sidelobe count) clear of that branch.
 """
 import importlib.util
 from pathlib import Path
@@ -58,19 +60,61 @@ def test_real_fast_path_matches_the_complex_path():
     assert np.max(np.abs(real_out - cplx_out)) < 1e-5             # float32 rounding only
 
 
-def test_tiny_loop_branch_real_equals_complex_and_reference():
-    """m >= n (filter longer than the loop) takes the direct-DFT branch; real == complex == ref."""
+def test_a_filter_at_least_as_long_as_the_loop_is_refused_not_truncated():
+    """m >= n: `np.fft.fft(h, n)` would silently TRUNCATE the FIR to n taps — not a circular
+    convolution with the full filter (that would alias h modulo n). The branch now refuses
+    loudly, for a real AND a complex input; one tap short of the loop is still a valid (proper,
+    overlap-add) circular convolution and matches the monolithic reference."""
     rng = np.random.default_rng(0)
     x = (1.0 - 2.0 * rng.integers(0, 2, size=97)).astype(np.float32)   # real ±1
-    h = l2c._design_lowpass(3e6, l2c.TRANS_HZ, 4096)[0]                # m >> n → tiny branch
+    h = l2c._design_lowpass(3e6, l2c.TRANS_HZ, 4096)[0]                # m >> n
     assert len(h) >= len(x)
-    real_out = l2c._circular_convolve(x, h)
-    cplx_out = l2c._circular_convolve(x.astype(np.complex64), h)
-    ref = np.fft.ifft(np.fft.fft(x) * np.fft.fft(h, len(x)))          # monolithic circular conv
-    assert real_out.dtype == np.complex64
-    assert np.max(np.abs(real_out - cplx_out)) < 1e-5
-    assert np.max(np.abs(real_out - ref.astype(np.complex64))) < 1e-4
+    with pytest.raises(ValueError, match="filter longer than the loop"):
+        l2c._circular_convolve(x, h)
+    with pytest.raises(ValueError, match="filter longer than the loop"):
+        l2c._circular_convolve(x.astype(np.complex64), h)
+    # the boundary: exactly m == n is refused too …
+    h_eq = h[:len(x)] / h[:len(x)].sum()
+    with pytest.raises(ValueError, match="m >= n"):
+        l2c._circular_convolve(x, h_eq)
+    with pytest.raises(ValueError, match="m >= n"):
+        l2c._circular_convolve(x.astype(np.complex64), h_eq)
+    # … while m == n − 1 goes through overlap-add and IS the full circular convolution.
+    h_ok = h[:len(x) - 1] / h[:len(x) - 1].sum()
+    ref = np.fft.ifft(np.fft.fft(x) * np.fft.fft(h_ok, len(x))).astype(np.complex64)
+    real_out = l2c._circular_convolve(x, h_ok)
+    cplx_out = l2c._circular_convolve(x.astype(np.complex64), h_ok)
+    assert real_out.dtype == np.complex64 and cplx_out.dtype == np.complex64
+    assert np.max(np.abs(real_out - ref)) < 1e-4
+    assert np.max(np.abs(cplx_out - ref)) < 1e-4
     assert np.max(np.abs(real_out.imag)) == 0.0
+
+
+def test_filter_buffer_taps_are_always_shorter_than_the_loop():
+    """The refusing branch must stay UNREACHABLE from the transmit path: for both shipped loops
+    ('cm' = one 20 ms CM period, 'full' = one 1.5 s CL period) and EVERY sidelobe count the
+    schema admits, the designed tap count is < n. filter_buffer caps the design at
+    max_taps = n // 2, so this holds by construction; the shipped skirt asks for far fewer taps
+    than either budget anyway (the full loop is exercised through the design, not built — 92 M
+    samples — its length follows from the CM loop: CL is exactly CL_LEN/CM_LEN CM periods)."""
+    base_cm, n_cm = l2c.build_l2c_buffer(1, "cm")
+    assert len(base_cm) == n_cm
+    assert l2c.CL_LEN % l2c.CM_LEN == 0
+    n_full = n_cm * (l2c.CL_LEN // l2c.CM_LEN)
+    assert n_full == int(round(l2c.CL_LEN / l2c.CHANNEL_CHIP_RATE * round(l2c.SAMP_RATE_HZ)))
+    wanted = int(np.ceil(5.5 * l2c.SAMP_RATE_HZ / l2c.TRANS_HZ)) | 1    # the skirt's own ask
+    for n in (n_cm, n_full):
+        for sidelobes in range(0, l2c.MAX_SIDELOBES + 1):
+            fp = (sidelobes + 1) * l2c.L2C_NULL_HZ
+            fc = fp + l2c.TRANS_HZ / 2.0
+            h, m = l2c._design_lowpass(fc, l2c.TRANS_HZ, n // 2)     # exactly filter_buffer's design
+            assert len(h) == m
+            assert m <= min(wanted, (n // 2) | 1)
+            assert m < n, (n, sidelobes, m)
+    # and the real call path on the CM loop, at the extremes of the sidelobe range
+    for sidelobes in (0, l2c.DEFAULT_SIDELOBES, l2c.MAX_SIDELOBES):
+        filt, taps, fp = l2c.filter_buffer(base_cm, sidelobes=sidelobes, trans_hz=l2c.TRANS_HZ)
+        assert taps < n_cm and len(filt) == n_cm
 
 
 def test_filter_is_periodic_no_seam():

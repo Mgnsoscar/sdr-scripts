@@ -646,6 +646,8 @@ def main() -> int:
                           flush=True)
             time.sleep(TICK_S)
     finally:
+        stop.set()   # an intentional teardown: tb.stop() ends the watcher's tb.wait(), and a set
+                     # stop keeps an exception out of the loop a plain crash, not a false RF fault
         ctrl.close()
         tb.stop()
         tb.wait()

@@ -396,6 +396,8 @@ def main() -> int:
                 apply_change(change.name, change.value)
             time.sleep(0.1)
     finally:
+        stop.set()   # an intentional teardown: tb.stop() ends the watcher's tb.wait(), and a set
+                     # stop keeps an exception out of the loop a plain crash, not a false RF fault
         ctrl.close()
         tb.stop()
         tb.wait()

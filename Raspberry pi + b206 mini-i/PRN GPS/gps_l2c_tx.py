@@ -343,7 +343,10 @@ def _design_lowpass(fc_hz: float, trans_hz: float, max_taps: int):
 
 
 def _circular_convolve(x, h):
-    """Circular convolution of period len(x) between `x` and real FIR `h` (len ≤ len(x)).
+    """Circular convolution of period len(x) between `x` and real FIR `h` (len < len(x); a
+    filter at least as long as the loop is REFUSED — `np.fft.fft(h, n)` would silently truncate it
+    to n taps, which is not a circular convolution with the full filter; filter_buffer's
+    max_taps = n // 2 keeps every shipped configuration well clear of that).
     For a short filter on a huge loop (the 1.5 s CL buffer is ~92 M samples at 61.38 MHz) a single
     monolithic DFT would need several GB, so this uses OVERLAP-ADD with a small block FFT and then
     aliases the (M−1)-sample linear-convolution tail back to the head — which is exactly what makes
@@ -358,13 +361,11 @@ def _circular_convolve(x, h):
     n = len(x)
     m = len(h)
     real = np.isrealobj(x)
-    if m >= n:                                        # tiny loop — a direct DFT is fine
-        if real:
-            y = np.fft.irfft(np.fft.rfft(x, n) * np.fft.rfft(h, n), n)
-            out = np.zeros(n, dtype=np.complex64)
-            out.real[:] = y
-            return out
-        return np.fft.ifft(np.fft.fft(x) * np.fft.fft(h, n)).astype(np.complex64)
+    if m >= n:
+        # A filter at least as long as the loop: `fft(h, n)` would TRUNCATE the taps (not alias
+        # them modulo n), silently transmitting a different filter. Nothing needs this (see the
+        # docstring), so refuse loudly rather than change the signal without a word.
+        raise ValueError(f"filter longer than the loop (m >= n): {m} taps for a {n}-sample loop")
     nfft = 1
     while nfft < 4 * m:                               # comfortably larger than the filter
         nfft <<= 1
@@ -786,6 +787,8 @@ def main() -> int:
                 apply_change(change.name, change.value)
             time.sleep(0.1)
     finally:
+        stop.set()   # an intentional teardown: tb.stop() ends the watcher's tb.wait(), and a set
+                     # stop keeps an exception out of the loop a plain crash, not a false RF fault
         ctrl.close()
         tb.stop()
         tb.wait()

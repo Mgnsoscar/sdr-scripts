@@ -35,6 +35,36 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
+## Current state — adopters set `stop` before `tb.stop()` (review fix #7) + L2C `m >= n` branch refuses (review fix #22): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
+Two verified review findings on the RF-fault Phase-1 adoption + the L2C fast filter. Suite 106 → 110.
+- **#7 (MEDIUM) — an ordinary crash was misreported as an RF fault.** `txhealth.watch_flowgraph`
+  declares a fault whenever `tb.wait()` RETURNS with `stop` still UNSET; every adopter's teardown was
+  `finally: ctrl.close(); tb.stop(); tb.wait()` with `stop` never set, so any Python exception escaping
+  the main loop (a UHD `RuntimeError` on a retune, a `ValueError` from a fold, a script bug) made the
+  finally's `tb.stop()` end the watcher's wait → a FALSE `HEALTH state=faulted` marker + exit 1 as an
+  rf-fault — the agent then skipped its crash-restart path and an auto-restart policy burned its budget
+  relaunching a deterministic traceback. **Fix:** all 30 adopters now run `stop.set()` FIRST in the
+  `finally` (before `ctrl.close()`/`tb.stop()`/`tb.wait()`), so the teardown is intentional: a crash
+  propagates as a plain crash with no marker and `.faulted` False; a GENUINE halt is unchanged (the
+  watcher itself sets `stop` + latches `.faulted` before the loop exits, so the finally's set is a no-op).
+  The FIFO stagers + mocks (non-adopters) are untouched. Tests: `tests/test_txhealth_adoption.py` — an
+  AST check per adopter that the teardown `finally` holding `tb.stop()` calls `stop.set()` BEFORE it, a
+  BEHAVIOURAL run of the REAL `cw_tx.py` `main()` in-process (fake `gnuradio` whose `wait()` blocks
+  until `stop()`, a `LiveControl.drain` that hands the loop an unparseable retune → `ValueError`
+  propagates, watcher not faulted, no marker), and an inline before/after control proving the old shape
+  DID fault. Both fail against the pre-fix file (verified).
+- **#22 (LOW) — `_circular_convolve`'s `m >= n` branch TRUNCATED the FIR.** `np.fft.fft(h, n)` with
+  `len(h) > n` truncates h to n taps — not a circular convolution with the full filter (that would alias
+  h modulo n) — and the old tiny-loop test enshrined it. The branch is unreachable from `filter_buffer`
+  (`max_taps = n // 2`), so it now **refuses loudly** (`ValueError("filter longer than the loop (m >= n)
+  …")`, real and complex) rather than silently transmit a different filter; aliasing was deliberately
+  NOT implemented (nothing needs it). Tests: `tests/test_l2c_fast_filter.py` — the refusal for real +
+  complex, exactly `m == n` refused, `m == n − 1` still a proper circular convolution matching the
+  monolithic reference; and `filter_buffer`'s design tap count `< n` for BOTH shipped loops (`cm`, and
+  `full` derived as `n_cm · CL_LEN/CM_LEN` — 92 M samples, not built) at every sidelobe count 0..28, plus
+  the real call path on the CM loop. The real-fast-path == complex-path, `imag == 0` and seam tests are
+  unchanged; `--self-test` still passes. No calibration/param/argspec change; no agent/client change.
+
 ## Current state — `gps_l2c_tx.py` full-CL warm-up ~2× faster (RF-fault Phase 3b — fast-warm, in place): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 The Phase-3b "fast-warm" half of the RF-fault recovery design (`../sdr-agent/docs/rf-fault-recovery.md`
 §8), done as an IN-PLACE speed-up instead of a disk cache. **Measurement first (owner-approved pivot):**
