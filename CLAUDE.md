@@ -48,10 +48,13 @@ first. The banner adds `resumed at : N s into the drift → f MHz`. `--restart` 
 start. The agent (`sdr-agent` 1.32.0, `docs/rf-fault-recovery.md` §14g) bakes `--elapsed` = the launch's
 value + the seconds the crashed run had drifted on BOTH restart paths (a run's resync/replay restart, the
 standalone auto-restart) and via `build_resume_request` for an arm-time resume offset. An operator can also
-set it by hand to begin part-way. **The script REQUIRES paramkit ≥ agent 1.32.0 on the unit** — the
-`is_elapsed=` kwarg makes an older paramkit raise `TypeError` at `build_script()` on every launch (the
-agent's upload validator accepts the file), so OTA every unit FIRST; the client refuses to deploy it to a
-unit lacking the `paramkit-is-elapsed` capability. Also pinned: the calibrated gain the tone is born with is
+set it by hand to begin part-way. **`--restart` declares `resets_elapsed=True`** (agent 1.33.0): the owner's
+workflow launches the drift X s before on-air muted and fires `rf on` + `--restart` AT on-air, so the agent
+counts the drift's elapsed from the last firing of that trigger, not from the launch (`rf-fault-recovery.md`
+§14i). **The script REQUIRES paramkit ≥ agent 1.33.0 on the unit** — the `is_elapsed=` / `resets_elapsed=`
+kwargs make an older paramkit raise `TypeError` at `build_script()` on every launch (the agent's upload
+validator accepts the file), so OTA every unit FIRST; the client refuses to deploy it to a unit lacking the
+`paramkit-is-elapsed` + `paramkit-resets-elapsed` capabilities. Also pinned: the calibrated gain the tone is born with is
 the fold AT the resume frequency with the split pinned at the start carrier; once-past-the-end births at
 the end; loop mode wraps. Tests: `tests/test_cw_drift.py` (schema: exactly one `is_elapsed` param;
 the banner at 5400 s of a 1600→1300/180 min drift reads 1450 MHz; the REAL `main()` driven in-process with a

@@ -248,6 +248,10 @@ def test_schema_surface_and_shared_calibration_signal():
     assert by["elapsed"]["default"] == 0.0 and by["elapsed"]["min"] == 0.0
     assert not by["elapsed"]["live"]                     # a launch parameter, not a live knob
     assert [d for d, p in by.items() if p.get("is_elapsed")] == ["elapsed"]   # exactly one
+    # --restart is the elapsed-RESET trigger: the agent counts the drift's elapsed from its last
+    # firing (the on-air `rf on` + `restart` after a muted pre-roll launch), not from the launch.
+    assert by["restart"]["resets_elapsed"] is True and by["restart"]["live"]
+    assert [d for d, p in by.items() if p.get("resets_elapsed")] == ["restart"]
     assert by["power"]["live"] and by["power"]["unit"] == "dBm"
     vals = [p.get("value") if isinstance(p, dict) else (p[1] if isinstance(p, (list, tuple)) else p)
             for p in by["sample_rate"]["presets"]]

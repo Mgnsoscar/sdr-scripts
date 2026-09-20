@@ -378,9 +378,11 @@ def build_script() -> Script:
                      "switch ON to go on-air. The drift runs on its own timeline; OFF mutes "
                      "gain AND baseband amplitude; power edits made while OFF are staged and "
                      "applied when you switch ON.")
-        .flag("-Restart", "--restart", live=True,
+        .flag("-Restart", "--restart", live=True, resets_elapsed=True,
               help="Live trigger (tune-step): restart the drift from the start frequency. "
-                   "Fire it to re-run the ramp from the beginning.")
+                   "Fire it to re-run the ramp from the beginning — e.g. at on-air, together with "
+                   "--rf on, after a muted pre-roll launch. The agent's RF-fault restart counts the "
+                   "drift's elapsed time from the last firing of this trigger.")
         # RELATIVE power: the SDR's raw TX gain (dB), bypassing the dBm calibration.
         # No default, so its PRESENCE selects relative mode (it overrides --power).
         .number("-Gain", "--gain", unit="dB",
