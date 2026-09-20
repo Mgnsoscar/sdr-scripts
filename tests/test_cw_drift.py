@@ -252,6 +252,10 @@ def test_schema_surface_and_shared_calibration_signal():
     # firing (the on-air `rf on` + `restart` after a muted pre-roll launch), not from the launch.
     assert by["restart"]["resets_elapsed"] is True and by["restart"]["live"]
     assert [d for d, p in by.items() if p.get("resets_elapsed")] == ["restart"]
+    # --clock-origin: the ABSOLUTE instant the drift began (overrides --elapsed; the agent bakes the
+    # origin the script itself reported, so a restart lands exactly whatever the launch latency).
+    assert by["clock_origin"]["is_clock_origin"] is True and by["clock_origin"]["default"] == 0.0
+    assert [d for d, p in by.items() if p.get("is_clock_origin")] == ["clock_origin"]
     assert by["power"]["live"] and by["power"]["unit"] == "dBm"
     vals = [p.get("value") if isinstance(p, dict) else (p[1] if isinstance(p, (list, tuple)) else p)
             for p in by["sample_rate"]["presets"]]
@@ -424,7 +428,7 @@ def _fake_gnuradio():
     return mod
 
 
-def _run_resumed(monkeypatch, tmp_path, argv_tail, doc):
+def _run_resumed(monkeypatch, tmp_path, argv_tail, doc, drain=None):
     """Drive the REAL main() in-process against a resolved calibration; returns (mod, built, clock)."""
     import json
     import types
@@ -451,12 +455,12 @@ def _run_resumed(monkeypatch, tmp_path, argv_tail, doc):
     monkeypatch.setattr(mod, "drift_freq", lambda e, *a: (clock.append(e), real_law(e, *a))[1])
     ticks = {"n": 0}
 
-    def drain(self):
+    def default_drain(self):
         ticks["n"] += 1
         if ticks["n"] > 3:
             raise RuntimeError("test: stop the loop")
         return []
-    monkeypatch.setattr(live.LiveControl, "drain", drain)
+    monkeypatch.setattr(live.LiveControl, "drain", drain or default_drain)
     monkeypatch.setattr(mod, "TICK_S", 0.01)
     with pytest.raises(RuntimeError, match="stop the loop"):
         mod.main()
@@ -496,3 +500,45 @@ def test_elapsed_past_a_once_drift_births_at_the_end_and_loop_mode_wraps(monkeyp
         ["--freq", "1600", "--freq_end", "1300", "--duration", "180", "--sample_rate", "2",
          "--power", "-60", "--rf", "on", "--drift", "loop", "--elapsed", str(10800 + 5400)], doc)
     assert built["center"] + built["tone"] == 1450e6     # loop: a second pass, half-way
+
+
+def test_clock_origin_overrides_elapsed_and_is_reported_at_start_and_on_restart(monkeypatch, tmp_path, capsys):
+    """An absolute --clock-origin 5400 s ago births the tone at 1450 MHz whatever --elapsed says (the
+    elapsed is computed at the moment this process's clock starts), the CLOCK marker reports the
+    origin back, and a live --restart reports a NEW origin (now) after resetting the clock."""
+    import time as _time
+    import paramkit.live as live
+    from paramkit.txhealth import CLOCK_MARKER
+    origin = _time.time() - 5400.0
+    doc = _doc()
+    # inject a restart trigger on the 2nd drain so the loop resets its clock and reports again
+    ticks = {"n": 0}
+
+    def drain(self):
+        ticks["n"] += 1
+        if ticks["n"] == 2:
+            return [live.Change("restart", True)]
+        if ticks["n"] > 4:
+            raise RuntimeError("test: stop the loop")
+        return []
+    monkeypatch.setattr(live.LiveControl, "drain", drain)
+    mod, built, clock = _run_resumed(monkeypatch, tmp_path,
+        ["--freq", "1600", "--freq_end", "1300", "--duration", "180", "--sample_rate", "2",
+         "--power", "-60", "--rf", "on", "--elapsed", "7", "--clock-origin", f"{origin:.3f}"], doc,
+        drain=drain)
+    assert abs((built["center"] + built["tone"]) - 1450e6) < 5e3         # 5400 s in, not 7 s
+    assert 5399.0 <= clock[0] <= 5402.0
+    out = capsys.readouterr().out
+    reported = [float(l.split(CLOCK_MARKER, 1)[1]) for l in out.splitlines() if CLOCK_MARKER in l]
+    assert len(reported) == 2                                              # at start + on --restart
+    assert abs(reported[0] - origin) < 1.0                                 # the origin handed in
+    assert reported[1] > reported[0] + 5000                                # the restart: origin ≈ now
+    assert clock[-1] < 10                                                  # the clock restarted
+
+
+def test_clock_origin_zero_means_unset(monkeypatch, tmp_path):
+    doc = _doc()
+    mod, built, clock = _run_resumed(monkeypatch, tmp_path,
+        ["--freq", "1600", "--freq_end", "1300", "--duration", "180", "--sample_rate", "2",
+         "--power", "-60", "--rf", "on", "--elapsed", "5400", "--clock-origin", "0"], doc)
+    assert built["center"] + built["tone"] == 1450e6                     # --elapsed still rules

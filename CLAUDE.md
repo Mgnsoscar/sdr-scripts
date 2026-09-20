@@ -35,7 +35,7 @@ to check the calibrated-power path end-to-end without hardware.
     through the agent (`argspec` copies laws verbatim) to the client; no agent bump needed.
 - `--self-test` — a no-hardware spectral-density check some generators implement.
 
-## Current state — `cw_drift_tx.py --elapsed`: the script-declared resume point (RF-fault restart at the right time): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo with agent 1.32.0)
+## Current state — `cw_drift_tx.py --elapsed` / `--restart` / `--clock-origin`: the script-declared resume point (RF-fault restart at the right time, exactly): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo with agent 1.32.0 → 1.34.0)
 Owner ask: a time-dependent script must declare something that lets the agent restart it at the CORRECT
 time, so a crashed drift continues from the right point with the right parameters. The drift's clock is
 `now − t0` from launch, so the agent could only ever restart it from the START frequency. Now
@@ -51,15 +51,23 @@ standalone auto-restart) and via `build_resume_request` for an arm-time resume o
 set it by hand to begin part-way. **`--restart` declares `resets_elapsed=True`** (agent 1.33.0): the owner's
 workflow launches the drift X s before on-air muted and fires `rf on` + `--restart` AT on-air, so the agent
 counts the drift's elapsed from the last firing of that trigger, not from the launch (`rf-fault-recovery.md`
-§14i). **The script REQUIRES paramkit ≥ agent 1.33.0 on the unit** — the `is_elapsed=` / `resets_elapsed=`
-kwargs make an older paramkit raise `TypeError` at `build_script()` on every launch (the agent's upload
-validator accepts the file), so OTA every unit FIRST; the client refuses to deploy it to a unit lacking the
-`paramkit-is-elapsed` + `paramkit-resets-elapsed` capabilities. Also pinned: the calibrated gain the tone is born with is
+§14i). **`--clock-origin`** (`-Clock-origin`, Unix seconds, default 0 = unset, `is_clock_origin=True`; agent
+1.34.0, `rf-fault-recovery.md` §14j) makes the resume EXACT: when set it overrides `--elapsed` — the script
+computes `elapsed = time.time() − origin` itself at the moment its clock starts, so the launch's own seconds
+(attenuator pre-command, spawn, UHD open, flowgraph build) never shift the drift. The script REPORTS its origin
+on stdout (`paramkit.txhealth.report_clock_origin` → `CLOCK origin=<unix>`) once when its clock starts and again
+from the `--restart` handler; the agent records the last one and bakes it back on a restart (resync exact,
+replay shifted by the down-time; the standalone auto-restart too). Leave it 0 by hand — `--elapsed` is the
+manual knob. **The script REQUIRES paramkit ≥ agent 1.34.0 on the unit** — the `is_elapsed=` / `resets_elapsed=` /
+`is_clock_origin=` kwargs make an older paramkit raise `TypeError` at `build_script()` on every launch (the agent's
+upload validator accepts the file), so OTA every unit FIRST; the client refuses to deploy it to a unit lacking the
+`paramkit-is-elapsed` + `paramkit-resets-elapsed` + `paramkit-clock-origin` capabilities. Also pinned: the calibrated gain the tone is born with is
 the fold AT the resume frequency with the split pinned at the start carrier; once-past-the-end births at
 the end; loop mode wraps. Tests: `tests/test_cw_drift.py` (schema: exactly one `is_elapsed` param;
 the banner at 5400 s of a 1600→1300/180 min drift reads 1450 MHz; the REAL `main()` driven in-process with a
 fake gnuradio: born at the resume point inside its LO window, the drift clock continues from 5400 s; the
-calibrated-fold + LO-grid + once/loop cases). Suite 110 → 114. The FIFO `--duration` stagers could declare the marker later (not done).
+calibrated-fold + LO-grid + once/loop cases; `--clock-origin` 5400 s ago overriding a contradicting `--elapsed`,
+reported at start and again on `--restart`, 0 = unset). Suite 110 → 116. The FIFO `--duration` stagers could declare the marker later (not done).
 
 ## Current state — adopters set `stop` before `tb.stop()` (review fix #7) + L2C `m >= n` branch refuses (review fix #22): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 Two verified review findings on the RF-fault Phase-1 adoption + the L2C fast filter. Suite 106 → 110.

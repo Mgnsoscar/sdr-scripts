@@ -349,6 +349,12 @@ def build_script() -> Script:
                 default="once",
                 help="once = ramp then hold at the end; loop = repeat start→end; pingpong = "
                      "start→end→start…")
+        .number("-Clock-origin", "--clock-origin", unit="s", min=0.0, default=0.0, is_clock_origin=True,
+                help="ABSOLUTE instant the drift began (Unix seconds, UTC); 0 = unset. When set it "
+                     "overrides --elapsed: the script computes the elapsed itself at the moment its "
+                     "clock starts, so an RF-fault restart lands exactly on the drift's position "
+                     "whatever the launch takes. The agent sets it on a restart from the origin the "
+                     "script itself reported; leave it 0 by hand.")
         .number("-Elapsed", "--elapsed", unit="s", min=0.0, default=0.0, is_elapsed=True,
                 help="Start this many SECONDS into the drift instead of at the start frequency "
                      "(0 = from the start). The drift's clock is shifted by it, so the tone "
@@ -448,6 +454,7 @@ def _self_test() -> int:
 def main() -> int:
     if "--self-test" in sys.argv[1:]:
         return _self_test()
+    from paramkit.txhealth import report_clock_origin
 
     script = build_script()
     args = script.parse()
@@ -469,6 +476,11 @@ def main() -> int:
     # emitted at the start frequency first. The attenuator split stays pinned at the START
     # frequency (where the agent positions it from --freq), exactly as for an unshifted launch.
     elapsed0 = max(0.0, float(getattr(args, "elapsed", 0.0) or 0.0)) if drifting else 0.0
+    # An ABSOLUTE origin wins over the relative --elapsed: the elapsed is computed HERE, at the moment
+    # this process's clock starts, so the seconds the launch itself took never shift the drift.
+    clock_origin = float(getattr(args, "clock_origin", 0.0) or 0.0)
+    if drifting and clock_origin > 0:
+        elapsed0 = max(0.0, time.time() - clock_origin)
     f0 = drift_freq(elapsed0, start, end, duration_s, args.drift) if elapsed0 > 0 else start
     if wide and f0 != start:
         lo0 = plan_lo(f0, lo0, half)
@@ -528,7 +540,8 @@ def main() -> int:
                   f"±{span/2e6:g} MHz on the baseband NCO (fully continuous)")
         if elapsed0 > 0:
             print(f"  resumed at     : {elapsed0:g} s into the drift → {f0/1e6:.6f} MHz "
-                  f"(the clock continues from there)")
+                  f"(the clock continues from there"
+                  + (f"; absolute origin {clock_origin:.3f})" if clock_origin > 0 else ")"))
     else:
         print(f"  tone           : {start/1e6:.6f} MHz (start == end — static; use cw_tx.py)")
     print(f"  sample rate    : {args.sample_rate:g} MHz")
@@ -636,6 +649,7 @@ def main() -> int:
             ctrl.report("hop_blank", round(state["blank_s"] * 1e3, 1))
         elif name == "restart" and value:
             nonlocal_t0[0] = time.monotonic()          # re-run the drift from start
+            report_clock_origin(time.time())            # the timeline restarted NOW (agent reads it)
             emit(start)
             ctrl.report("restart", True)
 
@@ -643,6 +657,10 @@ def main() -> int:
     # a pure mute; only --restart re-runs the sweep from the start frequency. --elapsed shifts
     # the clock so the sweep is already that far along (a restart resumes where it left off).
     nonlocal_t0 = [time.monotonic() - elapsed0 if drifting else None]
+    if drifting:
+        # Report the ABSOLUTE instant this timeline began (elapsed0 seconds ago on the wall clock), so
+        # the agent can hand it back to a relaunch exactly (rf-fault-recovery.md §14j).
+        report_clock_origin(time.time() - elapsed0)
     next_progress = time.monotonic() + PROGRESS_EVERY_S
 
     stop = threading.Event()
