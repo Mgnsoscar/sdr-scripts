@@ -418,3 +418,77 @@ def _fake_gnuradio():
     mod = types.ModuleType("gnuradio")
     exec(_FAKE_GNURADIO, mod.__dict__)
     return mod
+
+
+def _run_resumed(monkeypatch, tmp_path, argv_tail, doc):
+    """Drive the REAL main() in-process against a resolved calibration; returns (mod, built, clock)."""
+    import json
+    import types
+    import paramkit.live as live
+    art = resolve(doc, None, "cw_tone").to_public_dict()
+    f = tmp_path / "cal.json"
+    f.write_text(json.dumps(art))
+    monkeypatch.setenv("SDR_CALIBRATION_FILE", str(f))
+    monkeypatch.delenv("SDR_CTRL_SOCK", raising=False)
+    mod = _load()                                        # a fresh module → a fresh power map
+    monkeypatch.setitem(sys.modules, "gnuradio", _fake_gnuradio())
+    monkeypatch.setattr(sys, "argv", [str(_DRIFT), *argv_tail])
+    monkeypatch.setattr(mod, "signal", types.SimpleNamespace(
+        SIGTERM=15, SIGINT=2, signal=lambda *a, **k: None))
+    built = {}
+    real_build = mod._build_top_block
+
+    def spy_build(center, samp, tone, gain, amp, *a, **k):
+        built.update(center=center, tone=tone, gain=gain)
+        return real_build(center, samp, tone, gain, amp, *a, **k)
+    monkeypatch.setattr(mod, "_build_top_block", spy_build)
+    clock = []
+    real_law = mod.drift_freq
+    monkeypatch.setattr(mod, "drift_freq", lambda e, *a: (clock.append(e), real_law(e, *a))[1])
+    ticks = {"n": 0}
+
+    def drain(self):
+        ticks["n"] += 1
+        if ticks["n"] > 3:
+            raise RuntimeError("test: stop the loop")
+        return []
+    monkeypatch.setattr(live.LiveControl, "drain", drain)
+    monkeypatch.setattr(mod, "TICK_S", 0.01)
+    with pytest.raises(RuntimeError, match="stop the loop"):
+        mod.main()
+    return mod, built, clock
+
+
+def test_elapsed_folds_the_calibrated_gain_at_the_resume_frequency_with_the_split_pinned_at_start(
+        monkeypatch, tmp_path):
+    """A 6 dB flatness rise at the resume point: the SDR gain the tone is BORN with is the fold at f0
+    (not at the start carrier), with the attenuator split pinned at the START carrier where the agent
+    positions it; the LO window is the un-resumed sweep's grid walked to f0 (hop positions stay put)."""
+    doc = _doc(bias=[(1300e6, 0.0), (1450e6, 6.0), (1600e6, 0.0)])
+    mod, built, clock = _run_resumed(monkeypatch, tmp_path,
+        ["--freq", "1600", "--freq_end", "1300", "--duration", "180", "--sample_rate", "2",
+         "--power", "-60", "--rf", "on", "--elapsed", "5400"], doc)
+    pmap = mod.power_map()
+    f0 = 1450e6
+    applied = pmap.pinned_applied(-60.0, freq=1600e6)
+    g_f0 = pmap.gain_for_power(-60.0, freq=f0, applied_db=applied)
+    g_start = pmap.gain_for_power(-60.0, freq=1600e6, applied_db=applied)
+    assert abs(g_f0 - g_start) > 3.0                     # the fold genuinely moves with frequency
+    assert built["gain"] == pytest.approx(g_f0)          # …and the tone is born with the f0 fold
+    half = mod.half_window_hz(2e6)
+    assert built["center"] == mod.plan_lo(f0, mod.initial_lo(1600e6, 1300e6, 2e6), half)
+    assert built["center"] + built["tone"] == f0
+    assert clock[0] == 5400.0 and all(5400.0 <= e < 5401 for e in clock[1:])
+
+
+def test_elapsed_past_a_once_drift_births_at_the_end_and_loop_mode_wraps(monkeypatch, tmp_path):
+    doc = _doc()
+    mod, built, _ = _run_resumed(monkeypatch, tmp_path,
+        ["--freq", "1600", "--freq_end", "1300", "--duration", "180", "--sample_rate", "2",
+         "--power", "-60", "--rf", "on", "--elapsed", "99999"], doc)
+    assert built["center"] + built["tone"] == 1300e6     # once: holds at the end
+    assert abs(built["tone"]) <= mod.half_window_hz(2e6)
+    mod, built, _ = _run_resumed(monkeypatch, tmp_path,
+        ["--freq", "1600", "--freq_end", "1300", "--duration", "180", "--sample_rate", "2",
+         "--power", "-60", "--rf", "on", "--drift", "loop", "--elapsed", str(10800 + 5400)], doc)
+    assert built["center"] + built["tone"] == 1450e6     # loop: a second pass, half-way

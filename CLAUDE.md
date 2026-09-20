@@ -48,10 +48,15 @@ first. The banner adds `resumed at : N s into the drift → f MHz`. `--restart` 
 start. The agent (`sdr-agent` 1.32.0, `docs/rf-fault-recovery.md` §14g) bakes `--elapsed` = the launch's
 value + the seconds the crashed run had drifted on BOTH restart paths (a run's resync/replay restart, the
 standalone auto-restart) and via `build_resume_request` for an arm-time resume offset. An operator can also
-set it by hand to begin part-way. Tests: `tests/test_cw_drift.py` (schema: exactly one `is_elapsed` param;
+set it by hand to begin part-way. **The script REQUIRES paramkit ≥ agent 1.32.0 on the unit** — the
+`is_elapsed=` kwarg makes an older paramkit raise `TypeError` at `build_script()` on every launch (the
+agent's upload validator accepts the file), so OTA every unit FIRST; the client refuses to deploy it to a
+unit lacking the `paramkit-is-elapsed` capability. Also pinned: the calibrated gain the tone is born with is
+the fold AT the resume frequency with the split pinned at the start carrier; once-past-the-end births at
+the end; loop mode wraps. Tests: `tests/test_cw_drift.py` (schema: exactly one `is_elapsed` param;
 the banner at 5400 s of a 1600→1300/180 min drift reads 1450 MHz; the REAL `main()` driven in-process with a
-fake gnuradio: born at the resume point inside its LO window, the drift clock continues from 5400 s). Suite
-110 → 112. The FIFO `--duration` stagers could declare the marker later (not done).
+fake gnuradio: born at the resume point inside its LO window, the drift clock continues from 5400 s; the
+calibrated-fold + LO-grid + once/loop cases). Suite 110 → 114. The FIFO `--duration` stagers could declare the marker later (not done).
 
 ## Current state — adopters set `stop` before `tb.stop()` (review fix #7) + L2C `m >= n` branch refuses (review fix #22): COMPLETE (branch `claude/system-familiarization-f5mezz`, scripts-only)
 Two verified review findings on the RF-fault Phase-1 adoption + the L2C fast filter. Suite 106 → 110.
