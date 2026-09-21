@@ -130,9 +130,12 @@ a monolithic reference; the circular seam holds). Suite 102 → 106.
 
 ## Current state — clean-set scripts adopt the `txhealth` done-watcher (RF-fault Phase 1): COMPLETE (branch `claude/system-familiarization-f5mezz`, cross-repo)
 Part of the agent's RF-fault DETECTION (`sdr-agent` 1.28.0, capability `task-rf-health`,
-`docs/rf-fault-recovery.md` §5.1/§14b). The field incident was a GNU Radio flowgraph that HALTED at
-startup (a `vmcircbuf` buffer error) but did NOT exit, so the agent showed the task RUNNING while the
-SDR sent nothing. GR does NOT re-raise a halted flowgraph to Python, so **`tb.wait()` RETURNING with
+`docs/rf-fault-recovery.md` §5.1/§14b). The field incident was BELIEVED to be a GNU Radio flowgraph that
+HALTED at startup (a `vmcircbuf` buffer error) but did NOT exit, so the agent showed the task RUNNING while
+the SDR sent nothing. **Corrected 2026-09-21 (`sdr-agent/docs/rf-fault-recovery.md` §14k):** the flowgraph
+was fine — the agent's on-air `rf on` tune was sent ≈0.5 s before the script had bound its control socket on
+a cold first launch after a reboot, agent 1.27.2 dropped it silently, and `fm_chirp_tx.py` stages power
+tunes while muted, so the gate never opened. The done-watcher below still guards the genuine-halt case. GR does NOT re-raise a halted flowgraph to Python, so **`tb.wait()` RETURNING with
 the stop flag still UNSET IS the fault signal**. The 30 CLEAN-set RPi scripts now turn that silent halt
 into a NON-ZERO EXIT the agent sees:
 ```python
